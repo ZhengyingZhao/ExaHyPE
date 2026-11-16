@@ -83,7 +83,7 @@ public:
     const RuntimeParameters&        parameters
   );
 {%- endif %}
-{%- if START_GRID_INITIALISATION_IMPLEMENTATION.strip() or TRACERS %}
+{%- if START_GRID_INITIALISATION_IMPLEMENTATION.strip() or REFINEMENT_INITIALISATION_IMPLEMENTATION.strip() or TRACERS %}
 
   void initialise(
     const peano4::CellConnectivity& cellConnectivity,

@@ -87,6 +87,15 @@ public:
     const RuntimeParameters&        parameters
   );
 
+  /** Submit refinement votes for the current accepted solution. */
+  template <typename RuntimeParameters>
+  INLINE_METHOD void assessRefinement(
+    const peano4::CellConnectivity& cellConnectivity,
+    exahype2::RefinementRequests&   requests,
+    const RuntimeParameters&        parameters,
+    bool                            enabled = true
+  );
+
   template <typename RuntimeParameters>
   INLINE_METHOD void allocate(const peano4::CellConnectivity& cellConnectivity, const RuntimeParameters& parameters);
 
@@ -211,6 +220,13 @@ protected:
 
   template <typename RuntimeParameters>
   INLINE_METHOD void voteOnRefinement(
+    const peano4::CellConnectivity& cellConnectivity,
+    exahype2::RefinementRequests&   requests,
+    const RuntimeParameters&        parameters
+  );
+
+  template <typename RuntimeParameters>
+  INLINE_METHOD void voteOnRefinementAfterTimeStep(
     const peano4::CellConnectivity& cellConnectivity,
     exahype2::RefinementRequests&   requests,
     const RuntimeParameters&        parameters

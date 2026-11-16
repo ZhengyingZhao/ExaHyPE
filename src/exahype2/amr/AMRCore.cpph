@@ -1,0 +1,1096 @@
+// This file is part of the ExaHyPE2 project. For conditions of distribution and
+// use, please see the copyright notice at www.peano-framework.org
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <set>
+#include <stdexcept>
+#include <thread>
+#include "tarch/accelerator/ParallelFor.h"
+#include "tarch/mpi/Rank.h"
+
+namespace exahype2::amr {
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  auto AMRCore<N, V, C, P, A, T, E, S>::geometry(const Coordinates& x, const Coordinates& h) -> Geometry {
+    Geometry key{};
+    for (int axis = 0; axis < DIMENSIONS; axis++) {
+      key[axis] = x(axis);
+      key[DIMENSIONS + axis] = h(axis);
+    }
+    return key;
+  }
+
+  /** Bound intermediate values during restriction and prolongation. */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  double AMRCore<N, V, C, P, A, T, E, S>::amplification(const double* matrix, bool restriction) {
+    if (matrix == nullptr) return 0.0;
+    const double limit = std::numeric_limits<double>::max();
+    double largest = 0.0;
+    for (int target = 0; target < N; target++) {
+      double sum = 0.0;
+      for (int child = 0; child < peano4::SubdivisionFactor; child++) {
+        double row = 0.0;
+        for (int input = 0; input < N; input++) {
+          const double value = std::abs(matrix[(child * N + input) * N + target]);
+          if (not std::isfinite(value) or row > limit - value) return 0.0;
+          row += value;
+        }
+        if (restriction) {
+          if (sum > limit - row) return 0.0;
+          sum += row;
+        } else {
+          largest = std::max(largest, row);
+        }
+      }
+      if (restriction) largest = std::max(largest, sum);
+    }
+    double bound = 1.0;
+    for (int axis = 0; axis < DIMENSIONS; axis++) {
+      if (largest > 1.0 and bound > limit / largest) return 0.0;
+      bound *= largest;
+    }
+    return bound > (limit - 1.0) / 2.0 ? 0.0 : 1.0 + 2.0 * bound;
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  bool AMRCore<N, V, C, P, A, T, E, S>::finite(const P* Q) {
+    if (Q == nullptr) return false;
+    for (int entry = 0; entry < Values; entry++) {
+      if (not std::isfinite(static_cast<double>(Q[entry]))) return false;
+    }
+    return true;
+  }
+
+  /** Measure variation at the resolution of the accepted representation. */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  double AMRCore<N, V, C, P, A, T, E, S>::localDetail(const P* Q) {
+    return localDetail({Q, N, T::IsFiniteVolume ? AcceptedRepresentation::FVCellAverages
+                                             : AcceptedRepresentation::DGNodal});
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  double AMRCore<N, V, C, P, A, T, E, S>::localDetail(const AcceptedCellView<P>& view) {
+    if (view.isFiniteVolume()) return resolution_detail::fvResolutionDetail<V, C>(
+      view.values, view.pointsPerAxis, amr_detail::resolutionTolerance<C>());
+    if (not finite(view)) return std::numeric_limits<double>::infinity();
+    if (view.pointsPerAxis != N) return std::numeric_limits<double>::infinity();
+    return amr_detail::highestOrderDetailImpl<S::NativeArithmetic, true, N, V, C>(
+      view.values, amr_detail::resolutionTolerance<C>());
+  }
+
+  /** Cache spatial evidence once per accepted cell and time step. */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  double AMRCore<N, V, C, P, A, T, E, S>::withObservation(double detail, double ratio) {
+    double scaled = 0.0;
+    if (not std::isfinite(ratio) or ratio < 0.0
+        or not native_neighbour_detail::product(ratio, amr_detail::resolutionTolerance<C>(), scaled))
+      return std::numeric_limits<double>::infinity();
+    if (ratio > 1.0) scaled = std::max(scaled,
+      std::nextafter(amr_detail::resolutionTolerance<C>(), std::numeric_limits<double>::infinity()));
+    return std::max(detail, scaled);
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  double AMRCore<N, V, C, P, A, T, E, S>::acceptedLocalDetail(const AcceptedCellView<P>& view, const double* nodes) {
+    double detail = predictionMode() ? prediction_detail::localDetail<N, V, C>(view, nodes) : localDetail(view);
+    if constexpr (observation_detail::count<C>() > 0)
+      detail = withObservation(detail, observation_detail::localRatio<N, V, C>(view, nodes, false));
+    return detail;
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  auto AMRCore<N, V, C, P, A, T, E, S>::cellDetail(const Cell& cell) const -> ResolutionEvidence {
+    if constexpr (not S::CheckNeighbours) {
+      return {acceptedLocalDetail(accepted(cell), _nodes), true};
+    }
+    else {
+      auto& cache = _detailCache[cell.slot];
+      int expected = 0;
+      if (cache.state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+        cache.evidence = computeCellDetail(cell);
+        cache.state.store(2, std::memory_order_release);
+      } else {
+        while (cache.state.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+      }
+      return cache.evidence;
+    }
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  auto AMRCore<N, V, C, P, A, T, E, S>::computeCellDetail(const Cell& cell) const -> ResolutionEvidence {
+    const auto own = accepted(cell);
+    ResolutionEvidence result{acceptedLocalDetail(own, _nodes), true};
+    if constexpr (S::CheckNeighbours) {
+      // A local refinement request needs no further face work.
+      if (result.value > amr_detail::resolutionTolerance<C>()) { result.complete = false; return result; }
+      if (_mesh == nullptr) { result.complete = false; return result; }
+      const auto visit = [&](int slot, int normal, int ownSide, int cachedFace) {
+        if (result.value > amr_detail::resolutionTolerance<C>()) { result.complete = false; return; }
+        if (slot < 0 or slot >= static_cast<int>(_cells.size())) {
+          result.complete = false;
+          return;
+        }
+        const auto& neighbour = _cells[slot];
+        const auto other = accepted(neighbour);
+        if (other.values == nullptr or other.pointsPerAxis <= 0) {
+          result.complete = false;
+          return;
+        }
+        result.value = std::max(result.value, cachedFace >= 0 ? acceptedFaceDetail(cachedFace)
+          : faceDetail(own, other, cell.key, neighbour.key, normal, ownSide));
+      };
+      if constexpr (cacheAcceptedFaces()) {
+        const auto& stencil = _nativeStencils[cell.slot];
+        for (const auto& face : stencil.faces) visit(face.slot, face.normal, face.side, face.cache);
+        result.complete = stencil.complete and result.complete;
+      } else {
+        result.complete = forEachNativeNeighbour(*_mesh, cell.slot, [&](int slot, int normal, int ownSide) {
+          visit(slot, normal, ownSide, -1);
+        }) and result.complete;
+      }
+    }
+    return result;
+  }
+
+  /** Reuse face indices while connectivity matches, including periodic and mixed-level neighbours. */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  void AMRCore<N, V, C, P, A, T, E, S>::bindAcceptedFaces(const peano4::CellConnectivity& mesh) {
+    bool changed = _nativeStencils.size() != _cells.size();
+    _nativeStencils.resize(_cells.size());
+    std::vector<NativeFace> faces;
+    for (const int slot : _leaves) {
+      faces.clear();
+      const bool complete = forEachNativeNeighbour(mesh, slot, [&](int neighbour, int normal, int side) {
+        faces.push_back({neighbour, normal, side, -1});
+      });
+      auto& stencil = _nativeStencils[slot];
+      const bool same = complete == stencil.complete and faces.size() == stencil.faces.size()
+        and std::equal(faces.begin(), faces.end(), stencil.faces.begin(), [](const NativeFace& a, const NativeFace& b) {
+          return a.slot == b.slot and a.normal == b.normal and a.side == b.side;
+        });
+      if (not same) {
+        changed = true;
+        stencil.faces = faces;
+        stencil.complete = complete;
+      }
+    }
+    if (changed) {
+      std::map<std::array<int, 3>, int> indices;
+      for (const int slot : _leaves) for (auto& face : _nativeStencils[slot].faces) {
+        if (face.slot < 0 or face.slot >= static_cast<int>(_cells.size())) { face.cache = -1; continue; }
+        const std::array<int, 3> key{face.normal, face.side == 1 ? slot : face.slot, face.side == 1 ? face.slot : slot};
+        face.cache = indices.try_emplace(key, static_cast<int>(indices.size())).first->second;
+      }
+      _acceptedFaceCount = indices.size();
+      if (_acceptedFaceCount > _acceptedFaceCapacity) {
+        _acceptedFaces = std::make_unique<AcceptedFaceCache[]>(_acceptedFaceCount);
+        _acceptedFaceCapacity = _acceptedFaceCount;
+      }
+      for (const auto& [key, index] : indices) {
+        auto& face = _acceptedFaces[index];
+        face.normal = key[0]; face.left = key[1]; face.right = key[2];
+      }
+    }
+    for (std::size_t face = 0; face < _acceptedFaceCount; face++)
+      _acceptedFaces[face].state.store(0, std::memory_order_relaxed);
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  double AMRCore<N, V, C, P, A, T, E, S>::acceptedFaceDetail(int index) const {
+    auto& face = _acceptedFaces[index];
+    int expected = 0;
+    if (face.state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+      const auto& left = _cells[face.left];
+      const auto& right = _cells[face.right];
+      face.value = faceDetail(accepted(left), accepted(right), left.key, right.key, face.normal, 1);
+      face.state.store(2, std::memory_order_release);
+    } else {
+      while (face.state.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+    }
+    return face.value;
+  }
+
+  /** Both accepted cells and proposed parents use the same spatial observation. */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  double AMRCore<N, V, C, P, A, T, E, S>::faceDetail(
+    const AcceptedCellView<P>& own, const AcceptedCellView<P>& other,
+    const Key& ownKey, const Key& otherKey, int normal, int side
+  ) const {
+    if constexpr (predictionMode()) {
+      double detail = prediction_detail::faceDetail<N, V, C>(own, other, ownKey, otherKey, _nodes, normal, side);
+      if constexpr (observation_detail::count<C>() > 0)
+        detail = withObservation(detail, observation_detail::faceRatio<N, V, C>(
+          own, other, ownKey, otherKey, _nodes, normal, side));
+      return detail;
+    } else {
+      return resolution_detail::faceDetail<N, V, C>(own, other, ownKey, otherKey, _nodes, normal, side);
+    }
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  void AMRCore<N, V, C, P, A, T, E, S>::beginInitialisation(
+    PhysicalAdmissibility admissible, InitialDataCheck initialDataCheck
+  ) {
+    reset();
+    if (not std::isfinite(amr_detail::resolutionTolerance<C>()) or amr_detail::resolutionTolerance<C>() <= 0.0) {
+      throw std::invalid_argument(S::InvalidUnits);
+    }
+    if (not observation_detail::valid<V, C>() or (observation_detail::count<C>() > 0 and not predictionMode()))
+      throw std::invalid_argument("Linear AMR observations require prediction mode, finite weights and valid absolute/relative budgets.");
+    if constexpr (requires { C::resolutionComponent(0); }) {
+      bool any = false;
+      for (int component = 0; component < V; component++) any = any or C::resolutionComponent(component);
+      if (not predictionMode() or not any)
+        throw std::invalid_argument("Resolution components require prediction mode and at least one stored component.");
+    }
+    if constexpr (S::RequireSingleRank) {
+      if (tarch::mpi::Rank::getInstance().getNumberOfRanks() != 1) {
+        throw std::invalid_argument("Independent Native AMR currently requires one MPI rank; accepted remote states are not exchanged.");
+      }
+    }
+    _admissible = admissible;
+    _initialDataCheck = initialDataCheck;
+    _initialising = true;
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  template <typename SolutionView, typename StatusView>
+  void AMRCore<N, V, C, P, A, T, E, S>::beginStep(
+    const peano4::CellConnectivity& mesh, SolutionView solution, StatusView statuses,
+    const exahype2::TimeStepping& clock, const double* nodes,
+    const double* restriction, const double* prolongation, WaveSpeed waveSpeed,
+    PhysicalAdmissibility admissible, TransferAdmissibility transferAdmissible, NativeSubcells subcells
+  ) {
+    _initialising = false;
+    _active = false;
+    if constexpr (S::RequireSingleRank) {
+      if (tarch::mpi::Rank::getInstance().getNumberOfRanks() != 1) {
+        throw std::invalid_argument("Independent Native AMR currently requires one MPI rank; accepted remote states are not exchanged.");
+      }
+    }
+    if (not std::isfinite(amr_detail::resolutionTolerance<C>()) or amr_detail::resolutionTolerance<C>() <= 0.0
+        or not std::isfinite(C::TransferTolerance) or C::TransferTolerance <= 0.0) {
+      throw std::invalid_argument(S::InvalidUnits);
+    }
+    if (not observation_detail::valid<V, C>() or (observation_detail::count<C>() > 0 and not predictionMode()))
+      throw std::invalid_argument("Linear AMR observations require prediction mode, finite weights and valid absolute/relative budgets.");
+    if constexpr (requires { C::resolutionComponent(0); }) {
+      bool any = false;
+      for (int component = 0; component < V; component++) any = any or C::resolutionComponent(component);
+      if (not predictionMode() or not any)
+        throw std::invalid_argument("Resolution components require prediction mode and at least one stored component.");
+    }
+    if constexpr (not predictionMode()) {
+      if (not std::isfinite(C::QuietTime) or C::QuietTime <= 0.0
+          or not std::isfinite(_referenceTime) or _referenceTime <= 0.0) {
+        throw std::invalid_argument(S::InvalidUnits);
+      }
+    }
+    for (int entry = 0; entry < V; entry++) {
+      if (not std::isfinite(C::stateScale(entry)) or C::stateScale(entry) <= 0.0) {
+        throw std::invalid_argument(S::InvalidScale);
+      }
+    }
+    if constexpr (not T::IsFiniteVolume) {
+      if (nodes == nullptr) throw std::invalid_argument(S::MissingNodes);
+      for (int node = 0; node < N; node++) {
+        if (not std::isfinite(nodes[node]) or nodes[node] < 0.0 or nodes[node] > 1.0
+            or (node > 0 and nodes[node] <= nodes[node - 1])) {
+          throw std::invalid_argument(S::InvalidNodes);
+        }
+      }
+    }
+    _clock = &clock;
+    _startTime = clock.getTimeStamp();
+    _nodes = nodes;
+    if constexpr (not T::IsFiniteVolume) _retainedParentGeometry.bind(nodes);
+    _restriction = restriction;
+    _prolongation = prolongation;
+    _waveSpeed = waveSpeed;
+    _admissible = admissible;
+    _transferAdmissible = transferAdmissible;
+    _mesh = &mesh;
+    _subcells = subcells;
+    _restrictionBound = T::IsFiniteVolume ? 1.0 : amplification(restriction, true);
+    _prolongationBound = T::IsFiniteVolume ? 1.0 : amplification(prolongation, false);
+    // Reuse topology only if slots, indices and geometry still match.
+    const auto leaves = mesh.getCells();
+    bool sameTopology = _topologyCached and _cells.size() == static_cast<std::size_t>(mesh.getNumberOfSlots())
+      and _leaves.size() == static_cast<std::size_t>(leaves.size);
+    for (int entry = 0; sameTopology and entry < leaves.size; entry++) {
+      const int slot = leaves[entry];
+      if (_leaves[entry] != slot) { sameTopology = false; break; }
+      const auto& cell = _cells[slot];
+      const auto lattice = mesh.getCellLattice(slot);
+      sameTopology = cell.key[0] == mesh.getCellLevel(slot)
+        and geometry(cell.centre, cell.width) == geometry(mesh.getCellCentre(slot), mesh.getCellWidth(slot));
+      for (int axis = 0; sameTopology and axis < DIMENSIONS; axis++) {
+        sameTopology = cell.key[axis + 1] == lattice(axis);
+      }
+    }
+    if (not sameTopology) {
+      _topologyCached = false;
+      _cells.assign(mesh.getNumberOfSlots(), Cell{});
+      _leaves.assign(leaves.begin(), leaves.end());
+      _families.clear();
+      _lookup.clear();
+      if constexpr (not predictionMode()) {
+        // Keep map entries alive while cells hold pointers to their histories.
+        for (auto& entry : _history) entry.second.live = false;
+      }
+      std::map<Key, int> families;
+      for (const int slot : _leaves) {
+        auto& cell = _cells[slot];
+        cell.slot = slot;
+        cell.centre = mesh.getCellCentre(slot);
+        cell.width = mesh.getCellWidth(slot);
+        cell.key[0] = mesh.getCellLevel(slot);
+        const auto lattice = mesh.getCellLattice(slot);
+        Key parent{};
+        parent[0] = cell.key[0] - 1;
+        int child = 0, stride = 1;
+        for (int axis = 0; axis < DIMENSIONS; axis++) {
+          cell.key[axis + 1] = lattice(axis);
+          parent[axis + 1] = lattice(axis) / peano4::SubdivisionFactor;
+          child += stride * (lattice(axis) % peano4::SubdivisionFactor);
+          stride *= peano4::SubdivisionFactor;
+        }
+        if constexpr (not predictionMode()) {
+          cell.history = &_history.try_emplace(cell.key).first->second;
+          cell.history->live = true;
+        }
+        _lookup.emplace(geometry(cell.centre, cell.width), slot);
+        if (cell.key[0] == 0) continue;
+        const auto [entry, inserted] = families.emplace(parent, static_cast<int>(_families.size()));
+        if (inserted) {
+          auto& family = _families.emplace_back();
+          family.slots.fill(-1);
+        }
+        cell.family = entry->second;
+        _families[cell.family].slots[child] = slot;
+      }
+      for (auto& family : _families) {
+        family.complete = std::all_of(family.slots.begin(), family.slots.end(), [](int slot) { return slot >= 0; });
+      }
+      if constexpr (not predictionMode()) {
+        bindQuietRegions();
+        _historyNeedsPruning = true;
+      }
+      _topologyCached = true;
+    }
+    if constexpr (S::CheckNeighbours) {
+      if (static_cast<std::size_t>(mesh.getNumberOfSlots()) > _detailCacheCapacity) {
+        _detailCacheCapacity = static_cast<std::size_t>(mesh.getNumberOfSlots());
+        _detailCache = std::make_unique<DetailCache[]>(_detailCacheCapacity);
+      }
+    }
+    // Pool addresses may change after a regrid.
+    for (const int slot : _leaves) {
+      auto& cell = _cells[slot];
+      cell.state = solution.getChunk(slot);
+      cell.status = statuses.getChunk(slot);
+      if constexpr (S::CheckNeighbours) _detailCache[slot].state.store(0, std::memory_order_relaxed);
+      if constexpr (not predictionMode()) {
+        cell.quiet = cell.history->time == _startTime ? cell.history->quiet : 0.0;
+        cell.quietReady = false;
+      }
+    }
+    if constexpr (S::CheckNeighbours and cacheAcceptedFaces()) bindAcceptedFaces(mesh);
+    if (_families.size() > _familyVoteCapacity) {
+      _familyVotes = std::make_unique<std::atomic<int>[]>(_families.size());
+      _familyPlans = std::make_unique<FamilyPlan[]>(_families.size());
+      _familyVoteCapacity = _families.size();
+    }
+    for (std::size_t i = 0; i < _families.size(); i++) {
+      _familyVotes[i].store(0, std::memory_order_relaxed);
+      _familyPlans[i].state.store(0, std::memory_order_relaxed);
+    }
+    _active = std::isfinite(_startTime) and _startTime >= 0.0;
+  }
+
+  /** Link leaf and ancestor histories across mesh changes. */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  void AMRCore<N, V, C, P, A, T, E, S>::bindQuietRegions() {
+    _quietRegions.clear();
+    _quietOrder.clear();
+    std::map<Key, int> regions;
+    for (const int slot : _leaves) {
+      Key key = _cells[slot].key;
+      int descendant = -1, child = -1;
+      while (true) {
+        const auto [entry, inserted] = regions.emplace(key, static_cast<int>(_quietRegions.size()));
+        if (inserted) {
+          auto& region = _quietRegions.emplace_back();
+          region.children.fill(-1);
+          region.history = &_history.try_emplace(key).first->second;
+          region.history->live = true;
+        }
+        auto& region = _quietRegions[entry->second];
+        if (descendant < 0) region.slot = slot;
+        else region.children[child] = descendant;
+        if (key[0] == 0) break;
+        descendant = entry->second;
+        key[0]--;
+        child = 0;
+        int stride = 1;
+        for (int axis = 0; axis < DIMENSIONS; axis++) {
+          child += stride * (key[axis + 1] % peano4::SubdivisionFactor);
+          stride *= peano4::SubdivisionFactor;
+          key[axis + 1] /= peano4::SubdivisionFactor;
+        }
+      }
+    }
+    // Update children before their parents.
+    for (auto entry = regions.rbegin(); entry != regions.rend(); ++entry) _quietOrder.push_back(entry->second);
+  }
+
+  /** Update parent histories from their children's accepted states. */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  void AMRCore<N, V, C, P, A, T, E, S>::finishQuietRegions(double time, double dt) {
+    for (const int index : _quietOrder) {
+      auto& region = _quietRegions[index];
+      if (region.slot >= 0) {
+        const auto& cell = _cells[region.slot];
+        region.valid = cell.acceptedQuiet >= 0.0;
+        region.crossing = cell.crossing;
+        region.moving = cell.moving;
+        continue;
+      }
+      region.valid = true;
+      region.moving = false;
+      region.crossing = std::numeric_limits<double>::infinity();
+      for (const int child : region.children) {
+        if (child < 0 or not _quietRegions[child].valid) { region.valid = false; break; }
+        const auto& descendant = _quietRegions[child];
+        region.moving = region.moving or descendant.moving;
+        region.crossing = std::min(region.crossing, descendant.crossing);
+      }
+      // Scale crossing time to the parent's width; invalid regions reset quiet time.
+      region.crossing *= peano4::SubdivisionFactor;
+      const double quiet = region.history->time == _startTime ? region.history->quiet : 0.0;
+      region.history->quiet = region.valid ? advanceQuiet(quiet, region.crossing, region.moving, dt) : 0.0;
+      region.history->time = time;
+    }
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  bool AMRCore<N, V, C, P, A, T, E, S>::fresh(double time) const {
+    return _active and _clock != nullptr and std::isfinite(time) and time > _startTime
+      and time == _clock->getTimeStamp() and std::isfinite(_clock->getTimeStepSizeOfLastStep())
+      and _clock->getTimeStepSizeOfLastStep() > 0.0;
+  }
+
+  /** Accumulate quiet time in local crossing times. */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  double AMRCore<N, V, C, P, A, T, E, S>::quietProgress(const Cell& cell, double time, double dt) const {
+    // The family-vote winner fills this cache; step completion can reuse it.
+    if (not cell.quietReady) {
+      cell.acceptedQuiet = computeQuietProgress(cell, time, dt);
+      cell.quietReady = true;
+    }
+    return cell.acceptedQuiet;
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  double AMRCore<N, V, C, P, A, T, E, S>::computeQuietProgress(const Cell& cell, double time, double dt) const {
+    cell.crossing = std::numeric_limits<double>::infinity();
+    cell.moving = false;
+    if (not E::quietEligible(cell.status)) return -1.0;
+    const auto view = accepted(cell);
+    if constexpr (S::CheckQuietDetail and not predictionMode()) {
+      const auto detail = cellDetail(cell);
+      if (not detail.complete or detail.value > amr_detail::resolutionTolerance<C>()
+          or (_admissible != nullptr and not _admissible(view.values, view.numberOfStates(), cell.centre, cell.width))) return -1.0;
+    } else if (not finite(view)
+        or (_admissible != nullptr and not _admissible(view.values, view.numberOfStates(), cell.centre, cell.width))) return -1.0;
+    double crossing = std::numeric_limits<double>::infinity();
+    bool moving = false;
+    if (_waveSpeed != nullptr) {
+      for (int node = 0; node < view.numberOfStates(); node++) {
+        auto index = tarch::la::Vector<DIMENSIONS, int>(0);
+        int remaining = node;
+        for (int axis = 0; axis < DIMENSIONS; axis++) {
+          index(axis) = remaining % view.pointsPerAxis;
+          remaining /= view.pointsPerAxis;
+        }
+        Coordinates point;
+        if constexpr (not S::NativeArithmetic and not T::IsFiniteVolume) {
+          point = exahype2::dg::getQuadraturePoint(cell.centre, cell.width, index, _nodes);
+        } else {
+          for (int axis = 0; axis < DIMENSIONS; axis++) {
+            const double position = view.isFiniteVolume() ? (index(axis) + 0.5) / view.pointsPerAxis : _nodes[index(axis)];
+            point(axis) = cell.centre(axis) + (position - 0.5) * cell.width(axis);
+          }
+        }
+        for (int axis = 0; axis < DIMENSIONS; axis++) {
+          const double speed = _waveSpeed(view.values + node * V, point, cell.width, time, dt, axis);
+          if (not std::isfinite(speed) or speed < 0.0) return -1.0;
+          if (speed == 0.0) continue;
+          moving = true;
+          const double width = cell.width(axis);
+          const double limit = std::numeric_limits<double>::max();
+          const double tau = speed < 1.0 and width > limit * speed
+            ? std::numeric_limits<double>::infinity() : width / speed;
+          crossing = std::min(crossing, tau);
+        }
+      }
+    }
+    cell.crossing = crossing;
+    cell.moving = moving;
+    return advanceQuiet(cell.quiet, crossing, moving, dt);
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  double AMRCore<N, V, C, P, A, T, E, S>::advanceQuiet(double quiet, double crossing, bool moving, double dt) const {
+    if (not moving) crossing = _referenceTime;
+    if (crossing <= 0.0 or std::isnan(crossing)) return -1.0;
+    const double limit = std::numeric_limits<double>::max();
+    const double increment = crossing < 1.0 and dt > limit * crossing ? limit : dt / crossing;
+    return quiet > limit - increment ? limit : quiet + increment;
+  }
+
+  /** Phase one checks accepted neighbours; phase two checks only eligible parents. */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  bool AMRCore<N, V, C, P, A, T, E, S>::parentPassesNeighbours(
+    const Family& family, const P* parent, const Key& parentKey,
+    double time, double dt, bool onlyProposedNeighbours
+  ) const {
+    if constexpr (not S::CheckNeighbours) return true;
+    else {
+      bool passes = true;
+      const AcceptedCellView<P> proposed{parent, N, T::IsFiniteVolume
+        ? AcceptedRepresentation::FVCellAverages : AcceptedRepresentation::DGNodal};
+      const auto compatible = [&](const AcceptedCellView<P>& other, const Key& otherKey, int normal, int side) {
+        const double detail = faceDetail(proposed, other, parentKey, otherKey, normal, side);
+        return std::isfinite(detail) and detail <= amr_detail::resolutionTolerance<C>();
+      };
+      // Deduplicate directed face checks by accepted slot or proposed family.
+      // Slot -1 identifies the parent's periodic self-neighbour.
+      std::set<std::array<int, 3>> checked;
+      for (const int childSlot : family.slots) {
+        const bool complete = forEachNativeNeighbour(*_mesh, childSlot, [&](int slot, int normal, int ownSide) {
+          if (not passes) return;
+          if (std::find(family.slots.begin(), family.slots.end(), slot) != family.slots.end()) {
+            const int position = _cells[childSlot].key[normal + 1] % peano4::SubdivisionFactor;
+            const bool exterior = ownSide == 0 ? position == 0 : position == peano4::SubdivisionFactor - 1;
+            // Compare both sides of the parent when coarsening closes a periodic seam.
+            if (not onlyProposedNeighbours and exterior
+                and checked.insert({-1, normal, ownSide}).second
+                and not compatible(proposed, parentKey, normal, ownSide)) passes = false;
+            return;
+          }
+          if (slot < 0 or slot >= static_cast<int>(_cells.size())) {
+            passes = false;
+            return;
+          }
+          const auto& neighbour = _cells[slot];
+          if (not onlyProposedNeighbours) {
+            if (not checked.insert({slot, normal, ownSide}).second) return;
+            const auto otherView = accepted(neighbour);
+            if (not finite(otherView) or not compatible(otherView, neighbour.key, normal, ownSide)) passes = false;
+            return;
+          }
+          // Phase two reuses the cached accepted-neighbour checks.
+          if (neighbour.family < 0 or not _families[neighbour.family].complete) return;
+          if (not checked.insert({neighbour.family, normal, ownSide}).second) return;
+          // Compare independently eligible parents to avoid recursive family decisions.
+          const auto& trial = familyPlan(neighbour.family, time, dt);
+          if (not trial.eligible) return;
+          const AcceptedCellView<P> trialView{trial.parent.data(), N, proposed.representation};
+          if (not compatible(trialView, trial.key, normal, ownSide)) passes = false;
+        });
+        // Missing neighbours cannot justify coarsening.
+        if (not complete or not passes) return false;
+      }
+      return true;
+    }
+  }
+
+  /** Check transfer loss and physical admissibility after restriction and prolongation. */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  bool AMRCore<N, V, C, P, A, T, E, S>::transferPasses(
+    const Family& family, double time, double dt, P* parent, Key& parentKey
+  ) const {
+    if (not family.complete or _mesh == nullptr or _restrictionBound <= 0.0 or _prolongationBound <= 0.0) return false;
+    if (not amr_detail::transfer_bound::arithmeticSupported()) return false;
+    const P* children[peano4::ChildrenPerCell];
+    observation_detail::Stencil<V, C> observedTransfer;
+    const double limit = static_cast<double>(std::numeric_limits<P>::max());
+    for (int child = 0; child < peano4::ChildrenPerCell; child++) {
+      const auto& cell = _cells[family.slots[child]];
+      if (not E::quietEligible(cell.status)) return false;
+      if constexpr (S::CheckQuietDetail or predictionMode()) {
+        // Require every child to satisfy the resolution budget before coarsening.
+        const auto detail = cellDetail(cell);
+        if (not detail.complete or detail.value > amr_detail::resolutionTolerance<C>()) return false;
+      }
+      if constexpr (not predictionMode()) {
+        if (quietProgress(cell, time, dt) < C::QuietTime) return false;
+      }
+      const auto view = accepted(cell);
+      if constexpr (predictionMode()) {
+        // Check accepted children for finite and physically admissible values.
+        if (not finite(view)
+            or (_admissible != nullptr
+              and not _admissible(view.values, view.numberOfStates(), cell.centre, cell.width))) return false;
+      }
+      // Require the accepted representation to match the transfer policy.
+      if (view.values != cell.state or view.pointsPerAxis != N
+          or view.isFiniteVolume() != T::IsFiniteVolume) return false;
+      children[child] = view.values;
+      if constexpr (observation_detail::count<C>() > 0) {
+        if (not observedTransfer.add(view)) return false;
+      }
+      for (int entry = 0; entry < Values; entry++) {
+        if (not std::isfinite(static_cast<double>(children[child][entry]))
+            or std::abs(static_cast<double>(children[child][entry])) > limit / _restrictionBound) return false;
+      }
+    }
+    P restored[Values];
+    T::restrict(children, parent, _restriction);
+    if (not finite(parent)) return false;
+    for (int entry = 0; entry < Values; entry++) {
+      if (std::abs(static_cast<double>(parent[entry])) > limit / _prolongationBound) return false;
+    }
+    const auto& first = _cells[family.slots[0]];
+    // Use lattice geometry for the proposed parent's physical checks.
+    Coordinates width, centre;
+    parentKey = {};
+    parentKey[0] = first.key[0] - 1;
+    const auto offset = _mesh->getDomainOffset();
+    for (int axis = 0; axis < DIMENSIONS; axis++) {
+      parentKey[axis + 1] = first.key[axis + 1] / peano4::SubdivisionFactor;
+      width(axis) = _mesh->getWidthOfLevel(first.key[0] - 1, axis);
+      centre(axis) = offset(axis)
+        + (static_cast<double>(parentKey[axis + 1]) + 0.5) * width(axis);
+      if (not std::isfinite(width(axis)) or width(axis) <= 0.0 or not std::isfinite(centre(axis))) return false;
+    }
+    if (_admissible != nullptr and not _admissible(parent, Nodes, centre, width)) return false;
+    // Check parent observables against the children's extrema.
+    if (_transferAdmissible != nullptr and not _transferAdmissible(parent, children)) return false;
+    // Apply the additional modal resolution check in legacy mode.
+    if constexpr (not predictionMode()) {
+      if (localDetail(parent) > amr_detail::resolutionTolerance<C>()) return false;
+    }
+    double rms = 0.0;
+    constexpr double samples = static_cast<double>(peano4::ChildrenPerCell) * Nodes;
+    // Share a 32 KiB cache budget between state and observable parent bounds.
+    constexpr std::size_t cacheBytes = observation_detail::count<C>() > 0 ? 16*1024 : 32*1024;
+    using Prepared = std::conditional_t<T::IsFiniteVolume, detail::retained_parent::NoGeometry,
+      detail::retained_parent::PreparedParent<N, V, DIMENSIONS, peano4::SubdivisionFactor, P, cacheBytes>>;
+    using ObservedPrepared = std::conditional_t<not T::IsFiniteVolume and (observation_detail::count<C>() > 0),
+      Prepared, detail::retained_parent::NoGeometry>;
+    [[maybe_unused]] Prepared preparedParent;
+    [[maybe_unused]] ObservedPrepared observedParent;
+    [[maybe_unused]] bool parentPrepared = false, observationsPrepared = false;
+    for (int child = 0; child < peano4::ChildrenPerCell; child++) {
+      T::prolong(parent, restored, _prolongation, child);
+      if (not finite(restored)) return false;
+      for (int node = 0; node < Nodes; node++) {
+        std::array<double, V> residuals;
+        for (int entry = 0; entry < V; entry++) {
+          const double scale = C::stateScale(entry);
+          const double a = static_cast<double>(children[child][node * V + entry]);
+          const double b = static_cast<double>(restored[node * V + entry]);
+          if (not std::isfinite(scale) or scale <= 0.0) return false;
+          // Round residual bounds outwards.
+          residuals[entry] = amr_detail::transfer_bound::magnitude(amr_detail::transfer_bound::difference(a, b, scale));
+          if (not std::isfinite(residuals[entry]) or residuals[entry] > C::TransferTolerance) return false;
+          if constexpr (predictionMode()) rms = amr_detail::guardedHypot(rms, residuals[entry] / std::sqrt(samples));
+        }
+        if (not amr_detail::transfer_bound::normPasses<V>(residuals, C::TransferTolerance)) return false;
+      }
+      if (not T::polynomialPasses(children[child], restored)) return false;
+      if constexpr (observation_detail::count<C>() > 0)
+        if (not observedTransfer.template transferPasses<N>(children[child], restored, T::IsFiniteVolume)) return false;
+      if constexpr (not T::IsFiniteVolume) {
+        // Bound loss against the retained parent polynomial as well as the numerical prolongation.
+        std::array<double, V> scales;
+        for (int component = 0; component < V; component++) {
+          scales[component] = C::stateScale(component);
+        }
+        amr_detail::transfer_bound::Field<N, V, DIMENSIONS> residual;
+        if (not parentPrepared) {
+          if (not preparedParent.prepare(parent, _retainedParentGeometry, scales)) return false;
+          parentPrepared = true;
+        }
+        if (not preparedParent.residual(children[child], child, residual)
+            or not amr_detail::transferPolynomialIntervalsPasses<N, V, C>(residual)) return false;
+        if constexpr (observation_detail::count<C>() > 0) {
+          // Use unscaled residuals for observables to avoid overflowing scaled weights.
+          const bool unitScales = std::all_of(scales.begin(), scales.end(), [](double scale) { return scale == 1.; });
+          if (unitScales) {
+            if (not observedTransfer.template transferIntervalsPasses<N>(residual, false)) return false;
+          } else {
+            scales.fill(1.);
+            if (not observationsPrepared) {
+              if (not observedParent.prepare(parent, _retainedParentGeometry, scales)) return false;
+              observationsPrepared = true;
+            }
+            if (not observedParent.residual(children[child], child, residual)
+                or not observedTransfer.template transferIntervalsPasses<N>(residual, false)) return false;
+          }
+        }
+      }
+    }
+    if constexpr (predictionMode()) {
+      if (not std::isfinite(rms) or rms > amr_detail::resolutionTolerance<C>()) return false;
+    }
+    return true;
+  }
+
+  /** Cache phase-one eligibility without reading another family's plan. */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  auto AMRCore<N, V, C, P, A, T, E, S>::familyPlan(int family, double time, double dt) const -> const FamilyPlan& {
+    auto& plan = _familyPlans[family];
+    int expected = 0;
+    if (plan.state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+      const auto& siblings = _families[family];
+      plan.sizeVetoed = false;
+      if (siblings.complete and _clock != nullptr) {
+        const double width = tarch::la::max(_cells[siblings.slots[0]].width);
+        // Apply the engine's parent-size guard before computing transfer bounds.
+        if (std::isfinite(width) and width >= 0.0
+            and width <= std::numeric_limits<double>::max() / peano4::SubdivisionFactor
+            and not (peano4::SubdivisionFactor * width <= _clock->getLimits().maxAdmissiblePatchSize)) {
+          plan.transferSafe = false;
+          plan.neighboursSafe = false;
+          plan.safe = false;
+          plan.eligible = false;
+          plan.sizeVetoed = true;
+          plan.state.store(2, std::memory_order_release);
+          return plan;
+        }
+      }
+      plan.transferSafe = transferPasses(siblings, time, dt, plan.parent.data(), plan.key);
+      bool parentResolved = true;
+      if constexpr (predictionMode()) {
+        if (plan.transferSafe) {
+          const AcceptedCellView<P> proposed{plan.parent.data(), N, T::IsFiniteVolume
+            ? AcceptedRepresentation::FVCellAverages : AcceptedRepresentation::DGNodal};
+          const double detail = acceptedLocalDetail(proposed, _nodes);
+          // Require the parent to pass its own local resolution test.
+          parentResolved = std::isfinite(detail) and detail <= amr_detail::resolutionTolerance<C>();
+        }
+      }
+      plan.neighboursSafe = plan.transferSafe
+        and parentResolved and parentPassesNeighbours(siblings, plan.parent.data(), plan.key, time, dt, false);
+      plan.safe = plan.transferSafe and plan.neighboursSafe;
+      // Combine transfer, parent-resolution and accepted-neighbour checks.
+      plan.eligible = plan.safe;
+      if (plan.eligible) {
+        // Permit only parent sizes accepted by the engine's regridding guard.
+        const auto& first = _cells[siblings.slots[0]];
+        plan.eligible = _clock != nullptr
+          and peano4::SubdivisionFactor * tarch::la::max(first.width)
+            <= _clock->getLimits().maxAdmissiblePatchSize;
+      }
+      plan.state.store(2, std::memory_order_release);
+    } else {
+      while (plan.state.load(std::memory_order_acquire) == 1) std::this_thread::yield();
+    }
+    return plan;
+  }
+
+  /** Compute each family's coarsening vote once across threads. */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  bool AMRCore<N, V, C, P, A, T, E, S>::familyPasses(int family, double time, double dt) const {
+    if (family < 0) return false;
+    auto& result = _familyVotes[family];
+    int expected = 0;
+    if (result.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+      const auto& plan = familyPlan(family, time, dt);
+      // Check eligible parents against neighbouring proposed parents.
+      const bool passed = plan.eligible
+        and parentPassesNeighbours(_families[family], plan.parent.data(), plan.key, time, dt, true);
+      result.store(passed ? 3 : 2, std::memory_order_release);
+      return passed;
+    }
+    while ((expected = result.load(std::memory_order_acquire)) == 1) std::this_thread::yield();
+    return expected == 3;
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  exahype2::RefinementCommand AMRCore<N, V, C, P, A, T, E, S>::command(
+    const P* Q, const Coordinates& x, const Coordinates& h, double time
+  ) const {
+    using Command = exahype2::RefinementCommand;
+    if (Q == nullptr) return Command::Keep;
+    for (int axis = 0; axis < DIMENSIONS; axis++) {
+      if (not std::isfinite(x(axis)) or not std::isfinite(h(axis)) or h(axis) <= 0.0) return Command::Keep;
+    }
+    // Initialisation permits refinement or keeping the current cell.
+    if (_initialising) {
+      const auto initialDetail = [&]() {
+        if constexpr (predictionMode() and requires { C::resolutionComponent(0); }) {
+          std::array<P, Values> selected{};
+          for (int node = 0; node < Nodes; node++) for (int component = 0; component < V; component++)
+            if (amr_detail::resolutionComponent<C>(component)) selected[node * V + component] = Q[node * V + component];
+          return localDetail(selected.data());
+        } else return localDetail(Q);
+      };
+      bool observedUnresolved = false;
+      if constexpr (observation_detail::count<C>() > 0) {
+        // Use modal detail when independent initial-data samples are unavailable.
+        if (_initialDataCheck == nullptr) {
+          const AcceptedCellView<P> initial{Q, N, T::IsFiniteVolume
+            ? AcceptedRepresentation::FVCellAverages : AcceptedRepresentation::DGNodal};
+          observedUnresolved = observation_detail::localRatio<N, V, C>(initial, nullptr, true) > 1.0;
+        }
+      }
+      return not finite(Q) or (_admissible != nullptr and not _admissible(Q, Nodes, x, h))
+        or observedUnresolved
+        or (_initialDataCheck != nullptr ? not _initialDataCheck(Q, x, h)
+          : initialDetail() > amr_detail::resolutionTolerance<C>())
+        ? Command::Refine : Command::Keep;
+    }
+    if (not fresh(time)) return Command::Keep;
+    const auto found = _lookup.find(geometry(x, h));
+    if (found == _lookup.end()) return Command::Keep;
+    const auto& cell = _cells[found->second];
+    if (cell.state != Q or not E::available(cell.status)) return Command::Keep;
+    if (E::requiresResolution(cell.status)) {
+      if constexpr (predictionMode() and requires { E::requestsRefinement(cell.status); }) {
+        // Active limiter cells request refinement; halo cells use the spatial sensor.
+        if (E::requestsRefinement(cell.status))
+          return locallyConstant(cell) ? Command::Keep : Command::Refine;
+      } else {
+        return locallyConstant(cell) ? Command::Keep : Command::Refine;
+      }
+    }
+    if constexpr (not predictionMode()) {
+      if (not E::quietEligible(cell.status)) return Command::Keep;
+    } else if constexpr (requires { E::known(cell.status); }) {
+      if (not E::known(cell.status)) return Command::Keep;
+    }
+    const auto view = accepted(cell);
+    if constexpr (predictionMode()) {
+      // Keep the cell when accepted solution data are unavailable.
+      if (view.values == nullptr or view.pointsPerAxis <= 0) return Command::Keep;
+    }
+    // Give resolution violations priority over coarsening requests.
+    const auto detail = cellDetail(cell);
+    if (detail.value > amr_detail::resolutionTolerance<C>()) return Command::Refine;
+    if constexpr (S::CheckCommandPhysical) {
+      if (_admissible != nullptr and not _admissible(view.values, view.numberOfStates(), x, h)) return Command::Refine;
+    }
+    // Preserve cells required by the limiter stencil.
+    if (not E::quietEligible(cell.status)) return Command::Keep;
+    // Require complete neighbour data before coarsening.
+    if (not detail.complete) return Command::Keep;
+    return familyPasses(cell.family, time, _clock->getTimeStepSizeOfLastStep()) ? Command::Erase : Command::Keep;
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  void AMRCore<N, V, C, P, A, T, E, S>::finishStep() {
+    if (not _active) return;
+    if constexpr (not predictionMode()) {
+      if (_clock != nullptr and fresh(_clock->getTimeStamp())) {
+        const double time = _clock->getTimeStamp(), dt = _clock->getTimeStepSizeOfLastStep();
+        constexpr bool reuseQuiet = [] {
+          if constexpr (requires { C::ReuseQuietProgress; }) return C::ReuseQuietProgress;
+          return false;
+        }();
+        // Each leaf owns the history entry it updates.
+        tarch::accelerator::parallelForOnHost(tarch::accelerator::Range(static_cast<int>(_leaves.size())), [&](int entry) {
+          const auto& cell = _cells[_leaves[entry]];
+          if (not reuseQuiet) cell.quietReady = false;
+          cell.history->time = time;
+          cell.history->quiet = std::max(0.0, quietProgress(cell, time, dt));
+        });
+        finishQuietRegions(time, dt);
+        if (_historyNeedsPruning) {
+          for (auto entry = _history.begin(); entry != _history.end();) {
+            if (not entry->second.live) entry = _history.erase(entry);
+            else ++entry;
+          }
+          _historyNeedsPruning = false;
+        }
+      } else {
+        // Discard legacy quiet history when no valid step completed.
+        _history.clear();
+        _topologyCached = false;
+        _historyNeedsPruning = false;
+      }
+    }
+    _active = false;
+  }
+
+  /** Snapshot completed cache entries without forcing any further assessment. */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  auto AMRCore<N, V, C, P, A, T, E, S>::statistics() const -> Statistics {
+    Statistics result;
+    result.totalFamilies = _families.size();
+    for (std::size_t index = 0; index < _families.size(); index++) {
+      if (_families[index].complete) result.completeFamilies++;
+      const auto& plan = _familyPlans[index];
+      if (plan.state.load(std::memory_order_acquire) != 2) continue;
+      result.assessedFamilies++;
+      if (plan.sizeVetoed) result.sizeVetoedFamilies++;
+      if (plan.transferSafe) result.transferPassed++;
+      if (plan.neighboursSafe) result.currentNeighboursPassed++;
+      if (plan.eligible) {
+        result.eligibleFamilies++;
+        result.quietReady++;
+      }
+      const int vote = _familyVotes[index].load(std::memory_order_acquire);
+      if (vote == 3) result.eraseVotes++;
+      else if (vote == 2 and plan.eligible) result.conflictVetoes++;
+    }
+    if constexpr (S::CheckNeighbours) {
+      for (const int slot : _leaves) {
+        const auto& detail = _detailCache[slot];
+        if (detail.state.load(std::memory_order_acquire) != 2) continue;
+        result.assessedLeaves++;
+        if (detail.evidence.value > amr_detail::resolutionTolerance<C>()) result.refineEvidence++;
+      }
+    }
+    return result;
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  void AMRCore<N, V, C, P, A, T, E, S>::setReferenceTime(double time) {
+    if (not std::isfinite(time) or time <= 0.0) {
+      throw std::invalid_argument(S::InvalidReferenceTime);
+    }
+    if constexpr (not predictionMode()) {
+      if (time != _referenceTime) reset();
+    }
+    _referenceTime = time;
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  void AMRCore<N, V, C, P, A, T, E, S>::reset() {
+    _detailCache.reset();
+    _detailCacheCapacity = 0;
+    _nativeStencils.clear();
+    _acceptedFaces.reset();
+    _acceptedFaceCount = _acceptedFaceCapacity = 0;
+    _active = false;
+    _initialising = false;
+    _clock = nullptr;
+    _waveSpeed = nullptr;
+    _admissible = nullptr;
+    _initialDataCheck = nullptr;
+    _transferAdmissible = nullptr;
+    _mesh = nullptr;
+    _subcells = {};
+    _history.clear();
+    _lookup.clear();
+    _cells.clear();
+    _leaves.clear();
+    _families.clear();
+    _quietRegions.clear();
+    _quietOrder.clear();
+    _familyVotes.reset();
+    _familyPlans.reset();
+    _familyVoteCapacity = 0;
+    _topologyCached = false;
+    _historyNeedsPruning = false;
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  bool AMRCore<N,V,C,P,A,T,E,S>::finite(const AcceptedCellView<P>& view) {
+    if (view.values == nullptr or view.pointsPerAxis <= 0) return false;
+    for (int entry = 0; entry < view.numberOfStates() * V; entry++) {
+      if (not std::isfinite(static_cast<double>(view.values[entry]))) return false;
+    }
+    return true;
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  auto AMRCore<N,V,C,P,A,T,E,S>::accepted(const Cell& cell) const -> AcceptedCellView<P> {
+    return A::accepted(cell.slot, cell.state, cell.status, _subcells);
+  }
+
+  /** Check admissibility and constancy of monitored fields in the cell and its
+   * face neighbours before suppressing limiter-driven refinement. */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  bool AMRCore<N,V,C,P,A,T,E,S>::locallyConstant(const Cell& cell) const {
+    if constexpr (not S::UseLocalConstancy) return false;
+    else {
+      if (not amr_detail::transfer_bound::arithmeticSupported()
+          or _mesh == nullptr or _subcells.segments == nullptr or _admissible == nullptr) return false;
+      // The limiter adapter defines the FV subcell count.
+      constexpr int SubcellsPerAxis = A::SubcellsPerAxis;
+      static_assert(SubcellsPerAxis > 0);
+      constexpr int Subcells = peano4::power(SubcellsPerAxis, DIMENSIONS);
+      if (_subcells.paddedChunkSize < Subcells * V) return false;
+      // Allow only projection roundoff when testing constancy.
+      constexpr double operations = 2.0 * SubcellsPerAxis * DIMENSIONS;
+      constexpr double product = operations * (std::numeric_limits<P>::epsilon() / 2.0);
+      if constexpr (product >= 1.0) return false;
+      constexpr double gamma = product / (1.0 - product);
+      const double budget = std::min(C::TransferTolerance, amr_detail::resolutionTolerance<C>());
+      std::array<double, V> lower, upper, magnitudes{};
+      lower.fill(std::numeric_limits<double>::infinity());
+      upper.fill(-std::numeric_limits<double>::infinity());
+      const auto needsConstancy = [](int entry) {
+        if (amr_detail::resolutionComponent<C>(entry)) return true;
+        // Include every field used by an observable in the constancy check.
+        if constexpr (observation_detail::count<C>() > 0)
+          for (int observation = 0; observation < observation_detail::count<C>(); observation++)
+            if (C::observableWeight(observation, entry) != 0.0) return true;
+        return false;
+      };
+      const auto matches = [&](const P* values, int states) {
+        if (values == nullptr or states <= 0) return false;
+        for (int node = 0; node < states; node++) {
+          for (int entry = 0; entry < V; entry++) {
+            const double value = values[node * V + entry];
+            const double limit = std::numeric_limits<double>::max();
+            if (not std::isfinite(value)) return false;
+            if (not needsConstancy(entry)) continue;
+            lower[entry] = std::min(lower[entry], value);
+            upper[entry] = std::max(upper[entry], value);
+            if (upper[entry] > 0.0 and lower[entry] < 0.0 and upper[entry] > limit + lower[entry]) return false;
+            const double difference = upper[entry] - lower[entry];
+            const double magnitude = std::min(std::abs(lower[entry]), std::abs(upper[entry]));
+            const double scale = C::stateScale(entry);
+            if (difference > gamma * magnitude
+                or not std::isfinite(scale) or scale <= 0.0
+                or (scale < 1.0 and difference > limit * scale)) return false;
+            magnitudes[entry] = amr_detail::transfer_bound::magnitude(
+              amr_detail::transfer_bound::difference(upper[entry], lower[entry], scale)
+            );
+            if (not std::isfinite(magnitudes[entry]) or magnitudes[entry] > budget) return false;
+          }
+        }
+        return true;
+      };
+      const auto inspect = [&](const Cell& observed) {
+        if (not E::known(observed.status)) return false;
+        const auto view = accepted(observed);
+        if (view.values == nullptr or view.pointsPerAxis <= 0) return false;
+        // Check both the DG storage and the accepted FV values for constancy.
+        if (not matches(observed.state, Nodes)) return false;
+        double detail;
+        if constexpr (predictionMode() and requires { C::resolutionComponent(0); }) {
+          std::array<P, Values> selected{};
+          for (int node = 0; node < Nodes; node++) for (int component = 0; component < V; component++)
+            if (needsConstancy(component)) selected[node * V + component] = observed.state[node * V + component];
+          detail = localDetail(selected.data());
+        } else detail = localDetail(observed.state);
+        if (detail > amr_detail::resolutionTolerance<C>()) return false;
+        if (view.isFiniteVolume() and not matches(view.values, view.numberOfStates())) return false;
+        return _admissible(observed.state, Nodes, observed.centre, observed.width)
+          and (not view.isFiniteVolume()
+            or _admissible(view.values, view.numberOfStates(), observed.centre, observed.width));
+      };
+      if (not inspect(cell)) return false;
+      bool matchesNeighbours = true;
+      const bool complete = forEachNativeNeighbour(*_mesh, cell.slot, [&](int slot) {
+        if (not matchesNeighbours) return;
+        // Require an available accepted state for each neighbour.
+        if (slot < 0 or slot >= static_cast<int>(_cells.size()) or _cells[slot].slot != slot) {
+          matchesNeighbours = false;
+          return;
+        }
+        matchesNeighbours = inspect(_cells[slot]);
+      });
+      return complete and matchesNeighbours
+        and amr_detail::transfer_bound::normPasses<V>(magnitudes, budget);
+    }
+  }
+
+} // namespace exahype2::amr

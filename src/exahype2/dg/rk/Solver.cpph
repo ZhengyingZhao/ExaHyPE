@@ -108,7 +108,7 @@ exahype2::dg::rk::Solver<Derived, StoragePrecision, ComputePrecision>::performTi
   const auto statistics = combineFinalState(cellConnectivity, timeStepSize, parameters);
   this->closeTimeStep(timeStepSize, statistics);
   this->measureError(cellConnectivity, parameters);
-  this->voteOnRefinement(cellConnectivity, requests, parameters);
+  this->voteOnRefinementAfterTimeStep(cellConnectivity, requests, parameters);
 }
 
 /**

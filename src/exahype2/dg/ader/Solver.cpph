@@ -226,7 +226,7 @@ exahype2::dg::ader::Solver<Derived, StoragePrecision, ComputePrecision, Limiter>
   }
   this->closeTimeStep(timeStepSize, statistics);
   this->measureError(cellConnectivity, parameters);
-  this->voteOnRefinement(cellConnectivity, requests, parameters);
+  this->voteOnRefinementAfterTimeStep(cellConnectivity, requests, parameters);
 }
 
 /**
@@ -357,8 +357,8 @@ exahype2::dg::ader::Solver<Derived, StoragePrecision, ComputePrecision, Limiter>
     }
     this->measureError(cellConnectivity, parameters);
     partner.measureError(cellConnectivity, parameters);
-    this->voteOnRefinement(cellConnectivity, requests, parameters);
-    partner.voteOnRefinement(cellConnectivity, requests, parameters);
+    this->voteOnRefinementAfterTimeStep(cellConnectivity, requests, parameters);
+    partner.voteOnRefinementAfterTimeStep(cellConnectivity, requests, parameters);
   };
 }
 

@@ -53,8 +53,10 @@ class Solver:
         self._solver_base_user_definitions = ""
         self._solver_user_declarations = ""
         self._start_grid_initialisation_implementation = ""
+        self._refinement_initialisation_implementation = ""
         self._start_time_step_implementation = ""
         self._finish_time_step_implementation = ""
+        self._refinement_assessment_implementation = ""
         self._start_simulation_implementation = ""
         self._finish_simulation_implementation = ""
         self._error_measurement = None
@@ -396,11 +398,17 @@ class Solver:
         d["START_GRID_INITIALISATION_IMPLEMENTATION"] = render_template(
             self._start_grid_initialisation_implementation
         )
+        d["REFINEMENT_INITIALISATION_IMPLEMENTATION"] = render_template(
+            self._refinement_initialisation_implementation
+        )
         d["START_TIME_STEP_IMPLEMENTATION"] = render_template(
             self._start_time_step_implementation
         )
         d["FINISH_TIME_STEP_IMPLEMENTATION"] = render_template(
             self._finish_time_step_implementation
+        )
+        d["REFINEMENT_ASSESSMENT_IMPLEMENTATION"] = render_template(
+            self._refinement_assessment_implementation
         )
         d["START_SIMULATION_IMPLEMENTATION"] = render_template(
             self._start_simulation_implementation
@@ -483,6 +491,9 @@ class Solver:
 
     def _validate(self):
         """Checks the configuration of the solver when the project generates its code."""
+        native_criterion = getattr(self, "_independent_native_criterion", None)
+        if native_criterion is not None:
+            native_criterion._validate_solver(self)
         if self.time_stepping.adaptive and not self._provides_max_eigenvalue():
             raise ValueError(
                 "The solver {} needs the max_eigenvalue PDE term for adaptive time stepping.".format(

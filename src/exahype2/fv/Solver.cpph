@@ -159,6 +159,29 @@ exahype2::fv::Solver<Derived, StoragePrecision, ComputePrecision>::performTimeSt
   _timeStepping.advanceTimeStamp(timeStepSize);
   proposeTimeStepSize(maxEigenvalue);
   measureError(cellConnectivity, parameters);
+  if constexpr (requires { Derived::DeferTimeStepRefinement; }) {
+    if constexpr (not Derived::DeferTimeStepRefinement) {
+      assessRefinement(cellConnectivity, requests, parameters);
+    }
+  } else {
+    assessRefinement(cellConnectivity, requests, parameters);
+  }
+}
+
+template <typename Derived, typename StoragePrecision, typename ComputePrecision>
+template <typename RuntimeParameters>
+INLINE_METHOD void
+exahype2::fv::Solver<Derived, StoragePrecision, ComputePrecision>::assessRefinement(
+  const peano4::CellConnectivity& cellConnectivity,
+  exahype2::RefinementRequests&   requests,
+  const RuntimeParameters&        parameters,
+  const bool                     enabled
+) {
+  if (not enabled) {
+    _meshChangedSinceLastTimeStep = false;
+    requests.merge(exahype2::RefinementCommand::Keep, cellConnectivity.getCells());
+    return;
+  }
   if (_meshChangedSinceLastTimeStep) {
     _meshChangedSinceLastTimeStep = false;
   } else {

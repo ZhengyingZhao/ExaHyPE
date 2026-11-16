@@ -1,0 +1,178 @@
+// This file is part of the ExaHyPE2 project. For conditions of distribution and
+// use, please see the copyright notice at www.peano-framework.org
+// Bound the loss between fine DG polynomials and the stored parent polynomial.
+#pragma once
+#include "TransferBounds.h"
+#include <type_traits>
+#include <cstddef>
+
+namespace exahype2::amr::detail::retained_parent {
+  namespace bound = ::exahype2::amr::detail::transfer_bound;
+  using Interval = bound::Interval;
+  struct NoGeometry {};
+
+  // Divide intervals; a denominator containing zero yields an invalid bound.
+  inline Interval quotient(Interval a, Interval b) {
+    if (not bound::valid(a) or not bound::valid(b) or (b.lo <= 0. and b.hi >= 0.)) return bound::bad();
+    if (bound::zero(a)) return {0., 0.};
+    const std::array<double, 2> numerator{a.lo, a.hi}, denominator{b.lo, b.hi};
+    std::array<double, 4> values;
+    int entry = 0;
+    for (double x : numerator) for (double y : denominator) {
+      const double divisor = std::abs(y);
+      if (divisor < 1.) {
+        // Round the safe range towards zero before attempting x/y.
+        const double safe = std::nextafter(std::numeric_limits<double>::max() * divisor, 0.);
+        if (std::abs(x) > safe) return bound::bad();
+      }
+      values[entry++] = x / y;
+    }
+    for (double x : values) if (not std::isfinite(x)) return bound::bad();
+    return {bound::down(*std::min_element(values.begin(), values.end())),
+            bound::up(*std::max_element(values.begin(), values.end()))};
+  }
+
+  /** Cache interval interpolation weights by node values.
+   * For child c, matrix[row*N+col] encloses L_col((c+node[row])/R),
+   * using the exact Lagrange basis of the stored double nodes.
+   */
+  template<int N, int R>
+  class Geometry {
+    static_assert(N > 0 and R > 1);
+    std::array<double, N> _nodes{};
+    std::array<std::array<Interval, N*N>, R> _matrix{};
+    bool _bound = false, _valid = false;
+  public:
+    bool bind(const double* nodes) {
+      if (nodes == nullptr or not bound::arithmeticSupported()) { _bound = false; return _valid = false; }
+      if (_bound and std::equal(_nodes.begin(), _nodes.end(), nodes)) return _valid;
+      std::copy_n(nodes, N, _nodes.begin());
+      _bound = true;
+      _valid = false;
+      for (int node = 0; node < N; node++)
+        if (not std::isfinite(nodes[node]) or nodes[node] < 0. or nodes[node] > 1.
+            or (node > 0 and nodes[node] <= nodes[node-1])) return false;
+      for (int child = 0; child < R; child++) for (int row = 0; row < N; row++) {
+        const Interval coordinate = bound::div(
+          bound::add({double(child), double(child)}, {nodes[row], nodes[row]}), double(R));
+        for (int col = 0; col < N; col++) {
+          Interval weight{1., 1.};
+          for (int other = 0; other < N; other++) if (other != col) {
+            const auto numerator = bound::sub(coordinate, {nodes[other], nodes[other]});
+            const auto denominator = bound::sub({nodes[col], nodes[col]}, {nodes[other], nodes[other]});
+            weight = bound::mul(weight, quotient(numerator, denominator));
+          }
+          if (not bound::valid(weight)) return false;
+          _matrix[child][row*N+col] = weight;
+        }
+      }
+      return _valid = true;
+    }
+    [[nodiscard]] bool valid() const { return _valid; }
+    [[nodiscard]] const std::array<Interval, N*N>& matrix(int child) const { return _matrix[child]; }
+  };
+
+  /** Enclose (fine polynomial - retained parent polynomial)/component_scale
+   * at the fine nodes, using the stored DG nodes and the exact affine child map.
+   *
+   * Partition of unity gives q(x)-reference = sum L_i(x)*(q_i-reference).
+   * Centering keeps equal constants exact and bounds uncertainty by variation.
+   */
+  template<int N, int V, int D, int R, typename P>
+  bool residual(const P* fine, const P* parent, const Geometry<N, R>& geometry,
+                int child, const std::array<double, V>& scales,
+                bound::Field<N, V, D>& output) {
+    static_assert(std::is_same_v<P, float> or std::is_same_v<P, double>,
+      "Retained-parent certificates require float or double stored values.");
+    static_assert(V > 0 and D > 0 and D <= 3);
+    if (fine == nullptr or parent == nullptr or not geometry.valid()
+        or child < 0 or child >= bound::power(R, D) or not bound::arithmeticSupported()) return false;
+    bound::Field<N, V, D> represented;
+    std::array<double, V> reference;
+    for (int component = 0; component < V; component++) {
+      reference[component] = static_cast<double>(parent[component]);
+      if (not std::isfinite(reference[component]) or not std::isfinite(scales[component]) or scales[component] <= 0.) return false;
+    }
+    for (int node = 0; node < bound::power(N, D); node++) for (int component = 0; component < V; component++) {
+      auto& value = represented[node*V+component];
+      value = bound::difference(static_cast<double>(parent[node*V+component]), reference[component], scales[component]);
+      if (not bound::valid(value)) return false;
+    }
+    for (int axis = 0; axis < D; axis++) {
+      represented = bound::contract<N, V, D>(represented, geometry.matrix(child % R), axis);
+      child /= R;
+    }
+    for (int node = 0; node < bound::power(N, D); node++) for (int component = 0; component < V; component++) {
+      const auto centeredFine = bound::difference(static_cast<double>(fine[node*V+component]), reference[component], scales[component]);
+      output[node*V+component] = bound::sub(centeredFine, represented[node*V+component]);
+      if (not bound::valid(output[node*V+component])) return false;
+    }
+    return true;
+  }
+  /** Cache normalization and first-axis contractions for one immutable parent,
+   * geometry and scale set, preserving residual()'s scalar operation order.
+   */
+  template<int N, int V, int D, int R, typename P, std::size_t CacheBytes = 32*1024>
+  class PreparedParent {
+    using Field = bound::Field<N, V, D>;
+    struct Axis0Cache {
+      std::array<Field, R> values;
+      std::array<bool, R> ready{};
+    };
+  public:
+    static constexpr bool CachesAxis0 = D > 1 and sizeof(Axis0Cache) <= CacheBytes;
+    static constexpr std::size_t CacheStorageBytes = CachesAxis0 ? sizeof(Axis0Cache) : 0;
+  private:
+    std::conditional_t<CachesAxis0, Axis0Cache, std::array<char, 0>> _axis0;
+    Field _normalised;
+    std::array<double, V> _reference, _scales;
+    const Geometry<N, R>* _geometry{nullptr};
+    bool _valid{false};
+  public:
+    bool prepare(const P* parent, const Geometry<N, R>& geometry, const std::array<double, V>& scales) {
+      static_assert(std::is_same_v<P, float> or std::is_same_v<P, double>);
+      static_assert(N > 0 and V > 0 and D > 0 and D <= 3);
+      _valid = false;
+      _geometry = &geometry;
+      if constexpr (CachesAxis0) _axis0.ready.fill(false);
+      if (parent == nullptr or not geometry.valid() or not bound::arithmeticSupported()) return false;
+      _scales = scales;
+      for (int component = 0; component < V; component++) {
+        _reference[component] = static_cast<double>(parent[component]);
+        if (not std::isfinite(_reference[component]) or not std::isfinite(scales[component]) or scales[component] <= 0.) return false;
+      }
+      for (int node = 0; node < bound::power(N, D); node++) for (int component = 0; component < V; component++) {
+        auto& value = _normalised[node*V+component];
+        value = bound::difference(static_cast<double>(parent[node*V+component]), _reference[component], scales[component]);
+        if (not bound::valid(value)) return false;
+      }
+      return _valid = true;
+    }
+    bool residual(const P* fine, int child, Field& output) {
+      if (fine == nullptr or not _valid or not _geometry->valid()
+          or child < 0 or child >= bound::power(R, D) or not bound::arithmeticSupported()) return false;
+      Field represented;
+      int firstAxis = 0;
+      if constexpr (CachesAxis0) {
+        const int position = child % R;
+        if (not _axis0.ready[position]) {
+          _axis0.values[position] = bound::contract<N, V, D>(_normalised, _geometry->matrix(position), 0);
+          _axis0.ready[position] = true;
+        }
+        represented = _axis0.values[position];
+        child /= R;
+        firstAxis = 1;
+      } else represented = _normalised;
+      for (int axis = firstAxis; axis < D; axis++) {
+        represented = bound::contract<N, V, D>(represented, _geometry->matrix(child % R), axis);
+        child /= R;
+      }
+      for (int node = 0; node < bound::power(N, D); node++) for (int component = 0; component < V; component++) {
+        const auto centeredFine = bound::difference(static_cast<double>(fine[node*V+component]), _reference[component], _scales[component]);
+        output[node*V+component] = bound::sub(centeredFine, represented[node*V+component]);
+        if (not bound::valid(output[node*V+component])) return false;
+      }
+      return true;
+    }
+  };
+} // namespace exahype2::amr::detail::retained_parent

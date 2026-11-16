@@ -67,9 +67,12 @@ void {{NAMESPACE | join("::")}}::{{CLASSNAME}}::performTimeStep(
 {%- if FINISH_TIME_STEP_IMPLEMENTATION.strip() %}
   {{FINISH_TIME_STEP_IMPLEMENTATION.strip()}}
 {%- endif %}
+{%- if REFINEMENT_ASSESSMENT_IMPLEMENTATION.strip() %}
+  {{REFINEMENT_ASSESSMENT_IMPLEMENTATION.strip()}}
+{%- endif %}
 }
 {%- endif %}
-{%- if START_GRID_INITIALISATION_IMPLEMENTATION.strip() or TRACERS %}
+{%- if START_GRID_INITIALISATION_IMPLEMENTATION.strip() or REFINEMENT_INITIALISATION_IMPLEMENTATION.strip() or TRACERS %}
 
 void {{NAMESPACE | join("::")}}::{{CLASSNAME}}::initialise(
   const peano4::CellConnectivity& cellConnectivity,
@@ -78,6 +81,9 @@ void {{NAMESPACE | join("::")}}::{{CLASSNAME}}::initialise(
 ) {
 {%- if START_GRID_INITIALISATION_IMPLEMENTATION.strip() %}
   {{START_GRID_INITIALISATION_IMPLEMENTATION.strip()}}
+{%- endif %}
+{%- if REFINEMENT_INITIALISATION_IMPLEMENTATION.strip() %}
+  {{REFINEMENT_INITIALISATION_IMPLEMENTATION.strip()}}
 {%- endif %}
   SolverFamily::initialise(cellConnectivity, requests, parameters);
 {%- if TRACERS %}

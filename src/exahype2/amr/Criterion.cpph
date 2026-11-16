@@ -1,0 +1,47 @@
+// This file is part of the ExaHyPE2 project. For conditions of distribution and
+// use, please see the copyright notice at www.peano-framework.org
+namespace exahype2::amr {
+  template<int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  void Criterion<N,V,C,P,A,T,E,S>::beginInitialisation(PhysicalAdmissibility admissible, InitialDataCheck check) {
+    _core.beginInitialisation(admissible, check);
+  }
+
+  template<int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  template<typename SolutionView>
+    requires (not A::HasHybridSubcells)
+  void Criterion<N,V,C,P,A,T,E,S>::beginStep(
+    const peano4::CellConnectivity& mesh, SolutionView solution, const exahype2::TimeStepping& clock,
+    const double* nodes, const double* restriction, const double* prolongation, WaveSpeed waveSpeed,
+    PhysicalAdmissibility admissible, TransferAdmissibility transferAdmissible
+  ) {
+    _core.beginStep(mesh, solution, NoStatusView{}, clock, nodes, restriction, prolongation,
+                    waveSpeed, admissible, transferAdmissible);
+  }
+
+  template<int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  template<typename SolutionView, typename StatusView>
+    requires (A::HasHybridSubcells)
+  void Criterion<N,V,C,P,A,T,E,S>::beginStep(
+    const peano4::CellConnectivity& mesh, SolutionView solution, StatusView statuses,
+    const exahype2::TimeStepping& clock, const double* nodes, const double* restriction,
+    const double* prolongation, WaveSpeed waveSpeed, PhysicalAdmissibility admissible,
+    TransferAdmissibility transferAdmissible, NativeSubcells subcells
+  ) {
+    _core.beginStep(mesh, solution, statuses, clock, nodes, restriction, prolongation,
+                    waveSpeed, admissible, transferAdmissible, subcells);
+  }
+
+  template<int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  exahype2::RefinementCommand Criterion<N,V,C,P,A,T,E,S>::command(
+    const P* Q, const Coordinates& x, const Coordinates& h, double time
+  ) const { return _core.command(Q, x, h, time); }
+
+  template<int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  void Criterion<N,V,C,P,A,T,E,S>::finishStep() { _core.finishStep(); }
+
+  template<int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  void Criterion<N,V,C,P,A,T,E,S>::setReferenceTime(double time) { _core.setReferenceTime(time); }
+
+  template<int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  void Criterion<N,V,C,P,A,T,E,S>::reset() { _core.reset(); }
+} // namespace exahype2::amr

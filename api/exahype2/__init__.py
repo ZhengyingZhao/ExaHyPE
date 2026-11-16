@@ -3,6 +3,7 @@
 import importlib
 
 _LAZY_MODULES = {
+    "amr": "exahype2.amr",
     "codegen": "exahype2.codegen",
     "dg": "exahype2.dg",
     "fv": "exahype2.fv",
