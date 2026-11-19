@@ -17,6 +17,8 @@
 #include "tarch/testing/UnitTest.h"
 #include "unittests/peano4/TestGrids.h"
 
+#include <atomic>
+
 namespace {
   constexpr double MaxAdmissibleSize = 1.0;
   constexpr double MinAdmissibleSize = 0.1;
@@ -48,6 +50,24 @@ namespace {
 
   constexpr StubSolver::RuntimeParameters CommandOfThePatch{};
   constexpr StubSolver::RuntimeParameters RefinementOfEveryCell{.refinesEveryCell = true};
+
+  /** Deliberately host-only: a GPU vote kernel must never instantiate this callback. */
+  struct HostCriterionSolver final {
+    using RuntimeParameters                                  = StubSolver::RuntimeParameters;
+    static constexpr bool          RefinementCriterionOnHost = true;
+    inline static std::atomic<int> calls{0};
+
+    static exahype2::RefinementCommand refinementCriterion(
+      const double*                                Q,
+      const tarch::la::Vector<DIMENSIONS, double>& centre,
+      const tarch::la::Vector<DIMENSIONS, double>& width,
+      double                                       timeStamp,
+      const RuntimeParameters&                     parameters
+    ) {
+      ++calls;
+      return StubSolver::refinementCriterion(Q, centre, width, timeStamp, parameters);
+    }
+  };
 
   int getNumberOf(const exahype2::RefinementCommand command) { return static_cast<int>(command); }
 
@@ -359,6 +379,218 @@ UNIT_TEST("Limits that fix the mesh skip the votes") {
         VALIDATE(fixedRequests.empty());
         VALIDATE(not openRequests.empty());
       }
+    }
+  }
+}
+
+UNIT_TEST("A host-only criterion reads the downloaded device solution and refreshes its votes") {
+  const auto& cellConnectivity = buildGrid();
+  const int   numberOfSlots    = cellConnectivity.getNumberOfSlots();
+  Pool        deviceSolution(1, tarch::MemoryLocation::Device);
+  Pool        hostSolution(1, tarch::MemoryLocation::Heap);
+  deviceSolution.reserve(numberOfSlots);
+  exahype2::RefinementVotes    votes;
+  exahype2::RefinementRequests requests;
+
+  writeCommandIntoEveryCell(deviceSolution, cellConnectivity, exahype2::RefinementCommand::Refine);
+  const auto acceptedBefore  = std::as_const(deviceSolution).download(hostSolution).getView();
+  HostCriterionSolver::calls = 0;
+  requests.clear(numberOfSlots);
+  votes.voteOnEveryCell<HostCriterionSolver>(
+    cellConnectivity,
+    acceptedBefore,
+    getLimitsAroundTheGrid(),
+    TimeStamp,
+    requests,
+    CommandOfThePatch
+  );
+  const auto refineRequests = requests.getRefinementRequests(cellConnectivity);
+  VALIDATE(not refineRequests.empty());
+  VALIDATE_EQUALS(HostCriterionSolver::calls.load(), cellConnectivity.getCells().size);
+
+  writeCommandIntoEveryCell(deviceSolution, cellConnectivity, exahype2::RefinementCommand::Keep);
+  const auto acceptedAfter = std::as_const(deviceSolution).download(hostSolution).getView();
+  for (const int slot : cellConnectivity.getCells()) {
+    VALIDATE(acceptedBefore.getChunk(slot) == acceptedAfter.getChunk(slot));
+    VALIDATE_EQUALS(acceptedBefore.getChunk(slot)[0], static_cast<double>(exahype2::RefinementCommand::Keep));
+  }
+  requests.clear(numberOfSlots);
+  votes.voteOnEveryCell<HostCriterionSolver>(
+    cellConnectivity,
+    acceptedAfter,
+    getLimitsAroundTheGrid(),
+    TimeStamp,
+    requests,
+    CommandOfThePatch
+  );
+  VALIDATE(requests.getRefinementRequests(cellConnectivity).empty());
+
+  requests.clear(numberOfSlots);
+  votes.voteOnEveryCell<HostCriterionSolver>(
+    cellConnectivity,
+    acceptedAfter,
+    getLimitsAroundTheGrid(),
+    TimeStamp,
+    requests,
+    RefinementOfEveryCell
+  );
+  VALIDATE(requests.getRefinementRequests(cellConnectivity) == refineRequests);
+
+  votes.release();
+  VALIDATE_EQUALS(votes.getAllocatedBytes().getTotal(), std::size_t{0});
+}
+
+UNIT_TEST("Host-only and device criteria cast the same grid-construction and listed-cell votes") {
+  const auto&                  cellConnectivity = buildGrid();
+  const int                    numberOfSlots    = cellConnectivity.getNumberOfSlots();
+  exahype2::RefinementVotes    hostVotes, deviceVotes;
+  exahype2::RefinementRequests hostRequests, deviceRequests;
+  hostRequests.clear(numberOfSlots);
+  deviceRequests.clear(numberOfSlots);
+  HostCriterionSolver::calls = 0;
+  hostVotes.voteOnGridConstruction<HostCriterionSolver, double>(
+    cellConnectivity,
+    getLimitsAroundTheGrid(),
+    hostRequests,
+    RefinementOfEveryCell
+  );
+  deviceVotes.voteOnGridConstruction<StubSolver, double>(
+    cellConnectivity,
+    getLimitsAroundTheGrid(),
+    deviceRequests,
+    RefinementOfEveryCell
+  );
+  VALIDATE(
+    hostRequests.getRefinementRequests(cellConnectivity) == deviceRequests.getRefinementRequests(cellConnectivity)
+  );
+  VALIDATE_EQUALS(HostCriterionSolver::calls.load(), cellConnectivity.getCells().size);
+
+  Pool deviceSolution(1, tarch::MemoryLocation::Device);
+  Pool hostSolution(1, tarch::MemoryLocation::Heap);
+  deviceSolution.reserve(numberOfSlots);
+  writeCommandIntoEveryCell(deviceSolution, cellConnectivity, exahype2::RefinementCommand::Refine);
+  const auto       downloaded = std::as_const(deviceSolution).download(hostSolution).getView();
+  std::vector<int> listed;
+  for (int entry = 0; entry < cellConnectivity.getCells().size; entry += 2) {
+    listed.push_back(cellConnectivity.getCells()[entry]);
+  }
+  for (int selection = 0; selection < 2; ++selection) {
+    hostRequests.clear(numberOfSlots);
+    deviceRequests.clear(numberOfSlots);
+    HostCriterionSolver::calls = 0;
+    hostVotes.voteOnCells<HostCriterionSolver>(
+      cellConnectivity,
+      listed,
+      downloaded,
+      getLimitsAroundTheGrid(),
+      TimeStamp,
+      hostRequests,
+      CommandOfThePatch
+    );
+    deviceVotes.voteOnCells<StubSolver>(
+      cellConnectivity,
+      listed,
+      std::as_const(deviceSolution).getView(),
+      getLimitsAroundTheGrid(),
+      TimeStamp,
+      deviceRequests,
+      CommandOfThePatch
+    );
+    VALIDATE(
+      hostRequests.getRefinementRequests(cellConnectivity) == deviceRequests.getRefinementRequests(cellConnectivity)
+    );
+    VALIDATE_EQUALS(HostCriterionSolver::calls.load(), static_cast<int>(listed.size()));
+    listed.clear();
+  }
+}
+
+UNIT_TEST("Host-only criteria obey mesh size limits without calling a fixed-mesh criterion") {
+  const auto&  cellConnectivity = buildGrid();
+  const int    numberOfSlots    = cellConnectivity.getNumberOfSlots();
+  const double width            = cellConnectivity.getWidthOfLevel(cellConnectivity.getMaximumLevel(), 0);
+  Pool         hostSolution(1, tarch::MemoryLocation::Heap);
+  hostSolution.reserve(numberOfSlots);
+  for (const int slot : cellConnectivity.getCells()) {
+    hostSolution.getChunk(slot)[0] = static_cast<double>(exahype2::RefinementCommand::Refine);
+  }
+  exahype2::Limits limits;
+  limits.minAdmissiblePatchSize = width;
+  limits.maxAdmissiblePatchSize = width;
+  exahype2::RefinementVotes    votes;
+  exahype2::RefinementRequests requests;
+  requests.clear(numberOfSlots);
+  HostCriterionSolver::calls = 0;
+  votes.voteOnEveryCell<HostCriterionSolver>(
+    cellConnectivity,
+    std::as_const(hostSolution).getView(),
+    limits,
+    TimeStamp,
+    requests,
+    RefinementOfEveryCell
+  );
+  VALIDATE(requests.getRefinementRequests(cellConnectivity).empty());
+  VALIDATE_EQUALS(HostCriterionSolver::calls.load(), 0);
+
+  // A listed vote still passes through the same clipping rules.
+  std::vector<int> listed;
+  for (const int slot : cellConnectivity.getCells()) {
+    listed.push_back(slot);
+  }
+  requests.clear(numberOfSlots);
+  votes.voteOnCells<HostCriterionSolver>(
+    cellConnectivity,
+    listed,
+    std::as_const(hostSolution).getView(),
+    limits,
+    TimeStamp,
+    requests,
+    RefinementOfEveryCell
+  );
+  VALIDATE(requests.getRefinementRequests(cellConnectivity).empty());
+}
+
+UNIT_TEST("Host and device votes agree for refinement and erasure at either size guard") {
+  const auto&  cellConnectivity = buildGrid();
+  const int    numberOfSlots    = cellConnectivity.getNumberOfSlots();
+  const double width            = cellConnectivity.getWidthOfLevel(cellConnectivity.getMaximumLevel(), 0);
+  Pool         deviceSolution(1, tarch::MemoryLocation::Device);
+  Pool         hostSolution(1, tarch::MemoryLocation::Heap);
+  deviceSolution.reserve(numberOfSlots);
+  exahype2::RefinementVotes    hostVotes, deviceVotes;
+  exahype2::RefinementRequests hostRequests, deviceRequests;
+  for (const auto command :
+       {exahype2::RefinementCommand::Refine, exahype2::RefinementCommand::Keep, exahype2::RefinementCommand::Erase}) {
+    writeCommandIntoEveryCell(deviceSolution, cellConnectivity, command);
+    const auto downloaded = std::as_const(deviceSolution).download(hostSolution).getView();
+    for (int guard = 0; guard < 4; ++guard) {
+      auto limits = getLimitsAroundTheGrid();
+      if ((guard & 1) != 0) {
+        limits.minAdmissiblePatchSize = width;
+      }
+      if ((guard & 2) != 0) {
+        limits.maxAdmissiblePatchSize = width;
+      }
+      hostRequests.clear(numberOfSlots);
+      deviceRequests.clear(numberOfSlots);
+      hostVotes.voteOnEveryCell<HostCriterionSolver>(
+        cellConnectivity,
+        downloaded,
+        limits,
+        TimeStamp,
+        hostRequests,
+        CommandOfThePatch
+      );
+      deviceVotes.voteOnEveryCell<StubSolver>(
+        cellConnectivity,
+        std::as_const(deviceSolution).getView(),
+        limits,
+        TimeStamp,
+        deviceRequests,
+        CommandOfThePatch
+      );
+      VALIDATE(
+        hostRequests.getRefinementRequests(cellConnectivity) == deviceRequests.getRefinementRequests(cellConnectivity)
+      );
     }
   }
 }

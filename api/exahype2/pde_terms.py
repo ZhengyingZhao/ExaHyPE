@@ -2,7 +2,7 @@
 # use, please see the copyright notice at www.peano-framework.org
 import textwrap
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import jinja2
 
@@ -519,6 +519,10 @@ class PDETerms:
 
     def names(self):
         return list(self._table)
+
+    def set_host_only(self, name):
+        """Keep a term's declaration and definition out of device compilation."""
+        self._table[name] = replace(self._table[name], gpu=False)
 
     def is_set(self, name):
         return name in self._values

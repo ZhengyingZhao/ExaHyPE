@@ -5,10 +5,6 @@
 #include "AMRCore.h"
 #include <type_traits>
 
-#if defined(PEANO_WITH_GPU_BACKEND)
-#error "The AMR criterion currently supports CPU execution only."
-#endif
-
 namespace exahype2::amr {
   namespace detail {
     template<typename Accepted, typename = void>
@@ -19,7 +15,10 @@ namespace exahype2::amr {
     };
   }
 
-  /** AMR decisions for FV, DG and DG/FV hybrid solvers. */
+  /** Host AMR decisions for FV, DG and DG/FV hybrid solvers, including GPU solvers.
+   * Views passed to beginStep() and command() must refer to host-accessible storage.
+   * Refresh those same host pools after the accepted step, before casting votes.
+   */
   template<int NodesPerAxis, int NumberOfData, typename Config, typename Precision = double,
            typename Accepted = NativeAcceptedSolutionAdapter<NodesPerAxis, NumberOfData, Config, Precision>,
            typename Transfer = NativeTransferPolicy<NodesPerAxis, NumberOfData, Config, Precision>,

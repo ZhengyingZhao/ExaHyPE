@@ -208,10 +208,17 @@ exahype2::dg::Solver<Derived, StoragePrecision, ComputePrecision>::regrid(
     }
     createdCells.push_back(slot);
   }
+  const auto criterionSolution = [&]() {
+    if constexpr (exahype2::terms::RefinementCriterionOnHost<Derived>) {
+      return downloadSolution().getView();
+    } else {
+      return std::as_const(_solution).getView();
+    }
+  }();
   _votes.voteOnCells<Derived>(
     cellConnectivity,
     createdCells,
-    std::as_const(_solution).getView(),
+    criterionSolution,
     _timeStepping.getLimits(),
     _timeStepping.getTimeStamp(),
     requests,
@@ -763,6 +770,14 @@ exahype2::dg::Solver<Derived, StoragePrecision, ComputePrecision>::assessRefinem
     }
     return;
   }
+  // A host criterion may still advance its histories when votes pause after a regrid.
+  const auto criterionSolution = [&]() {
+    if constexpr (exahype2::terms::RefinementCriterionOnHost<Derived>) {
+      return downloadSolution().getView();
+    } else {
+      return std::as_const(_solution).getView();
+    }
+  }();
   if (_meshChangedSinceLastTimeStep) {
     _meshChangedSinceLastTimeStep = false;
     return;
@@ -771,7 +786,7 @@ exahype2::dg::Solver<Derived, StoragePrecision, ComputePrecision>::assessRefinem
     _votes.voteOnCells<Derived>(
       cellConnectivity,
       _ownedCellsOnHost,
-      std::as_const(_solution).getView(),
+      criterionSolution,
       _timeStepping.getLimits(),
       _timeStepping.getTimeStamp(),
       requests,
@@ -780,7 +795,7 @@ exahype2::dg::Solver<Derived, StoragePrecision, ComputePrecision>::assessRefinem
   } else {
     _votes.voteOnEveryCell<Derived>(
       cellConnectivity,
-      std::as_const(_solution).getView(),
+      criterionSolution,
       _timeStepping.getLimits(),
       _timeStepping.getTimeStamp(),
       requests,

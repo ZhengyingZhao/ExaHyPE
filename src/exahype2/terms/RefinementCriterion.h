@@ -6,6 +6,16 @@
 #include "tarch/la/Vector.h"
 
 namespace exahype2::terms {
+  /** Select host assessment for criteria that own host-only accepted-step evidence. */
+  template <typename SolverType>
+  inline constexpr bool RefinementCriterionOnHost = [] {
+    if constexpr (requires { SolverType::RefinementCriterionOnHost; }) {
+      return static_cast<bool>(SolverType::RefinementCriterionOnHost);
+    } else {
+      return false;
+    }
+  }();
+
   template <typename SolverType, typename Precision>
   concept HasRefinementCriterion = requires(
     const Precision* const                        Q,

@@ -133,6 +133,8 @@ public:
   INLINE_METHOD void openErrorMeasurement(const std::string& fileName, double timeDeltaBetweenSnapshots);
   [[nodiscard]] INLINE_METHOD const exahype2::TimeStepping& getTimeStepping() const;
   [[nodiscard]] INLINE_METHOD const Patches& getSolution() const;
+  /** Return the current solution in host-accessible memory. */
+  [[nodiscard]] INLINE_METHOD const Patches& downloadSolution();
   [[nodiscard]] INLINE_METHOD tarch::AllocatedBytes getAllocatedBytes() const;
   [[nodiscard]] INLINE_METHOD int getNumberOfDoFs() const;
 

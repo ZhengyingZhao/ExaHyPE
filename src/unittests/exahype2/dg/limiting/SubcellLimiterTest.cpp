@@ -6,6 +6,7 @@
 #include "exahype2/RefinementCommand.h"
 #include "exahype2/RefinementRequests.h"
 #include "exahype2/TimeStepping.h"
+#include "exahype2/amr/LimiterEvidence.h"
 #include "exahype2/dg/Basis.h"
 #include "exahype2/dg/ader/Solver.h"
 #include "exahype2/dg/limiting/LimiterStatus.h"
@@ -36,6 +37,32 @@
 #include "unittests/tarch/accelerator/ChunkedMemoryPoolTestData.h"
 
 namespace {
+  /**
+   * The host AMR proof must use table accessors. Deliberately expose no device
+   * pointer members so a regression cannot silently read device allocations.
+   */
+  struct AMRProofSolver final : exahype2::dg::limiting::unittests::StubSolver {
+    static constexpr int NodesPerAxis = 2;
+    static constexpr int NumberOfData = 2;
+
+    struct LimiterType {
+      using SubcellScheme = exahype2::dg::limiting::SubcellScheme<AMRProofSolver, double>;
+      using Detector = exahype2::dg::limiting::Detector<AMRProofSolver, double>;
+    };
+
+    template <typename Precision>
+    struct SubcellProjection {
+      static constexpr std::array<Precision, 6> getNodesToSubcells1D() {
+        return {Precision{0.75}, Precision{0.5}, Precision{0.25},
+                Precision{0.25}, Precision{0.5}, Precision{0.75}};
+      }
+
+      static constexpr std::array<Precision, 4> getNodesToLobatto1D() {
+        return {Precision{1}, Precision{0}, Precision{0}, Precision{1}};
+      }
+    };
+  };
+
   TARGET_DECLARE
   constexpr int SubdivisionFactor = peano4::SubdivisionFactor;
   /**
@@ -694,6 +721,46 @@ UNIT_TEST("A plot of cells on the subcell scheme writes every file and allocates
       }
     }
     solver.release();
+  }
+}
+
+UNIT_TEST("Host AMR parent proofs apply limiter admissibility and maximum-principle checks without an accelerator team") {
+  GIVEN("A constant positive parent, constant children and host projection table accessors") {
+    constexpr int States = peano4::power(AMRProofSolver::NodesPerAxis, DIMENSIONS);
+    std::array<double, States * AMRProofSolver::NumberOfData> parent{}, child{};
+    for (int state = 0; state < States; state++) {
+      parent[state * AMRProofSolver::NumberOfData] = 1.0;
+      child[state * AMRProofSolver::NumberOfData] = 1.0;
+    }
+    std::array<const double*, peano4::ChildrenPerCell> children{};
+    children.fill(child.data());
+    const tarch::la::Vector<DIMENSIONS, double> centre(0.5), width(1.0);
+    const AMRProofSolver::RuntimeParameters parameters{};
+
+    WHEN("The parent keeps the accepted constant state") {
+      THEN("Physical admissibility and the maximum principle permit it") {
+        VALIDATE(exahype2::amr::parentPhysicallyAdmissible<AMRProofSolver>(
+          parent.data(), States, centre, width, parameters));
+        VALIDATE(exahype2::amr::parentRespectsMaximumPrinciple<AMRProofSolver>(
+          parent.data(), children.data(), 0.0, 0.0, parameters));
+      }
+    }
+
+    WHEN("One parent node exceeds every child's observable range") {
+      parent[0] = 2.0;
+      THEN("The maximum principle vetoes the proposed parent") {
+        VALIDATE(not exahype2::amr::parentRespectsMaximumPrinciple<AMRProofSolver>(
+          parent.data(), children.data(), 0.0, 0.0, parameters));
+      }
+    }
+
+    WHEN("One parent node is physically inadmissible") {
+      parent[0] = -1.0;
+      THEN("The physical admissibility proof vetoes the proposed parent") {
+        VALIDATE(not exahype2::amr::parentPhysicallyAdmissible<AMRProofSolver>(
+          parent.data(), States, centre, width, parameters));
+      }
+    }
   }
 }
 

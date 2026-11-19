@@ -3,6 +3,7 @@
 #pragma once
 
 #include "exahype2/RefinementCommand.h"
+#include "exahype2/terms/RefinementCriterion.h"
 #include "peano4/CellConnectivity.h"
 #include "tarch/CompilerSpecificSettings.h"
 #include "tarch/Span.h"
@@ -25,7 +26,7 @@ namespace exahype2 {
 
 /**
  * Refinement votes of one solver, one command per slot of the cell connectivity. Every vote method
- * computes the commands on the device and merges them into requests.
+ * computes the commands on the device, or on the host for a host criterion, and merges them into requests.
  */
 class exahype2::RefinementVotes final {
 public:
@@ -69,6 +70,17 @@ public:
   [[nodiscard]] INLINE_METHOD tarch::AllocatedBytes getAllocatedBytes() const;
 
 private:
+  template <typename Derived, typename SolutionView>
+  INLINE_METHOD void voteOnCellsOnHost(
+    const peano4::CellConnectivity&            cellConnectivity,
+    tarch::Span<const int>                     cells,
+    const SolutionView&                        solution,
+    const exahype2::Limits&                    limits,
+    double                                     timeStamp,
+    exahype2::RefinementRequests&              requests,
+    const typename Derived::RuntimeParameters& parameters
+  );
+
   [[nodiscard]] static INLINE_METHOD bool canRefineOrErase(
     const peano4::CellConnectivity& cellConnectivity,
     const exahype2::Limits&         limits
@@ -90,6 +102,14 @@ private:
 
 TARGET_DECLARE
 namespace exahype2 {
+  /** Apply the same size limits to host and device criterion results. */
+  INLINE_METHOD GPU_CALLABLE_METHOD RefinementCommand clipRefinementVote(
+    RefinementCommand command,
+    double            largestWidth,
+    double            maxAdmissibleSize,
+    double            minAdmissibleSize
+  );
+
   template <typename Derived, typename StoragePrecision>
   INLINE_METHOD GPU_CALLABLE_METHOD RefinementCommand voteWithinAdmissibleSizes(
     const StoragePrecision*                      Q,

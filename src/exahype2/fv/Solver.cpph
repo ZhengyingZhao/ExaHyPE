@@ -106,9 +106,16 @@ exahype2::fv::Solver<Derived, StoragePrecision, ComputePrecision>::initialise(
   );
   measureMeshWidths(cellConnectivity);
   measureError(cellConnectivity, parameters);
+  const auto criterionSolution = [&]() {
+    if constexpr (exahype2::terms::RefinementCriterionOnHost<Derived>) {
+      return downloadSolution().getView();
+    } else {
+      return std::as_const(_solution).getView();
+    }
+  }();
   _votes.voteOnEveryCell<Derived>(
     cellConnectivity,
-    std::as_const(_solution).getView(),
+    criterionSolution,
     _timeStepping.getLimits(),
     _timeStepping.getTimeStamp(),
     requests,
@@ -182,12 +189,21 @@ exahype2::fv::Solver<Derived, StoragePrecision, ComputePrecision>::assessRefinem
     requests.merge(exahype2::RefinementCommand::Keep, cellConnectivity.getCells());
     return;
   }
+  // Refresh the accepted state even when voting pauses after a regrid: host criteria
+  // may update their step histories after this call.
+  const auto criterionSolution = [&]() {
+    if constexpr (exahype2::terms::RefinementCriterionOnHost<Derived>) {
+      return downloadSolution().getView();
+    } else {
+      return std::as_const(_solution).getView();
+    }
+  }();
   if (_meshChangedSinceLastTimeStep) {
     _meshChangedSinceLastTimeStep = false;
   } else {
     _votes.voteOnEveryCell<Derived>(
       cellConnectivity,
-      std::as_const(_solution).getView(),
+      criterionSolution,
       _timeStepping.getLimits(),
       _timeStepping.getTimeStamp(),
       requests,
@@ -237,10 +253,17 @@ exahype2::fv::Solver<Derived, StoragePrecision, ComputePrecision>::regrid(
     }
   }
   _meshChangedSinceLastTimeStep = true;
+  const auto criterionSolution  = [&]() {
+    if constexpr (exahype2::terms::RefinementCriterionOnHost<Derived>) {
+      return downloadSolution().getView();
+    } else {
+      return std::as_const(_solution).getView();
+    }
+  }();
   _votes.voteOnCells<Derived>(
     cellConnectivity,
     regrid.createdSlots,
-    std::as_const(_solution).getView(),
+    criterionSolution,
     _timeStepping.getLimits(),
     _timeStepping.getTimeStamp(),
     requests,
@@ -331,6 +354,13 @@ template <typename Derived, typename StoragePrecision, typename ComputePrecision
 INLINE_METHOD const typename exahype2::fv::Solver<Derived, StoragePrecision, ComputePrecision>::Patches&
 exahype2::fv::Solver<Derived, StoragePrecision, ComputePrecision>::getSolution() const {
   return _solution;
+}
+
+/** Read the live pool on CPU backends and refresh its host mirror on GPU backends. */
+template <typename Derived, typename StoragePrecision, typename ComputePrecision>
+INLINE_METHOD const typename exahype2::fv::Solver<Derived, StoragePrecision, ComputePrecision>::Patches&
+exahype2::fv::Solver<Derived, StoragePrecision, ComputePrecision>::downloadSolution() {
+  return std::as_const(_solution).download(_solutionOnHost);
 }
 
 /**

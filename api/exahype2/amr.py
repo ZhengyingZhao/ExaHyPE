@@ -107,7 +107,7 @@ def _solver_adapter(solver):
         return _ADERDGAdapter
     raise ValueError(
         "No limiter criterion adapter for solver family {!r}. "
-        "The available adapter requires CPU ADER-DG with its native subcell limiter; "
+        "The available adapter requires ADER-DG with its native subcell limiter; "
         "RKDG and standalone FV do not expose that accepted-step evidence.".format(family)
     )
 
@@ -365,6 +365,30 @@ def _with_parameter_snapshot(body):
             + body + "\n}\n")
 
 
+def _host_operator_declarations():
+    """Keep host transfer tables alive while the criterion holds their pointers."""
+    return """
+  inline static constexpr auto _amrQuadratureNodes = Quadrature<double>::getQuadraturePoints1D();
+  inline static constexpr auto _amrRestriction = DGMatrices<double>::getWeightedRestrictionMatrix1D();
+  inline static constexpr auto _amrProlongation = DGMatrices<double>::getProlongationMatrix1D();
+"""
+
+
+def _refresh_accepted_solution(member):
+    """Refresh limiter mirrors; assessRefinement() downloads the solution itself."""
+    refresh = ""
+    if member == "_limiterCriterion":
+        refresh = """
+// Refresh the same host pools bound before stepping, after application hooks.
+{
+  auto& criterionLimiter = const_cast<typename SolverFamily::LimiterType&>(getLimiter());
+  (void)criterionLimiter.downloadStatuses();
+  (void)criterionLimiter.downloadSubcells();
+}
+"""
+    return refresh
+
+
 def _install_policy(policy, solver, adapter, declarations, *, member, header, policy_attribute,
                     external_callback, additional_headers=()):
     """Connect AMR to initialisation and completed-step callbacks."""
@@ -381,14 +405,16 @@ def _install_policy(policy, solver, adapter, declarations, *, member, header, po
     solver.add_declarations(declarations)
     counter, selected = member + "AcceptedSteps", member + "AssessThisStep"
     reset = "\n" + member + ".reset();\n"
-    assessment = "\nthis->assessRefinement(cellConnectivity, requests, parameters);\n" + member + ".finishStep();\n"
+    refresh = _refresh_accepted_solution(member)
+    assessment = refresh + "\nthis->assessRefinement(cellConnectivity, requests, parameters);\n" + member + ".finishStep();\n"
     if policy.assessment_interval > 1:
         solver.add_declarations("inline static unsigned long long " + counter + "=0;\n"
                                 "inline static bool " + selected + "=true;\n")
         reset += counter + "=0;" + selected + "=true;\n"
         begin_step = (selected + "=(" + counter + " % " + str(policy.assessment_interval) + " == 0);\n"
                       "if(" + selected + "){\n" + begin_step + "\n}\n")
-        assessment = ("this->assessRefinement(cellConnectivity, requests, parameters, " + selected + ");\n"
+        assessment = ("if(" + selected + "){\n" + refresh + "}\n"
+                      "this->assessRefinement(cellConnectivity, requests, parameters, " + selected + ");\n"
                       "if(" + selected + ")" + member + ".finishStep();\n"
                       # Count only steps with positive time advance.
                       "if(getTimeStepping().getTimeStepSizeOfLastStep()>0.)++" + counter + ";\n")
@@ -405,6 +431,7 @@ def _install_policy(policy, solver, adapter, declarations, *, member, header, po
     solver.set_pde_terms(refinement_criterion=True if external_callback else (
         "return {{SOLVER_NAME}}Base::" + member + ".command(Q, x, h, t);"
     ))
+    solver.pde_terms.set_host_only("refinement_criterion")
     setattr(solver, policy_attribute, policy)
     return solver
 
@@ -462,6 +489,7 @@ class Limiter(_AMRSettings):
         lower, upper, amplification = self._transfer_weights(solver)
         declarations = """
   static constexpr bool DeferTimeStepRefinement = true;
+  static constexpr bool RefinementCriterionOnHost = true;
   struct LimiterCriterionConfig final {
     // PatchSize is the limiter's number of subcells per axis.
     using LimiterAdapter = ::exahype2::amr::NativeSubcellLimiter<PatchSize>;
@@ -601,8 +629,7 @@ class Limiter(_AMRSettings):
     return ::exahype2::amr::initialDataPasses<
       %(nodes)d, %(values)d, LimiterCriterionConfig
     >(
-      Q, x, h, Solver::template Quadrature<double>::QuadraturePoints1D,
-      Solver::template DGMatrices<double>::ProlongationMatrix1D,
+      Q, x, h, _amrQuadratureNodes.data(), _amrProlongation.data(),
       %(initial_condition)s, %(admissible)s,
       ::exahype2::amr::observation_detail::InitialDataMonitor<
         %(nodes)d, %(values)d, LimiterCriterionConfig, %(storage)s>{}
@@ -612,7 +639,7 @@ class Limiter(_AMRSettings):
        "values": solver.state.number_of_values,
        "initial_condition": _runtime_callback("_limiterCriterion", "InitialCondition", "Solver"),
        "admissible": _runtime_callback("_limiterCriterion", "Admissible", "Solver")}
-        return declarations
+        return _host_operator_declarations() + declarations
 
     @staticmethod
     def _begin_step():
@@ -650,10 +677,8 @@ static_assert(
 // Read the accepted solution and limiter status from the live solver pools.
 auto& criterionLimiter = const_cast<typename SolverFamily::LimiterType&>(getLimiter());
 _limiterCriterion.beginStep(
-  cellConnectivity, getSolution().getView(), criterionLimiter.getStatuses(), getTimeStepping(),
-  Quadrature<double>::QuadraturePoints1D,
-  DGMatrices<double>::WeightedRestrictionMatrix1D,
-  DGMatrices<double>::ProlongationMatrix1D,
+  cellConnectivity, this->downloadSolution().getView(), criterionLimiter.downloadStatuses().getView(), getTimeStepping(),
+  _amrQuadratureNodes.data(), _amrRestriction.data(), _amrProlongation.data(),
   %(wave_speed)s, %(admissible)s,
   %(transfer_admissible)s, criterionLimiter.downloadSubcells().getView()
 );
@@ -730,6 +755,7 @@ class Native(_AMRSettings):
         storage, compute = solver.precision.storage, solver.precision.compute
         lines = [
             "\n  static constexpr bool DeferTimeStepRefinement = true;",
+            "  static constexpr bool RefinementCriterionOnHost = true;",
             "  struct NativeCriterionConfig final {",
             "    static constexpr bool ReuseQuietProgress = true;",
             "    static constexpr bool IsFiniteVolume = {};".format("true" if adapter is _NativeFVAdapter else "false"),
@@ -823,8 +849,7 @@ class Native(_AMRSettings):
     const RuntimeParameters& parameters
   ) {
     return ::exahype2::amr::nativeInitialDataPasses<%(count)d, %(values)d, NativeCriterionConfig>(
-      Q, x, h, Solver::template Quadrature<double>::QuadraturePoints1D,
-      Solver::template DGMatrices<double>::ProlongationMatrix1D,
+      Q, x, h, _amrQuadratureNodes.data(), _amrProlongation.data(),
       %(initial_condition)s, %(admissible)s,
       ::exahype2::amr::observation_detail::InitialDataMonitor<
         %(count)d, %(values)d, NativeCriterionConfig, %(storage)s>{}
@@ -833,6 +858,8 @@ class Native(_AMRSettings):
 """ % {"storage": storage, "count": count, "values": values,
        "initial_condition": _runtime_callback("_nativeCriterion", "InitialCondition", "Solver"),
        "admissible": _runtime_callback("_nativeCriterion", "Admissible", "Solver")}
+        if adapter is _NativeDGAdapter:
+            declarations = _host_operator_declarations() + declarations
         return declarations
 
 
@@ -856,7 +883,7 @@ static_assert(
   "The native criterion requires a complete, uncoupled solver domain."
 );
 _nativeCriterion.beginStep(
-  cellConnectivity, getSolution().getView(), getTimeStepping(),
+  cellConnectivity, this->downloadSolution().getView(), getTimeStepping(),
   nullptr, nullptr, nullptr, %(wave_speed)s, %(admissible)s
 );
 """ % {"wave_speed": _runtime_callback("_nativeCriterion", "WaveSpeed", snapshot=True),
@@ -890,10 +917,8 @@ static_assert(
   "The native criterion requires a complete, uncoupled solver domain."
 );
 _nativeCriterion.beginStep(
-  cellConnectivity, getSolution().getView(), getTimeStepping(),
-  Quadrature<double>::QuadraturePoints1D,
-  DGMatrices<double>::WeightedRestrictionMatrix1D,
-  DGMatrices<double>::ProlongationMatrix1D,
+  cellConnectivity, this->downloadSolution().getView(), getTimeStepping(),
+  _amrQuadratureNodes.data(), _amrRestriction.data(), _amrProlongation.data(),
   %(wave_speed)s, %(admissible)s
 );
 """ % {"wave_speed": _runtime_callback("_nativeCriterion", "WaveSpeed", snapshot=True),

@@ -155,6 +155,28 @@ public:
     const typename Derived::RuntimeParameters& parameters
   );
 
+  /** Serial assessment entry points. Host AMR proofs have no accelerator team. */
+  template <typename StoragePrecision>
+  static INLINE_METHOD GPU_CALLABLE_METHOD void openInitialStatus(
+    int* NOALIAS                               status,
+    const StoragePrecision* NOALIAS            nodes,
+    const StoragePrecision* NOALIAS            sampledExtrema,
+    const StoragePrecision* NOALIAS            nodesToLobatto,
+    const StoragePrecision* NOALIAS            nodesToSubcells,
+    StoragePrecision                           relaxationParameter,
+    StoragePrecision                           differencesScaling,
+    const typename Derived::RuntimeParameters& parameters
+  );
+
+  template <typename StoragePrecision>
+  static INLINE_METHOD GPU_CALLABLE_METHOD void reduceExtrema(
+    StoragePrecision* NOALIAS                  extrema,
+    const StoragePrecision* NOALIAS            nodes,
+    const StoragePrecision* NOALIAS            nodesToLobatto,
+    const StoragePrecision* NOALIAS            nodesToSubcells,
+    const typename Derived::RuntimeParameters& parameters
+  );
+
   template <typename StoragePrecision>
   static INLINE_METHOD GPU_CALLABLE_METHOD exahype2::dg::MaxEigenvalueStatistics judgeCandidateInTeam(
     tarch::accelerator::TeamHandle               team,
@@ -204,18 +226,6 @@ public:
 
 private:
   template <typename StoragePrecision>
-  static INLINE_METHOD GPU_CALLABLE_METHOD void openInitialStatus(
-    int* NOALIAS                               status,
-    const StoragePrecision* NOALIAS            nodes,
-    const StoragePrecision* NOALIAS            sampledExtrema,
-    const StoragePrecision* NOALIAS            nodesToLobatto,
-    const StoragePrecision* NOALIAS            nodesToSubcells,
-    StoragePrecision                           relaxationParameter,
-    StoragePrecision                           differencesScaling,
-    const typename Derived::RuntimeParameters& parameters
-  );
-
-  template <typename StoragePrecision>
   static INLINE_METHOD GPU_CALLABLE_METHOD void openInitialStatusWithThreadsOfTeam(
     tarch::accelerator::TeamHandle             team,
     int* NOALIAS                               status,
@@ -226,15 +236,6 @@ private:
     StoragePrecision                           relaxationParameter,
     StoragePrecision                           differencesScaling,
     StoragePrecision* NOALIAS                  scratch,
-    const typename Derived::RuntimeParameters& parameters
-  );
-
-  template <typename StoragePrecision>
-  static INLINE_METHOD GPU_CALLABLE_METHOD void reduceExtrema(
-    StoragePrecision* NOALIAS                  extrema,
-    const StoragePrecision* NOALIAS            nodes,
-    const StoragePrecision* NOALIAS            nodesToLobatto,
-    const StoragePrecision* NOALIAS            nodesToSubcells,
     const typename Derived::RuntimeParameters& parameters
   );
 

@@ -40,14 +40,18 @@ namespace exahype2::amr {
       using Projection = typename Solver::template SubcellProjection<P>;
       constexpr int Subcells = Scheme::SubcellsPerAxis;
       constexpr int Volumes = peano4::power(Subcells, DIMENSIONS);
-      if (not detail::projectionIsSafe<N, Subcells, V>(Q, Projection::NodesToSubcells1D)
-          or not detail::projectionIsSafe<N, N, V>(Q, Projection::NodesToLobatto1D)
+      // The pointer members of generated tables address device memory. The AMR
+      // proof runs on the host, including in an accelerator build.
+      constexpr auto nodesToSubcells = Projection::getNodesToSubcells1D();
+      constexpr auto nodesToLobatto = Projection::getNodesToLobatto1D();
+      if (not detail::projectionIsSafe<N, Subcells, V>(Q, nodesToSubcells.data())
+          or not detail::projectionIsSafe<N, N, V>(Q, nodesToLobatto.data())
           or not Solver::isPhysicallyAdmissible(Q, Nodes, x, h, parameters)) return false;
       P subcells[Volumes * V], lobatto[Nodes * V];
       exahype2::dg::projectTensorProduct<DIMENSIONS, N, Subcells, V,
-        exahype2::dg::ProjectionRule::Butterfly>(Q, subcells, Projection::NodesToSubcells1D);
+        exahype2::dg::ProjectionRule::Butterfly>(Q, subcells, nodesToSubcells.data());
       exahype2::dg::projectTensorProduct<DIMENSIONS, N, N, V,
-        exahype2::dg::ProjectionRule::Butterfly>(Q, lobatto, Projection::NodesToLobatto1D);
+        exahype2::dg::ProjectionRule::Butterfly>(Q, lobatto, nodesToLobatto.data());
       for (int entry = 0; entry < Volumes * V; entry++) {
         if (not std::isfinite(static_cast<double>(subcells[entry]))) return false;
       }
@@ -76,6 +80,8 @@ namespace exahype2::amr {
       using Scheme = typename Solver::LimiterType::SubcellScheme;
       constexpr int N = Solver::NodesPerAxis, V = Solver::NumberOfData;
       constexpr int Subcells = Scheme::SubcellsPerAxis;
+      constexpr auto nodesToSubcells = Projection::getNodesToSubcells1D();
+      constexpr auto nodesToLobatto = Projection::getNodesToLobatto1D();
       const double parameterLimit = static_cast<double>(std::numeric_limits<P>::max());
       if (parent == nullptr or children == nullptr
           or not std::isfinite(relaxation) or relaxation < 0.0
@@ -83,17 +89,15 @@ namespace exahype2::amr {
           or relaxation > parameterLimit or differencesScaling > parameterLimit) return false;
       const P specifiedRelaxation = static_cast<P>(relaxation);
       const P specifiedScaling = static_cast<P>(differencesScaling);
-      if (not detail::projectionIsSafe<N, Subcells, V>(parent, Projection::NodesToSubcells1D)
-          or not detail::projectionIsSafe<N, N, V>(parent, Projection::NodesToLobatto1D)) return false;
+      if (not detail::projectionIsSafe<N, Subcells, V>(parent, nodesToSubcells.data())
+          or not detail::projectionIsSafe<N, N, V>(parent, nodesToLobatto.data())) return false;
       P reference[Detector::ExtremaPerCell], childExtrema[Detector::ExtremaPerCell];
       Detector::clearExtrema(reference);
       for (int child = 0; child < peano4::ChildrenPerCell; child++) {
-        if (not detail::projectionIsSafe<N, Subcells, V>(children[child], Projection::NodesToSubcells1D)
-            or not detail::projectionIsSafe<N, N, V>(children[child], Projection::NodesToLobatto1D)) return false;
-        Detector::reduceExtremaInTeam(
-          tarch::accelerator::TeamHandle{}, childExtrema, children[child],
-          Projection::NodesToLobatto1D, Projection::NodesToSubcells1D,
-          static_cast<P*>(nullptr), parameters
+        if (not detail::projectionIsSafe<N, Subcells, V>(children[child], nodesToSubcells.data())
+            or not detail::projectionIsSafe<N, N, V>(children[child], nodesToLobatto.data())) return false;
+        Detector::reduceExtrema(
+          childExtrema, children[child], nodesToLobatto.data(), nodesToSubcells.data(), parameters
         );
         for (int entry = 0; entry < Detector::ExtremaPerCell; entry++) {
           if (not std::isfinite(static_cast<double>(childExtrema[entry]))) return false;
@@ -101,10 +105,10 @@ namespace exahype2::amr {
         Detector::widenExtrema(reference, childExtrema);
       }
       int scratch[exahype2::dg::limiting::NumberOfStatusEntries]{};
-      Detector::openInitialStatusInTeam(
-        tarch::accelerator::TeamHandle{}, scratch, parent, reference,
-        Projection::NodesToLobatto1D, Projection::NodesToSubcells1D,
-        specifiedRelaxation, specifiedScaling, static_cast<P*>(nullptr), parameters
+      Detector::openInitialStatus(
+        scratch, parent, reference,
+        nodesToLobatto.data(), nodesToSubcells.data(),
+        specifiedRelaxation, specifiedScaling, parameters
       );
       return scratch[static_cast<int>(exahype2::dg::limiting::StatusEntry::WasTroubled)] == 0;
     }
