@@ -19,8 +19,9 @@ namespace exahype2::terms {
   };
 
   template <typename SolverType>
-  concept IsPeriodicAlongEveryAxis = SolverType::PeriodicBoundaries[0] and SolverType::PeriodicBoundaries[1]
-    and SolverType::PeriodicBoundaries[DIMENSIONS - 1];
+  concept IsPeriodicAlongEveryAxis = static_cast<bool>(SolverType::PeriodicBoundaries[0])
+    and static_cast<bool>(SolverType::PeriodicBoundaries[1])
+    and static_cast<bool>(SolverType::PeriodicBoundaries[DIMENSIONS - 1]);
 
   template <typename SolverType, typename Precision>
   concept HasBoundaryConditionsWhereNeeded =
