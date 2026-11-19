@@ -100,6 +100,38 @@ private:
   tarch::accelerator::Buffer<int>                         _listedCells{tarch::MemoryLocation::Device};
 };
 
+namespace exahype2::detail {
+  /**
+   * Named host functors keep the visibility of solver types with internal linkage.
+   * They stay outside TARGET_DECLARE because the criterion may own host-only state.
+   */
+  template <typename Derived, typename StoragePrecision>
+  struct VoteOnGridConstructionOnHost final {
+    const peano4::CellConnectivity&            cellConnectivity;
+    tarch::Span<const int>                     cells;
+    exahype2::RefinementCommand*               commands;
+    double                                     maxAdmissibleSize;
+    double                                     minAdmissibleSize;
+    const typename Derived::RuntimeParameters& parameters;
+
+    INLINE_METHOD void operator()(int entry) const;
+  };
+
+  template <typename Derived, typename SolutionView>
+  struct VoteOnRefinementOnHost final {
+    const peano4::CellConnectivity&            cellConnectivity;
+    tarch::Span<const int>                     cells;
+    const SolutionView&                        solution;
+    exahype2::RefinementCommand*               commands;
+    double                                     maxAdmissibleSize;
+    double                                     minAdmissibleSize;
+    double                                     timeStamp;
+    const typename Derived::RuntimeParameters& parameters;
+
+    INLINE_METHOD void operator()(int entry) const;
+  };
+} // namespace exahype2::detail
+
 TARGET_DECLARE
 namespace exahype2 {
   /** Apply the same size limits to host and device criterion results. */

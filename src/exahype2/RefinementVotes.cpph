@@ -26,24 +26,17 @@ exahype2::RefinementVotes::voteOnGridConstruction(
   if constexpr (exahype2::terms::RefinementCriterionOnHost<Derived>) {
     const auto cells = cellConnectivity.getCells();
     _commandsOnHost.resize(static_cast<std::size_t>(cellConnectivity.getNumberOfSlots()));
-    tarch::accelerator::parallelForOnHost(tarch::accelerator::Range(cells.size), [&](const int entry) {
-      const int    slot         = cells[entry];
-      const auto   width        = cellConnectivity.getCellWidth(slot);
-      const double largestWidth = tarch::la::max(width);
-      auto         command      = exahype2::RefinementCommand::Keep;
-      if (tarch::la::greater(largestWidth, limits.maxAdmissiblePatchSize)) {
-        command = exahype2::RefinementCommand::Refine;
-      } else if (tarch::la::greaterEquals(largestWidth, limits.minAdmissiblePatchSize)) {
-        command = Derived::refinementCriterion(
-          static_cast<const StoragePrecision*>(nullptr),
-          cellConnectivity.getCellCentre(slot),
-          width,
-          0.0,
-          parameters
-        );
+    tarch::accelerator::parallelForOnHost(
+      tarch::accelerator::Range(cells.size),
+      exahype2::detail::VoteOnGridConstructionOnHost<Derived, StoragePrecision>{
+        cellConnectivity,
+        cells,
+        _commandsOnHost.data(),
+        limits.maxAdmissiblePatchSize,
+        limits.minAdmissiblePatchSize,
+        parameters
       }
-      _commandsOnHost[slot] = command;
-    });
+    );
     requests.merge(_commandsOnHost, cells);
   } else {
     reserve(cellConnectivity.getNumberOfSlots());
@@ -200,30 +193,19 @@ exahype2::RefinementVotes::voteOnCellsOnHost(
   const typename Derived::RuntimeParameters& parameters
 ) {
   _commandsOnHost.resize(static_cast<std::size_t>(cellConnectivity.getNumberOfSlots()));
-  tarch::accelerator::parallelForOnHost(tarch::accelerator::Range(cells.size), [&](const int entry) {
-    const int    slot         = cells[entry];
-    const auto   width        = cellConnectivity.getCellWidth(slot);
-    const double largestWidth = tarch::la::max(width);
-    auto         command      = exahype2::RefinementCommand::Keep;
-    if (tarch::la::greater(largestWidth, limits.maxAdmissiblePatchSize)) {
-      command = exahype2::RefinementCommand::Refine;
-    } else if (tarch::la::greater(largestWidth, limits.minAdmissiblePatchSize)
-               or peano4::SubdivisionFactor * largestWidth <= limits.maxAdmissiblePatchSize) {
-      command = exahype2::clipRefinementVote(
-        Derived::refinementCriterion(
-          solution.getChunk(slot),
-          cellConnectivity.getCellCentre(slot),
-          width,
-          timeStamp,
-          parameters
-        ),
-        largestWidth,
-        limits.maxAdmissiblePatchSize,
-        limits.minAdmissiblePatchSize
-      );
+  tarch::accelerator::parallelForOnHost(
+    tarch::accelerator::Range(cells.size),
+    exahype2::detail::VoteOnRefinementOnHost<Derived, SolutionView>{
+      cellConnectivity,
+      cells,
+      solution,
+      _commandsOnHost.data(),
+      limits.maxAdmissiblePatchSize,
+      limits.minAdmissiblePatchSize,
+      timeStamp,
+      parameters
     }
-    _commandsOnHost[slot] = command;
-  });
+  );
   requests.merge(_commandsOnHost, cells);
 }
 
@@ -273,6 +255,54 @@ exahype2::RefinementVotes::merge(
   _commandsOnHost.resize(numberOfSlots);
   _commands.copyToHost(_commandsOnHost.data(), numberOfSlots);
   requests.merge(_commandsOnHost, cellsOnHost);
+}
+
+template <typename Derived, typename StoragePrecision>
+INLINE_METHOD void
+exahype2::detail::VoteOnGridConstructionOnHost<Derived, StoragePrecision>::operator()(const int entry) const {
+  const int    slot         = cells[entry];
+  const auto   width        = cellConnectivity.getCellWidth(slot);
+  const double largestWidth = tarch::la::max(width);
+  auto         command      = exahype2::RefinementCommand::Keep;
+  if (tarch::la::greater(largestWidth, maxAdmissibleSize)) {
+    command = exahype2::RefinementCommand::Refine;
+  } else if (tarch::la::greaterEquals(largestWidth, minAdmissibleSize)) {
+    command = Derived::refinementCriterion(
+      static_cast<const StoragePrecision*>(nullptr),
+      cellConnectivity.getCellCentre(slot),
+      width,
+      0.0,
+      parameters
+    );
+  }
+  commands[slot] = command;
+}
+
+template <typename Derived, typename SolutionView>
+INLINE_METHOD void
+exahype2::detail::VoteOnRefinementOnHost<Derived, SolutionView>::operator()(const int entry) const {
+  const int    slot         = cells[entry];
+  const auto   width        = cellConnectivity.getCellWidth(slot);
+  const double largestWidth = tarch::la::max(width);
+  auto         command      = exahype2::RefinementCommand::Keep;
+  if (tarch::la::greater(largestWidth, maxAdmissibleSize)) {
+    command = exahype2::RefinementCommand::Refine;
+  } else if (tarch::la::greater(largestWidth, minAdmissibleSize)
+             or peano4::SubdivisionFactor * largestWidth <= maxAdmissibleSize) {
+    command = exahype2::clipRefinementVote(
+      Derived::refinementCriterion(
+        solution.getChunk(slot),
+        cellConnectivity.getCellCentre(slot),
+        width,
+        timeStamp,
+        parameters
+      ),
+      largestWidth,
+      maxAdmissibleSize,
+      minAdmissibleSize
+    );
+  }
+  commands[slot] = command;
 }
 
 TARGET_DECLARE
