@@ -1,10 +1,9 @@
 # This file is part of the ExaHyPE2 project. For conditions of distribution and
 # use, please see the copyright notice at www.peano-framework.org
-"""GPU-safe AMR code generation; run with PYTHONPATH=api python -m unittest discover -s api/exahype2/tests -p amr_gpu.py.
+"""Check the C++ solver code generated for CPU and GPU refinement criteria.
 
-These tests render the actual solver files without requiring a GPU compiler.
-The runtime RefinementVotes tests exercise the resulting host dispatch on every
-configured accelerator backend.
+Run from the repository root with
+`PYTHONPATH=api python -m unittest discover -s api/exahype2/tests -p amr_gpu.py`.
 """
 
 import re
@@ -43,12 +42,17 @@ def solver_for(family):
 
 
 class AMRGPUGenerationTest(unittest.TestCase):
-    def render(self, family, *, external_callback=False, interval=1, sampling=False, install=True):
+    def render(self, family, *, external_callback=False, interval=1, sampling=False, install=True,
+               execution="cpu", external_initial=False):
+        """Return the solver and its generated C++ files for a CUDA project."""
         solver = solver_for(family)
+        if external_initial:
+            solver.set_pde_terms(initial_condition=True)
         solver.on_finish_time_step("// application hook before AMR installation\n")
         policy = exahype2.amr.AMR(
             state_scales=(1.0, 1.0), assessment_interval=interval,
             sample_initial_data=sampling,
+            execution=execution,
         )
         if install:
             policy.install(solver, external_callback=external_callback)
@@ -60,8 +64,7 @@ class AMRGPUGenerationTest(unittest.TestCase):
                 periodic_bc=[True, True], directory=directory,
             )
             project.add_solver(solver)
-            # Generation itself is backend independent; avoid discovering an
-            # unrelated installed runtime while rendering a GPU project.
+            # The fixture always generates CUDA solver files, including for CPU criteria.
             project.output.makefile.d["GPU"] = "cuda"
             with patch.object(project.output.makefile, "parse_configuration_outcome"):
                 project._generate()
@@ -142,6 +145,79 @@ class AMRGPUGenerationTest(unittest.TestCase):
         solver, _ = self.render("fv", install=False)
         self.assertIn("refinementCriterion", solver.dictionary["SOLVER_PDE_TERM_DECLARATIONS"])
         self.assertNotIn("refinementCriterion", solver.dictionary["SOLVER_HOST_PDE_TERM_DECLARATIONS"])
+
+    def test_device_assessment_uses_live_device_views_for_every_solver_family(self):
+        for family in ("fv", "ader", "rk", "limited"):
+            with self.subTest(family=family):
+                solver, files = self.render(family, execution="gpu")
+                declarations = files["AMRGPUBase.h"]
+                begin = solver.dictionary["START_TIME_STEP_IMPLEMENTATION"]
+                assessment = solver.dictionary["REFINEMENT_ASSESSMENT_IMPLEMENTATION"]
+                self.assertIn("RefinementCriterionOnHost = false", declarations)
+                self.assertIn("::exahype2::amr::DeviceCriterion<", declarations)
+                self.assertIn("assessAMROnDevice(", declarations)
+                self.assertIn("DeviceCallbacks", declarations)
+                self.assertIn("RuntimeParameters parameters;", declarations)
+                self.assertNotIn("make_shared", begin)
+                self.assertNotIn("download", begin)
+                self.assertNotIn("download", assessment)
+                if family == "fv":
+                    self.assertNotIn("DeviceDGOperators", begin)
+                else:
+                    self.assertIn("DeviceDGOperators{Quadrature<double>::QuadraturePoints1D", begin)
+                    self.assertIn("DGMatrices<double>::WeightedRestrictionMatrix1D", begin)
+                    self.assertIn("DGMatrices<double>::ProlongationMatrix1D", begin)
+                self.assertIn(".beginInitialisation();", solver.dictionary["REFINEMENT_INITIALISATION_IMPLEMENTATION"])
+                self.assertIn("GPU_CALLABLE_METHOD static double stateScale", declarations)
+                self.assertIn("GPU_CALLABLE_METHOD static double _", declarations)
+                self.assertIn("GPU_CALLABLE_METHOD bool admissible", declarations)
+                if family == "limited":
+                    self.assertIn("getLimiter().getStatuses()", declarations)
+                    self.assertIn("getLimiter().getSubcells()", declarations)
+                else:
+                    self.assertIn("NoStatusView{}", declarations)
+
+    def test_device_initial_sampling_uses_device_tables_and_callbacks(self):
+        for family in ("ader", "rk", "limited"):
+            with self.subTest(family=family):
+                solver, files = self.render(family, sampling=True, execution="gpu")
+                declarations = files["AMRGPUBase.h"]
+                self.assertIn("HasInitialDataCheck = true", declarations)
+                self.assertIn("constexpr auto deviceNodes = Quadrature<double>::getQuadraturePoints1D()", declarations)
+                self.assertIn("constexpr auto deviceProlongation = DGMatrices<double>::getProlongationMatrix1D()", declarations)
+                self.assertIn("deviceNodes.data(), deviceProlongation.data()", declarations)
+                self.assertNotIn("Quadrature<double>::QuadraturePoints1D", declarations)
+                self.assertNotIn("DGMatrices<double>::ProlongationMatrix1D", declarations)
+                self.assertIn("[parameters] GPU_CALLABLE_METHOD", declarations)
+                self.assertIn("::observation_detail::DeviceInitialDataMonitor<", declarations)
+                self.assertIn("deviceInitialDataPasses<" if family == "limited" else "nativeDeviceInitialDataPasses<", declarations)
+                self.assertIn("initialCondition", solver.dictionary["SOLVER_PDE_TERM_DECLARATIONS"])
+                self.assertNotIn("initialCondition", solver.dictionary["SOLVER_HOST_PDE_TERM_DECLARATIONS"])
+                device_blocks = re.findall(r"TARGET_DECLARE\b(.*?)TARGET_DECLARE_END", files["AMRGPU.h"], re.S)
+                self.assertTrue(any("initialCondition" in block and "GPU_CALLABLE_METHOD" in block for block in device_blocks))
+
+    def test_device_sampling_requires_external_initial_data_definitions_on_the_device(self):
+        solver, files = self.render("ader", sampling=True, execution="gpu", external_initial=True)
+        self.assertIn("initialCondition", solver.dictionary["HOST_DEFINED_DEVICE_TERMS"])
+        self.assertIn("A GPU build needs the definitions of initialCondition", files["AMRGPU.h"])
+        solver, _ = self.render("ader", sampling=True)
+        self.assertIn("initialCondition", solver.dictionary["SOLVER_HOST_PDE_TERM_DECLARATIONS"])
+
+    def test_device_interval_keeps_assessment_after_application_hooks(self):
+        solver, files = self.render("limited", interval=3, execution="gpu")
+        assessment = solver.dictionary["REFINEMENT_ASSESSMENT_IMPLEMENTATION"]
+        self.assertIn("_limiterCriterionAssessThisStep", assessment)
+        self.assertNotIn("download", assessment)
+        body = files["AMRGPUBase.cpp"]
+        after = body.index("// application hook after AMR installation", body.index("SolverFamily::performTimeStep("))
+        self.assertLess(after, body.index("this->assessRefinement(", after))
+
+    def test_device_backend_rejects_external_callbacks_and_unknown_execution(self):
+        with self.assertRaisesRegex(ValueError, "device backend owns the complete AMR assessment"):
+            self.render("ader", execution="gpu", external_callback=True)
+        for execution in ("cuda", None, True):
+            with self.subTest(execution=execution), self.assertRaisesRegex(ValueError, "execution"):
+                exahype2.amr.AMR(state_scales=(1.0,), execution=execution)
 
 
 if __name__ == "__main__":

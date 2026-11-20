@@ -322,6 +322,18 @@ exahype2::dg::limiting::SubcellLimiter<Derived, StoragePrecision, ComputePrecisi
   return _statuses.getView();
 }
 
+template <typename Derived, typename StoragePrecision, typename ComputePrecision>
+INLINE_METHOD typename exahype2::dg::limiting::SubcellLimiter<Derived, StoragePrecision, ComputePrecision>::StatusPool::ConstView
+exahype2::dg::limiting::SubcellLimiter<Derived, StoragePrecision, ComputePrecision>::getStatuses() const {
+  return _statuses.getView();
+}
+
+template <typename Derived, typename StoragePrecision, typename ComputePrecision>
+INLINE_METHOD typename exahype2::dg::limiting::SubcellLimiter<Derived, StoragePrecision, ComputePrecision>::CellPool::ConstView
+exahype2::dg::limiting::SubcellLimiter<Derived, StoragePrecision, ComputePrecision>::getSubcells() const {
+  return _subcells.getView();
+}
+
 /**
  * Returns the status pool if host code reads it. Otherwise returns its copy in _statusesOnHost.
  */

@@ -2,6 +2,7 @@
 // use, please see the copyright notice at www.peano-framework.org
 
 #pragma once
+#include "tarch/accelerator/CompileTarget.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -13,40 +14,153 @@
 #if defined(__FAST_MATH__)
 #error "Continuous transfer certificates require IEEE arithmetic without fast-math."
 #endif
+TARGET_DECLARE
 namespace exahype2::amr::detail::transfer_bound {
+  /** A fixed-capacity list. Appending an entry returns false when the list is full. */
+  template <typename T, int Capacity>
+  class FixedVector {
+    static_assert(Capacity >= 0);
+    T _values[Capacity > 0 ? Capacity : 1]{};
+    int _size{0};
+  public:
+    GPU_CALLABLE_METHOD constexpr int size() const { return _size; }
+    GPU_CALLABLE_METHOD constexpr bool empty() const { return _size == 0; }
+    GPU_CALLABLE_METHOD constexpr T* data() { return _values; }
+    GPU_CALLABLE_METHOD constexpr const T* data() const { return _values; }
+    GPU_CALLABLE_METHOD constexpr T* begin() { return data(); }
+    GPU_CALLABLE_METHOD constexpr const T* begin() const { return data(); }
+    GPU_CALLABLE_METHOD constexpr T* end() { return data() + _size; }
+    GPU_CALLABLE_METHOD constexpr const T* end() const { return data() + _size; }
+    GPU_CALLABLE_METHOD constexpr T& operator[](int index) { return _values[index]; }
+    GPU_CALLABLE_METHOD constexpr const T& operator[](int index) const { return _values[index]; }
+    GPU_CALLABLE_METHOD constexpr void clear() { _size = 0; }
+    GPU_CALLABLE_METHOD constexpr bool resize(int size) {
+      if (size < 0 or size > Capacity) return false;
+      for (int entry = _size; entry < size; entry++) _values[entry] = T{};
+      _size = size;
+      return true;
+    }
+    GPU_CALLABLE_METHOD constexpr bool push_back(const T& value) {
+      if (_size == Capacity) return false;
+      _values[_size++] = value;
+      return true;
+    }
+  };
+
+  template <typename Iterator>
+  GPU_CALLABLE_METHOD constexpr void sort(Iterator first, Iterator last) {
+    if (first == last) return;
+    for (auto entry = first + 1; entry != last; ++entry) {
+      const auto value = *entry;
+      auto position = entry;
+      while (position != first and value < *(position - 1)) {
+        *position = *(position - 1);
+        --position;
+      }
+      *position = value;
+    }
+  }
+
+  template <typename Iterator>
+  GPU_CALLABLE_METHOD constexpr Iterator unique(Iterator first, Iterator last) {
+    if (first == last) return last;
+    auto output = first;
+    for (auto entry = first + 1; entry != last; ++entry) {
+      if (not (*output == *entry)) *++output = *entry;
+    }
+    return output + 1;
+  }
+
+  template <typename Iterator>
+  GPU_CALLABLE_METHOD constexpr bool nextPermutation(Iterator first, Iterator last) {
+    if (first == last or first + 1 == last) return false;
+    auto pivot = last - 1;
+    while (pivot != first and not (*(pivot - 1) < *pivot)) --pivot;
+    const bool found = pivot != first;
+    if (found) {
+      --pivot;
+      auto successor = last - 1;
+      while (not (*pivot < *successor)) --successor;
+      const auto value = *pivot;
+      *pivot = *successor;
+      *successor = value;
+      ++pivot;
+    }
+    for (auto back = last - 1; pivot < back; ++pivot, --back) {
+      const auto value = *pivot;
+      *pivot = *back;
+      *back = value;
+    }
+    return found;
+  }
+
+  /** Each operation rounds to double before its result is used to form an interval endpoint. */
+  GPU_CALLABLE_METHOD inline double roundedAdd(double left, double right) {
+#if defined(__CUDA_ARCH__)
+    return __dadd_rn(left, right);
+#else
+    COMPILE_IF_ON_DEVICE(volatile double value = left + right; return value;)
+    COMPILE_IF_ON_HOST(return left + right;)
+#endif
+  }
+  GPU_CALLABLE_METHOD inline double roundedSubtract(double left, double right) {
+#if defined(__CUDA_ARCH__)
+    return __dsub_rn(left, right);
+#else
+    COMPILE_IF_ON_DEVICE(volatile double value = left - right; return value;)
+    COMPILE_IF_ON_HOST(return left - right;)
+#endif
+  }
+  GPU_CALLABLE_METHOD inline double roundedMultiply(double left, double right) {
+#if defined(__CUDA_ARCH__)
+    return __dmul_rn(left, right);
+#else
+    COMPILE_IF_ON_DEVICE(volatile double value = left * right; return value;)
+    COMPILE_IF_ON_HOST(return left * right;)
+#endif
+  }
+  GPU_CALLABLE_METHOD inline double roundedDivide(double left, double right) {
+#if defined(__CUDA_ARCH__)
+    return __ddiv_rn(left, right);
+#else
+    COMPILE_IF_ON_DEVICE(volatile double value = left / right; return value;)
+    COMPILE_IF_ON_HOST(return left / right;)
+#endif
+  }
+
   // Outward-rounded scalar bounds.
   struct Interval {
     double lo, hi;
   };
-  inline Interval bad() { return {-INFINITY, INFINITY}; }
-  inline bool valid(Interval x) { return std::isfinite(x.lo) && std::isfinite(x.hi) && x.lo <= x.hi; }
-  inline bool zero(Interval x) { return x.lo == 0. && x.hi == 0.; }
-  inline double down(double x) {
+  GPU_CALLABLE_METHOD inline Interval bad() { return {-INFINITY, INFINITY}; }
+  GPU_CALLABLE_METHOD inline bool valid(Interval x) { return std::isfinite(x.lo) && std::isfinite(x.hi) && x.lo <= x.hi; }
+  GPU_CALLABLE_METHOD inline bool zero(Interval x) { return x.lo == 0. && x.hi == 0.; }
+  GPU_CALLABLE_METHOD inline double down(double x) {
     return x == -std::numeric_limits<double>::max() ? -INFINITY : std::nextafter(x, -INFINITY);
   }
-  inline double up(double x) {
+  GPU_CALLABLE_METHOD inline double up(double x) {
     return x == std::numeric_limits<double>::max() ? INFINITY : std::nextafter(x, INFINITY);
   }
   // Check for overflow before evaluating interval endpoints.
-  inline bool sumSafe(double a, double b) {
+  GPU_CALLABLE_METHOD inline bool sumSafe(double a, double b) {
     const double limit = std::numeric_limits<double>::max();
-    return std::signbit(a) != std::signbit(b) || std::abs(a) <= limit - std::abs(b);
+    return std::signbit(a) != std::signbit(b) || std::abs(a) <= roundedSubtract(limit, std::abs(b));
   }
-  inline bool productSafe(double a, double b) {
+  GPU_CALLABLE_METHOD inline bool productSafe(double a, double b) {
     const double aa = std::abs(a), bb = std::abs(b), limit = std::numeric_limits<double>::max();
     if (aa > 1.) {
       // Prevent speculative division by a zero or tiny operand.
       volatile double divisor = aa;
-      if (bb > std::nextafter(limit / divisor, 0.)) return false;
+      if (bb > std::nextafter(roundedDivide(limit, divisor), 0.)) return false;
     }
     if (bb > 1.) {
       volatile double divisor = bb;
-      if (aa > std::nextafter(limit / divisor, 0.)) return false;
+      if (aa > std::nextafter(roundedDivide(limit, divisor), 0.)) return false;
     }
     return true;
   }
-  // Round outwards and preserve exact zero; unbounded results fail the certificate.
-  inline Interval add(Interval a, Interval b) {
+  // The result encloses the exact sum, including roundoff at both endpoints.
+  GPU_CALLABLE_METHOD inline Interval add(Interval a, Interval b) {
     if (!valid(a) || !valid(b)) {
       return bad();
     }
@@ -59,11 +173,11 @@ namespace exahype2::amr::detail::transfer_bound {
     if (!sumSafe(a.lo, b.lo) || !sumSafe(a.hi, b.hi)) {
       return bad();
     }
-    const double lo = a.lo + b.lo, hi = a.hi + b.hi;
+    const double lo = roundedAdd(a.lo, b.lo), hi = roundedAdd(a.hi, b.hi);
     return std::isfinite(lo) && std::isfinite(hi) ? Interval{down(lo), up(hi)} : bad();
   }
-  inline Interval sub(Interval a, Interval b) { return add(a, {-b.hi, -b.lo}); }
-  inline Interval mul(Interval a, Interval b) {
+  GPU_CALLABLE_METHOD inline Interval sub(Interval a, Interval b) { return add(a, {-b.hi, -b.lo}); }
+  GPU_CALLABLE_METHOD inline Interval mul(Interval a, Interval b) {
     if (!valid(a) || !valid(b)) {
       return bad();
     }
@@ -73,15 +187,22 @@ namespace exahype2::amr::detail::transfer_bound {
     if (!productSafe(a.lo, b.lo) || !productSafe(a.lo, b.hi) || !productSafe(a.hi, b.lo) || !productSafe(a.hi, b.hi)) {
       return bad();
     }
-    const std::array<double, 4> v{a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi};
+    const std::array<double, 4> v{
+      roundedMultiply(a.lo, b.lo), roundedMultiply(a.lo, b.hi),
+      roundedMultiply(a.hi, b.lo), roundedMultiply(a.hi, b.hi)};
     for (double x : v) {
       if (!std::isfinite(x)) {
         return bad();
       }
     }
-    return {down(*std::min_element(v.begin(), v.end())), up(*std::max_element(v.begin(), v.end()))};
+    double lower = v[0], upper = v[0];
+    for (int entry = 1; entry < 4; entry++) {
+      lower = std::min(lower, v[entry]);
+      upper = std::max(upper, v[entry]);
+    }
+    return {down(lower), up(upper)};
   }
-  inline Interval div(Interval a, double s) {
+  GPU_CALLABLE_METHOD inline Interval div(Interval a, double s) {
     if (!valid(a) || !std::isfinite(s) || s <= 0.) {
       return bad();
     }
@@ -90,13 +211,13 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     if (s < 1.) {
       volatile double factor = s;
-      if (std::max(std::abs(a.lo), std::abs(a.hi)) > std::numeric_limits<double>::max() * factor) return bad();
+      if (std::max(std::abs(a.lo), std::abs(a.hi)) > roundedMultiply(std::numeric_limits<double>::max(), factor)) return bad();
     }
-    const double lo = a.lo / s, hi = a.hi / s;
+    const double lo = roundedDivide(a.lo, s), hi = roundedDivide(a.hi, s);
     return std::isfinite(lo) && std::isfinite(hi) ? Interval{down(lo), up(hi)} : bad();
   }
   // Bound (a-b)/s, dividing first if a-b would overflow.
-  inline Interval difference(double a, double b, double s) {
+  GPU_CALLABLE_METHOD inline Interval difference(double a, double b, double s) {
     if (!std::isfinite(a) || !std::isfinite(b) || !std::isfinite(s) || s <= 0.) {
       return bad();
     }
@@ -104,19 +225,19 @@ namespace exahype2::amr::detail::transfer_bound {
       return {0., 0.};
     }
     const double limit = std::numeric_limits<double>::max();
-    if (std::signbit(a) != std::signbit(b) && std::abs(a) > limit - std::abs(b)) {
+    if (std::signbit(a) != std::signbit(b) && std::abs(a) > roundedSubtract(limit, std::abs(b))) {
       return sub(div({a, a}, s), div({b, b}, s));
     }
     return div(sub({a, a}, {b, b}), s);
   }
   // Convert an interval to an upper bound on its absolute value.
-  inline double magnitude(Interval a) { return valid(a) ? std::max(std::abs(a.lo), std::abs(a.hi)) : INFINITY; }
+  GPU_CALLABLE_METHOD inline double magnitude(Interval a) { return valid(a) ? std::max(std::abs(a.lo), std::abs(a.hi)) : INFINITY; }
   // Bound the vector norm with outward rounding; scale by budget to avoid overflow.
-  template <int V> bool normPasses(std::array<double, V> m, double budget) {
+  template <int V> GPU_CALLABLE_METHOD bool normPasses(std::array<double, V> m, double budget) {
     if (!std::isfinite(budget) || budget <= 0.) {
       return false;
     }
-    std::sort(m.begin(), m.end());
+    sort(m.begin(), m.end());
     double sum = 0.;
     for (double x : m) {
       if (!std::isfinite(x) || x < 0. || x > budget) {
@@ -125,8 +246,8 @@ namespace exahype2::amr::detail::transfer_bound {
       if (x == 0.) {
         continue;
       }
-      const double ratio = up(x / budget), square = up(ratio * ratio);
-      sum = up(sum + square);
+      const double ratio = up(roundedDivide(x, budget)), square = up(roundedMultiply(ratio, ratio));
+      sum = up(roundedAdd(sum, square));
       if (!std::isfinite(sum) || sum > 1.) {
         return false;
       }
@@ -134,7 +255,7 @@ namespace exahype2::amr::detail::transfer_bound {
     return sum == 0. || up(std::sqrt(sum)) <= 1.;
   }
   // Sort terms for an order-independent interval sum.
-  template <int N> Interval canonicalSum(std::array<Interval, N> terms) {
+  template <int N> GPU_CALLABLE_METHOD Interval canonicalSum(std::array<Interval, N> terms) {
     std::array<double, N> lo, hi;
     for (int i = 0; i < N; i++) {
       if (!valid(terms[i])) {
@@ -147,18 +268,18 @@ namespace exahype2::amr::detail::transfer_bound {
     for (double &x : lo) {
       x = -x;
     }
-    std::sort(lo.begin(), lo.end());
-    std::sort(hi.begin(), hi.end());
+    sort(lo.begin(), lo.end());
+    sort(hi.begin(), hi.end());
     double l = 0., h = 0.;
     for (int i = 0; i < N; i++) {
       if (!sumSafe(l, lo[i]) || !sumSafe(h, hi[i])) {
         return bad();
       }
       if (lo[i] != 0.) {
-        l = up(l + lo[i]);
+        l = up(roundedAdd(l, lo[i]));
       }
       if (hi[i] != 0.) {
-        h = up(h + hi[i]);
+        h = up(roundedAdd(h, hi[i]));
       }
       if (!std::isfinite(l) || !std::isfinite(h)) {
         return bad();
@@ -167,17 +288,15 @@ namespace exahype2::amr::detail::transfer_bound {
     return {-l, h};
   }
   // Require round-to-nearest and gradual underflow for interval bounds.
-  inline bool arithmeticSupported() {
+  GPU_CALLABLE_METHOD inline bool arithmeticSupported() {
     static_assert(sizeof(double) == sizeof(std::uint64_t) && std::numeric_limits<double>::digits == 53);
-    if (std::fegetround() != FE_TONEAREST) {
-      return false;
-    }
+    COMPILE_IF_ON_HOST(if (std::fegetround() != FE_TONEAREST) return false;)
     volatile double normal = std::numeric_limits<double>::min(), half = .5;
     volatile double tiny = std::numeric_limits<double>::denorm_min(), two = 2.;
     const double a = normal * half, b = tiny * two;
     return std::bit_cast<std::uint64_t>(a) == 0x0008000000000000ULL && std::bit_cast<std::uint64_t>(b) == 2ULL;
   }
-  constexpr int power(int n, int d) {
+  GPU_CALLABLE_METHOD constexpr int power(int n, int d) {
     int v = 1;
     while (d--) {
       v *= n;
@@ -187,7 +306,7 @@ namespace exahype2::amr::detail::transfer_bound {
   template <int N, int V, int D> using Field = std::array<Interval, power(N, D) * V>;
   // Apply an interval matrix along one tensor axis.
   template <int N, int V, int D>
-  Field<N, V, D> contract(const Field<N, V, D> &q, const std::array<Interval, N * N> &matrix, int axis) {
+  GPU_CALLABLE_METHOD Field<N, V, D> contract(const Field<N, V, D> &q, const std::array<Interval, N * N> &matrix, int axis) {
     Field<N, V, D> out;
     const int stride = power(N, axis), nodes = power(N, D);
     for (int fibre = 0; fibre < nodes / N; fibre++) {
@@ -205,7 +324,7 @@ namespace exahype2::amr::detail::transfer_bound {
     return out;
   }
   // Certify the polynomial from the convex hull of its Bernstein control vectors.
-  template <int N, int V, int D> bool hullPasses(const Field<N, V, D> &q, double budget) {
+  template <int N, int V, int D> GPU_CALLABLE_METHOD bool hullPasses(const Field<N, V, D> &q, double budget) {
     for (int n = 0; n < power(N, D); n++) {
       std::array<double, V> m;
       for (int c = 0; c < V; c++) {
@@ -218,7 +337,7 @@ namespace exahype2::amr::detail::transfer_bound {
     return true;
   }
   // Bisect one tensor axis at its midpoint using de Casteljau averaging.
-  template <int N, int V, int D> Field<N, V, D> half(const Field<N, V, D> &q, int axis, bool right) {
+  template <int N, int V, int D> GPU_CALLABLE_METHOD Field<N, V, D> half(const Field<N, V, D> &q, int axis, bool right) {
     Field<N, V, D> out;
     const int stride = power(N, axis), nodes = power(N, D);
     for (int fibre = 0; fibre < nodes / N; fibre++) {
@@ -246,7 +365,7 @@ namespace exahype2::amr::detail::transfer_bound {
   }
   /** Bisect all axes until every box passes or the round limit is reached. */
   template <int N, int V, int D>
-  bool refinedHullPasses(const Field<N, V, D> &q, double budget, const std::array<int, D> &order, int remaining) {
+  GPU_CALLABLE_METHOD bool refinedHullPasses(const Field<N, V, D> &q, double budget, const std::array<int, D> &order, int remaining) {
     if (hullPasses<N, V, D>(q, budget)) {
       return true;
     }
@@ -265,7 +384,7 @@ namespace exahype2::amr::detail::transfer_bound {
     return true;
   }
   // Detect points whose norm lower bound exceeds the budget.
-  template <int V> bool pointAbove(const std::array<Interval, V> &point, double budget) {
+  template <int V> GPU_CALLABLE_METHOD bool pointAbove(const std::array<Interval, V> &point, double budget) {
     std::array<double, V> lower;
     for (int c = 0; c < V; c++) {
       if (!valid(point[c])) {
@@ -273,7 +392,7 @@ namespace exahype2::amr::detail::transfer_bound {
       }
       lower[c] = point[c].lo > 0. ? point[c].lo : point[c].hi < 0. ? -point[c].hi : 0.;
     }
-    std::sort(lower.begin(), lower.end());
+    sort(lower.begin(), lower.end());
     double sum = 0.;
     for (double value : lower) {
       if (value > budget) {
@@ -282,17 +401,17 @@ namespace exahype2::amr::detail::transfer_bound {
       if (value == 0.) {
         continue;
       }
-      const double ratio = std::max(0., down(value / budget)), square = std::max(0., down(ratio * ratio));
+      const double ratio = std::max(0., down(roundedDivide(value, budget))), square = std::max(0., down(roundedMultiply(ratio, ratio)));
       if (!sumSafe(sum, square)) {
         return false;
       }
-      sum = std::max(0., down(sum + square));
+      sum = std::max(0., down(roundedAdd(sum, square)));
     }
     return sum > 1.;
   }
   // Look for an over-budget value at the corners or centre.
   template <int N, int V, int D>
-  bool pointWitness(const Field<N, V, D> &q, double budget, const std::array<int, D> &order) {
+  GPU_CALLABLE_METHOD bool pointWitness(const Field<N, V, D> &q, double budget, const std::array<int, D> &order) {
     for (int corner = 0; corner < (1 << D); corner++) {
       int node = 0;
       for (int a = 0; a < D; a++) {
@@ -320,7 +439,7 @@ namespace exahype2::amr::detail::transfer_bound {
     return pointAbove<V>(value, budget);
   }
   // Split the axis with the largest adjacent-control variation; use order to break ties.
-  template <int N, int V, int D> int splitAxis(const Field<N, V, D> &q, const std::array<int, D> &order) {
+  template <int N, int V, int D> GPU_CALLABLE_METHOD int splitAxis(const Field<N, V, D> &q, const std::array<int, D> &order) {
     int selected = order[0];
     double largest = -1.;
     for (int axis : order) {
@@ -343,11 +462,54 @@ namespace exahype2::amr::detail::transfer_bound {
     return selected;
   }
   enum class HullResult { Proved, Unsafe, Unknown };
-  /** Refine unresolved boxes within fixed work limits.
-   * Complete frontiers make the limits independent of visit order.
+  /** Test the error bound on smaller parts of the cell. Unknown means the available bounds or work limit
+   * did not settle the test.
    */
   template <int N, int V, int D>
-  HullResult adaptiveHull(const Field<N, V, D> &q, double budget, const std::array<int, D> &order) {
+  GPU_CALLABLE_METHOD HullResult adaptiveHullOnDevice(
+    const Field<N, V, D>& q, double budget, const std::array<int, D>& order
+  ) {
+    constexpr int Boxes = (1 << 10) - 1, Coefficients = 1 << 18;
+    constexpr int Entries = power(N, D) * V;
+    constexpr int Capacity = Entries <= Coefficients ? std::min(512, Coefficients / Entries) : 1;
+    if (q.size() > Coefficients) return HullResult::Unknown;
+    FixedVector<std::uint64_t, Capacity> active, next;
+    active.push_back(0);
+    int visited = 0;
+    for (int depth = 0;; depth++) {
+      if (active.size() > Boxes - visited) return HullResult::Unknown;
+      FixedVector<std::uint64_t, Capacity> unresolved;
+      for (const auto path : active) {
+        auto box = q;
+        for (int level = 0; level < depth; level++) {
+          const int axis = splitAxis<N, V, D>(box, order);
+          box = half<N, V, D>(box, axis, ((path >> (depth - level - 1)) & 1U) != 0);
+        }
+        ++visited;
+        if (hullPasses<N, V, D>(box, budget)) continue;
+        for (const auto value : box) if (not valid(value)) return HullResult::Unknown;
+        if (pointWitness<N, V, D>(box, budget, order)) return HullResult::Unsafe;
+        if (not unresolved.push_back(path)) return HullResult::Unknown;
+      }
+      if (unresolved.empty()) return HullResult::Proved;
+      if (depth >= std::numeric_limits<double>::digits or unresolved.size() > (Boxes - visited) / 2
+          or active.size() > Coefficients / int(q.size())
+          or unresolved.size() > (Coefficients / int(q.size()) - active.size()) / 2) return HullResult::Unknown;
+      next.clear();
+      for (const auto path : unresolved) {
+        if (not next.push_back(path << 1) or not next.push_back((path << 1) | 1U)) return HullResult::Unknown;
+      }
+      active = next;
+    }
+  }
+
+  /** Check whether the error stays within budget throughout the cell. Subdivide boxes whose bounds are
+   * inconclusive.
+   */
+  template <int N, int V, int D>
+  GPU_CALLABLE_METHOD HullResult adaptiveHull(const Field<N, V, D> &q, double budget, const std::array<int, D> &order) {
+    COMPILE_IF_ON_DEVICE(return (adaptiveHullOnDevice<N, V, D>(q, budget, order));)
+    COMPILE_IF_ON_HOST(return ([&]() -> HullResult {
     constexpr std::size_t boxes = (1U << 10) - 1, coefficients = 1U << 18;
     if (q.size() > coefficients) {
       return HullResult::Unknown;
@@ -394,12 +556,14 @@ namespace exahype2::amr::detail::transfer_bound {
       }
       active = std::move(next);
     }
+    })();)
+    return HullResult::Unknown;
   }
-  /** Certify a polynomial from interval-enclosed nodal residuals.
-   * matrix encloses the nodal-to-Bernstein transform; unresolved bounds fail.
+  /** Return true if the error intervals at the nodes imply that the polynomial stays within budget
+   * everywhere in the cell.
    */
   template <int N, int V, int D>
-  bool passesIntervals(const Field<N, V, D> &input, double budget,
+  GPU_CALLABLE_METHOD bool passesIntervals(const Field<N, V, D> &input, double budget,
                        const std::array<Interval, N * N> &matrix, bool split = true) {
     static_assert(N > 0 && V > 0 && D > 0 && D <= 3);
     static_assert(std::numeric_limits<double>::is_iec559);
@@ -431,7 +595,7 @@ namespace exahype2::amr::detail::transfer_bound {
         }
         terms[col] = magnitude(matrix[row * N + col]);
       }
-      std::sort(terms.begin(), terms.end());
+      sort(terms.begin(), terms.end());
       double sum = 0.;
       for (double x : terms) {
         if (x != 0.) {
@@ -439,7 +603,7 @@ namespace exahype2::amr::detail::transfer_bound {
             sum = INFINITY;
             break;
           }
-          sum = up(sum + x);
+          sum = up(roundedAdd(sum, x));
         }
       }
       amplification = std::max(amplification, sum);
@@ -448,7 +612,7 @@ namespace exahype2::amr::detail::transfer_bound {
     for (int axis = 0; axis < D; axis++) {
       for (double &x : fast) {
         if (x != 0.) {
-          x = std::isfinite(amplification) && productSafe(x, amplification) ? up(x * amplification) : INFINITY;
+          x = std::isfinite(amplification) && productSafe(x, amplification) ? up(roundedMultiply(x, amplification)) : INFINITY;
         }
       }
     }
@@ -482,7 +646,7 @@ namespace exahype2::amr::detail::transfer_bound {
           return true;
         }
       }
-    } while (std::next_permutation(order.begin(), order.end()));
+    } while (nextPermutation(order.begin(), order.end()));
     // Refine unresolved hulls and reject over-budget point witnesses.
     if (split) {
       for (int a = 0; a < D; a++) {
@@ -500,16 +664,16 @@ namespace exahype2::amr::detail::transfer_bound {
         if (result == HullResult::Unsafe) {
           return false;
         }
-      } while (std::next_permutation(order.begin(), order.end()));
+      } while (nextPermutation(order.begin(), order.end()));
     }
     return false;
   }
 
-  /** Certify the component-scaled fine-minus-restored polynomial over the cell.
-   * matrix encloses the nodal-to-Bernstein transform; split enables subdivision.
+  /** Check that the scaled difference between the original and restored DG polynomials stays within budget
+   * across the cell.
    */
   template <int N, int V, int D, typename P>
-  bool passes(const P *fine, const P *restored, const std::array<double, V> &scales, double budget,
+  GPU_CALLABLE_METHOD bool passes(const P *fine, const P *restored, const std::array<double, V> &scales, double budget,
               const std::array<Interval, N * N> &matrix, bool split = true) {
     if (!fine || !restored || !arithmeticSupported()) {
       return false;
@@ -523,3 +687,5 @@ namespace exahype2::amr::detail::transfer_bound {
     return passesIntervals<N, V, D>(input, budget, matrix, split);
   }
 } // namespace exahype2::amr::detail::transfer_bound
+
+TARGET_DECLARE_END

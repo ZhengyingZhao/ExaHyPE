@@ -78,6 +78,8 @@ set(PEANO4_TEST_SOURCES
 )
 
 set(EXAHYPE2_TEST_SOURCES
+  exahype2/AMRDeviceSensorsTest.cpp
+  exahype2/AMRDeviceCriterionTest.cpp
   exahype2/CurviTest.cpp
   exahype2/ErrorMeasurementTest.cpp
   exahype2/LevelJumpsTest.cpp
@@ -147,6 +149,8 @@ set(GPU_TEST_SOURCES
   peano4/communication/HaloExchangeKernelsTest.cpp
   peano4/communication/MigrationExchangeKernelsTest.cpp
 
+  exahype2/AMRDeviceSensorsTest.cpp
+  exahype2/AMRDeviceCriterionTest.cpp
   exahype2/ErrorMeasurementTest.cpp
   exahype2/LevelJumpsTest.cpp
   exahype2/MultiresolutionDetailTest.cpp

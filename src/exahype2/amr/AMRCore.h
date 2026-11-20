@@ -14,6 +14,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 namespace exahype2::amr {
@@ -22,6 +23,8 @@ namespace exahype2::amr {
            typename Accepted, typename Transfer, typename Evidence = NoLimiterEvidence,
            typename Assessment = DefaultAssessmentPolicy<Accepted>>
   class AMRCore final {
+    template<int, int, typename, typename, typename, typename, typename, typename>
+    friend class DeviceCriterion;
   public:
     using EngineTag = AMRCoreTag;
     using AcceptedAdapter = Accepted;
@@ -58,6 +61,7 @@ namespace exahype2::amr {
     };
 
     void beginInitialisation(PhysicalAdmissibility admissible = nullptr, InitialDataCheck initialDataCheck = nullptr);
+    /** Sets up host assessment for this time step using the solver's cells, solution and optional limiter data. */
     template<typename SolutionView, typename StatusView>
     void beginStep(const peano4::CellConnectivity& mesh, SolutionView solution, StatusView statuses,
                    const exahype2::TimeStepping& clock, const double* nodes,
@@ -67,8 +71,8 @@ namespace exahype2::amr {
     [[nodiscard]] exahype2::RefinementCommand command(
       const Precision* Q, const Coordinates& x, const Coordinates& h, double time) const;
     void finishStep();
-    /** Read cached assessment counters after voting, with no concurrent writes.
-     * Erase votes count families; refinement evidence counts assessed leaves. */
+    /** Counts assessed leaves and sibling groups. Call after voting has finished.
+     * One erase vote represents a whole group of siblings that can coarsen together. */
     [[nodiscard]] Statistics statistics() const;
     void setReferenceTime(double time);
     void reset();
@@ -213,6 +217,18 @@ namespace exahype2::amr {
       const AcceptedCellView<Precision>& own, const AcceptedCellView<Precision>& other,
       const Key& ownKey, const Key& otherKey, int normal, int side
     ) const;
+    /** Sets up the grid geometry, sibling groups and transfer bounds for CPU or device assessment.
+     * Returns true if the step starts at a finite, nonnegative time. */
+    [[nodiscard]] bool prepareStep(const peano4::CellConnectivity& mesh, const exahype2::TimeStepping& clock,
+                                   const double* nodes, const double* restriction, const double* prolongation);
+    static void countAssessedFamily(Statistics& result, const auto& plan) {
+      ++result.assessedFamilies;
+      result.sizeVetoedFamilies += plan.sizeVetoed;
+      result.transferPassed += plan.transferSafe;
+      result.currentNeighboursPassed += plan.neighboursSafe;
+      result.eligibleFamilies += plan.eligible;
+      result.quietReady += plan.eligible;
+    }
     void bindQuietRegions();
     void finishQuietRegions(double time, double dt);
     [[nodiscard]] double advanceQuiet(double quiet, double crossing, bool moving, double dt) const;

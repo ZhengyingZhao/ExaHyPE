@@ -7,11 +7,12 @@
 #include <concepts>
 #include <type_traits>
 
+TARGET_DECLARE
 namespace exahype2::amr {
   /** Limiter roles used by the AMR criterion. */
   enum class CellRole { Unavailable, Regular, Halo, Limited, Troubled };
 
-  /** Interpret the native DG subcell limiter's status array. */
+  /** Translate a cell's limiter status into the role AMR uses to choose DG or subcell values. */
   template<int SubcellCount>
   struct NativeSubcellLimiter {
     static_assert(SubcellCount > 0);
@@ -20,7 +21,7 @@ namespace exahype2::amr {
     static constexpr int StatusEntries = exahype2::dg::limiting::NumberOfStatusEntries;
     static constexpr int StatusIndex = static_cast<int>(exahype2::dg::limiting::StatusEntry::Status);
 
-    static constexpr CellRole classify(const int* status) noexcept {
+    static GPU_CALLABLE_METHOD constexpr CellRole classify(const int* status) noexcept {
       if (status == nullptr) return CellRole::Unavailable;
       using NativeRole = exahype2::dg::limiting::LimiterStatus;
       switch (status[StatusIndex]) {
@@ -32,20 +33,20 @@ namespace exahype2::amr {
       }
     }
 
-    static constexpr bool isKnown(CellRole role) noexcept {
+    static GPU_CALLABLE_METHOD constexpr bool isKnown(CellRole role) noexcept {
       return role == CellRole::Regular or role == CellRole::Halo
           or role == CellRole::Limited or role == CellRole::Troubled;
     }
 
-    static constexpr bool quietEligible(CellRole role) noexcept {
+    static GPU_CALLABLE_METHOD constexpr bool quietEligible(CellRole role) noexcept {
       return role == CellRole::Regular;
     }
 
-    static constexpr bool requiresResolution(CellRole role) noexcept {
+    static GPU_CALLABLE_METHOD constexpr bool requiresResolution(CellRole role) noexcept {
       return role == CellRole::Halo or role == CellRole::Limited or role == CellRole::Troubled;
     }
 
-    static constexpr bool usesNativeFV(CellRole role) noexcept {
+    static GPU_CALLABLE_METHOD constexpr bool usesNativeFV(CellRole role) noexcept {
       return role == CellRole::Limited or role == CellRole::Troubled;
     }
   };
@@ -77,3 +78,4 @@ namespace exahype2::amr {
     };
   } // namespace detail
 } // namespace exahype2::amr
+TARGET_DECLARE_END

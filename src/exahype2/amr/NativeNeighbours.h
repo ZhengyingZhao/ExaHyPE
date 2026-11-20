@@ -12,15 +12,18 @@
 #include <type_traits>
 
 namespace exahype2::amr {
+  TARGET_DECLARE
   /** Cell level and domain-relative lattice indices. */
   using NativeCellKey = std::array<int, DIMENSIONS + 1>;
+  TARGET_DECLARE_END
 
   namespace native_neighbour_detail {
+    TARGET_DECLARE
     struct FaceProjection {
       std::array<double, DIMENSIONS> offset{}, ratio{};
     };
 
-    inline bool product(double left, double right, double& result) {
+    inline GPU_CALLABLE_METHOD bool product(double left, double right, double& result) {
       const double largest = std::numeric_limits<double>::max();
       if (not std::isfinite(left) or not std::isfinite(right)) return false;
       if (std::abs(right) > 1.0) {
@@ -37,7 +40,7 @@ namespace exahype2::amr {
       return std::isfinite(result);
     }
 
-    inline bool sum(double left, double right, double& result) {
+    inline GPU_CALLABLE_METHOD bool sum(double left, double right, double& result) {
       const double largest = std::numeric_limits<double>::max();
       if (not std::isfinite(left) or not std::isfinite(right)
           or (std::signbit(left) == std::signbit(right) and std::abs(left) > largest - std::abs(right))) return false;
@@ -49,7 +52,7 @@ namespace exahype2::amr {
       return std::isfinite(result);
     }
 
-    inline bool ratio(double numerator, double denominator, double& result) {
+    inline GPU_CALLABLE_METHOD bool ratio(double numerator, double denominator, double& result) {
       const double largest = std::numeric_limits<double>::max();
       if (not std::isfinite(numerator) or not std::isfinite(denominator) or denominator == 0.0) return false;
       if (std::abs(denominator) < 1.0) {
@@ -63,6 +66,8 @@ namespace exahype2::amr {
       }
       return std::isfinite(result);
     }
+
+    TARGET_DECLARE_END
 
     /** Find leaf cells on the requested side of a face. */
     template <typename Callback>
@@ -95,7 +100,8 @@ namespace exahype2::amr {
       return false;
     }
 
-    inline double scaledDifference(double left, double right, double scale) {
+    TARGET_DECLARE
+    inline GPU_CALLABLE_METHOD double scaledDifference(double left, double right, double scale) {
       const double invalid = std::numeric_limits<double>::infinity();
       const double largest = std::numeric_limits<double>::max();
       if (not std::isfinite(left) or not std::isfinite(right)
@@ -111,6 +117,8 @@ namespace exahype2::amr {
       double delta = 0.0, result = 0.0;
       return sum(left, -right, delta) and ratio(delta, scale, result) ? result : invalid;
     }
+
+    TARGET_DECLARE_END
 
     /** Evaluate a tensor-product DG polynomial in reference coordinates. */
     template <int N, int V, typename P>
@@ -217,8 +225,9 @@ namespace exahype2::amr {
       return ratio(distance, targetWidth, offset) and ratio(width, targetWidth, fraction);
     }
 
-    /** Validate the level and indices against the representable lattice extent. */
-    inline bool validKey(const NativeCellKey& key) {
+    TARGET_DECLARE
+    /** Check that the cell's integer coordinates lie inside the grid at its level. */
+    inline GPU_CALLABLE_METHOD bool validKey(const NativeCellKey& key) {
       if (key[0] < 0) return false;
       int extent = 1;
       for (int level = 0; level < key[0]; level++) {
@@ -231,8 +240,8 @@ namespace exahype2::amr {
       return true;
     }
 
-    /** Map a finer ternary face into its containing coarse face. */
-    inline bool projectLatticeFace(
+    /** Map points on the shared part of a face into the local coordinates of both cells. */
+    inline GPU_CALLABLE_METHOD bool projectLatticeFace(
       const NativeCellKey& own, const NativeCellKey& other, int normal,
       FaceProjection& ownMap, FaceProjection& otherMap
     ) {
@@ -257,6 +266,8 @@ namespace exahype2::amr {
       }
       return true;
     }
+
+    TARGET_DECLARE_END
 
     /** Return the maximum scaled vector jump over samples on the common subface. */
     template <int N, int V, typename C, typename P>

@@ -3,10 +3,20 @@
 #pragma once
 
 #include "exahype2/RefinementCommand.h"
+#include "tarch/Span.h"
 #include "tarch/la/Vector.h"
 
+namespace peano4 {
+  class CellConnectivity;
+}
+
+namespace exahype2 {
+  class RefinementRequests;
+  class TimeStepping;
+}
+
 namespace exahype2::terms {
-  /** Select host assessment for criteria that own host-only accepted-step evidence. */
+  /** True when the solver asks to evaluate its refinement criterion on the CPU. */
   template <typename SolverType>
   inline constexpr bool RefinementCriterionOnHost = [] {
     if constexpr (requires { SolverType::RefinementCriterionOnHost; }) {
@@ -25,5 +35,18 @@ namespace exahype2::terms {
     const typename SolverType::RuntimeParameters& parameters
   ) {
     { SolverType::refinementCriterion(Q, x, h, t, parameters) } -> std::same_as<exahype2::RefinementCommand>;
+  };
+
+  /** True when the solver can decide on the device which cells should refine or coarsen. */
+  template <typename SolverType, typename SolutionPool, typename RuntimeParameters>
+  concept HasDeviceAMRAssessment = requires(
+    SolverType&                     solver,
+    const peano4::CellConnectivity& mesh,
+    const SolutionPool&             solution,
+    TimeStepping&                   clock,
+    RefinementRequests&             requests,
+    const RuntimeParameters&        parameters
+  ) {
+    solver.assessAMROnDevice(mesh, solution.getView(), clock, requests, parameters, tarch::Span<const int>{}, true);
   };
 } // namespace exahype2::terms

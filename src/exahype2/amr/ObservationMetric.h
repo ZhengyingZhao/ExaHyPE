@@ -7,13 +7,13 @@
 namespace exahype2::amr::observation_detail {
   /** Return the number of optional linear observation channels. */
   template <typename C>
-  constexpr int count() {
+  GPU_CALLABLE_METHOD constexpr int count() {
     if constexpr (requires { C::NumberOfObservables; }) return C::NumberOfObservables;
     return 0;
   }
 
   template <int V, typename C>
-  bool valid() {
+  GPU_CALLABLE_METHOD bool valid() {
     if constexpr (count<C>() == 0) return true;
     else if constexpr (count<C>() < 0 or not requires {
       C::observableWeight(0, 0);
@@ -41,19 +41,16 @@ namespace exahype2::amr::observation_detail {
   /** Unit tolerances for observations normalized by their physical budgets. */
   template <typename C>
   struct UnitConfig {
-    static double stateScale(int) { return 1.0; }
+    static GPU_CALLABLE_METHOD double stateScale(int) { return 1.0; }
     static constexpr double ResolutionTolerance = 1.0;
     static constexpr double TransferTolerance = 1.0;
-    static double highestModeWeight(int node) requires requires { C::highestModeWeight(node); } {
+    static GPU_CALLABLE_METHOD double highestModeWeight(int node) requires requires { C::highestModeWeight(node); } {
       return C::highestModeWeight(node);
     }
   };
 
-  /**
-   * Fix observation budgets from the accepted stencil:
-   *   absolute tolerance + relative tolerance * observed nodal range.
-   * Projection and trial parents cannot enlarge the budget. Linear observations
-   * preserve DG degree and commute with FV averaging.
+  /** Track each observable's range across the accepted cells.
+   * Its error budget is the absolute tolerance plus the relative tolerance times this range.
    */
   template <int V, typename C>
   class Stencil {
@@ -67,7 +64,7 @@ namespace exahype2::amr::observation_detail {
     bool _empty = true;
 
     template <typename P>
-    Interval observationInterval(const P* state, int observation) const {
+    GPU_CALLABLE_METHOD Interval observationInterval(const P* state, int observation) const {
       namespace bound = detail::transfer_bound;
       std::array<Interval, V> terms;
       for (int component = 0; component < V; component++) {
@@ -78,16 +75,64 @@ namespace exahype2::amr::observation_detail {
       return bound::canonicalSum<V>(terms);
     }
 
+    /** Fill in the error budget for each observable and return the number of states to project, or zero on
+     * failure.
+     */
+    template <typename P>
+    GPU_CALLABLE_METHOD int prepareProjection(AcceptedCellView<P> view, std::array<double, Observations>& budgets) const {
+      if (not _valid or _empty or view.values == nullptr or view.pointsPerAxis <= 0) return 0;
+      int states = 1;
+      for (int axis = 0; axis < DIMENSIONS; axis++) {
+        if (states > std::numeric_limits<int>::max() / view.pointsPerAxis) return 0;
+        states *= view.pointsPerAxis;
+      }
+      if (states > std::numeric_limits<int>::max() / std::max(V, Observations)) return 0;
+      for (int observation = 0; observation < Observations; observation++) {
+        budgets[observation] = budget(observation);
+        if (not std::isfinite(budgets[observation]) or budgets[observation] <= 0.0) return 0;
+      }
+      return states;
+    }
+
+    /** Write each observable relative to the stencil midpoint, in units of its error budget. */
+    template <typename P>
+    GPU_CALLABLE_METHOD bool projectValues(
+      const P* values, int states, const std::array<double, Observations>& budgets, double* output
+    ) const {
+      for (int node = 0; node < states; node++) {
+        std::array<double, V> differences;
+        for (int component = 0; component < V; component++) {
+          const double reference = 0.5 * _lower[component] + 0.5 * _upper[component];
+          differences[component] = native_neighbour_detail::scaledDifference(
+            static_cast<double>(values[node * V + component]), reference, 1.0);
+          if (not std::isfinite(differences[component])) return false;
+        }
+        for (int observation = 0; observation < Observations; observation++) {
+          std::array<double, V> terms;
+          for (int component = 0; component < V; component++) {
+            if (not native_neighbour_detail::product(C::observableWeight(observation, component),
+                  differences[component], terms[component])) return false;
+          }
+          double value = 0.0;
+          if (not resolution_detail::sumTerms<V>(terms, value)
+              or not native_neighbour_detail::ratio(value, budgets[observation], value)) return false;
+          output[node * Observations + observation] = value;
+        }
+      }
+      return true;
+    }
+
   public:
-    Stencil() {
+    GPU_CALLABLE_METHOD Stencil() {
       _lower.fill(INFINITY);
       _upper.fill(-INFINITY);
       _minimumUpper.fill(INFINITY);
       _maximumLower.fill(-INFINITY);
     }
 
+    /** Include this cell's values in the ranges used to set the observable error budgets. */
     template <typename P>
-    bool add(AcceptedCellView<P> view) {
+    GPU_CALLABLE_METHOD bool add(AcceptedCellView<P> view) {
       if constexpr (Observations == 0) return true;
       else {
         if (not _valid or view.values == nullptr or view.pointsPerAxis <= 0
@@ -119,7 +164,7 @@ namespace exahype2::amr::observation_detail {
     }
 
     /** Return a positive budget, or zero when its bound is invalid. */
-    double budget(int observation) const {
+    GPU_CALLABLE_METHOD double budget(int observation) const {
       if constexpr (Observations == 0) return INFINITY;
       else {
         namespace bound = detail::transfer_bound;
@@ -137,57 +182,35 @@ namespace exahype2::amr::observation_detail {
       }
     }
 
-    /**
-     * Normalize linear observations after centering each component at its midrange.
-     * Centering preserves weak differences against a large constant background.
-     */
+    /** Write one normalized value per state and observable into the caller's buffer. */
+    template <typename P>
+    GPU_CALLABLE_METHOD bool project(AcceptedCellView<P> view, double* output, int capacity) const {
+      if constexpr (Observations == 0) return true;
+      else {
+        std::array<double, Observations> budgets;
+        const int states = prepareProjection(view, budgets);
+        if (states == 0 or output == nullptr or capacity < states * Observations) return false;
+        return projectValues(view.values, states, budgets, output);
+      }
+    }
+
     template <typename P>
     bool project(AcceptedCellView<P> view, std::vector<double>& output) const {
       if constexpr (Observations == 0) { output.clear(); return true; }
       else {
-        if (not _valid or _empty or view.values == nullptr or view.pointsPerAxis <= 0) return false;
-        int states = 1;
-        for (int axis = 0; axis < DIMENSIONS; axis++) {
-          if (states > std::numeric_limits<int>::max() / view.pointsPerAxis) return false;
-          states *= view.pointsPerAxis;
-        }
-        if (states > std::numeric_limits<int>::max() / std::max(V, Observations)) return false;
         std::array<double, Observations> budgets;
-        for (int observation = 0; observation < Observations; observation++) {
-          budgets[observation] = budget(observation);
-          if (not std::isfinite(budgets[observation]) or budgets[observation] <= 0.0) return false;
-        }
+        const int states = prepareProjection(view, budgets);
+        if (states == 0) return false;
         output.resize(static_cast<std::size_t>(states) * Observations);
-        for (int node = 0; node < states; node++) {
-          std::array<double, V> differences;
-          for (int component = 0; component < V; component++) {
-            const double reference = 0.5 * _lower[component] + 0.5 * _upper[component];
-            differences[component] = native_neighbour_detail::scaledDifference(
-              static_cast<double>(view.values[node * V + component]), reference, 1.0);
-            if (not std::isfinite(differences[component])) return false;
-          }
-          for (int observation = 0; observation < Observations; observation++) {
-            std::array<double, V> terms;
-            for (int component = 0; component < V; component++) {
-              if (not native_neighbour_detail::product(C::observableWeight(observation, component),
-                    differences[component], terms[component])) return false;
-            }
-            double value = 0.0;
-            if (not resolution_detail::sumTerms<V>(terms, value)
-                or not native_neighbour_detail::ratio(value, budgets[observation], value)) return false;
-            output[node * Observations + observation] = value;
-          }
-        }
-        return true;
+        return projectValues(view.values, states, budgets, output.data());
       }
     }
 
-    /** Check fine-minus-parent observation residuals with the fine-family budget.
-     * Input intervals enclose unscaled residuals at fine nodes; DG also requires
-     * a continuous polynomial bound.
+    /** Check whether the error in each observable fits the children's budget.
+     * The input bounds are in the original field units. For DG, the check covers the whole cell.
      */
     template <int N>
-    bool transferIntervalsPasses(const detail::transfer_bound::Field<N, V, DIMENSIONS>& residual, bool finiteVolume) const {
+    GPU_CALLABLE_METHOD bool transferIntervalsPasses(const detail::transfer_bound::Field<N, V, DIMENSIONS>& residual, bool finiteVolume) const {
       if constexpr (Observations == 0) return true;
       else {
         namespace bound = detail::transfer_bound;
@@ -218,13 +241,11 @@ namespace exahype2::amr::observation_detail {
       }
     }
 
-    /**
-     * Check fine-minus-restored observations with the accepted stencil's budget.
-     * Combine raw residual intervals before normalization to retain uncertainty.
-     * FV checks cell means; DG also requires a continuous polynomial bound.
+    /** Check how much each observable changes when the parent is mapped back to a child.
+     * Use cell averages for FV and a bound over the whole cell for DG.
      */
     template <int N, typename P>
-    bool transferPasses(const P* fine, const P* restored, bool finiteVolume) const {
+    GPU_CALLABLE_METHOD bool transferPasses(const P* fine, const P* restored, bool finiteVolume) const {
       if constexpr (Observations == 0) return true;
       else {
         namespace bound = detail::transfer_bound;
@@ -263,9 +284,8 @@ namespace exahype2::amr::observation_detail {
     }
   };
 
-  /**
-   * Check supplied initial-data samples using observation budgets from the
-   * complete fine sample family.
+  /** Compare initial data on all children with the parent's prediction, using one observable budget for
+   * the family.
    */
   template <int N, int V, typename C, typename P>
   class InitialDataMonitor {
@@ -299,7 +319,6 @@ namespace exahype2::amr::observation_detail {
       else {
         if (not _valid or _children != peano4::ChildrenPerCell) return false;
         for (int child = 0; child < _children; child++) {
-          // Use the pointwise check for initial-data samples.
           if (not _stencil.template transferPasses<N>(
                 _fresh.data() + child * Values, _represented.data() + child * Values, true)) return false;
         }
@@ -307,6 +326,49 @@ namespace exahype2::amr::observation_detail {
       }
     }
   };
+
+  TARGET_DECLARE
+  /** Check the initial observations on all children against what the parent DG polynomial predicts. */
+  template <int N, int V, typename C, typename P>
+  class DeviceInitialDataMonitor {
+    static constexpr int Values = peano4::power(N, DIMENSIONS) * V;
+    Stencil<V, C> _stencil;
+    static constexpr int StoredValues = count<C>() == 0 ? 0 : Values * peano4::ChildrenPerCell;
+    std::array<P, StoredValues> _fresh{}, _represented{};
+    int _children = 0;
+    bool _valid = true;
+
+  public:
+    GPU_CALLABLE_METHOD bool add(const P* fresh, const P* represented) {
+      if constexpr (count<C>() == 0) return true;
+      else {
+        if (not _valid or fresh == nullptr or represented == nullptr
+            or _children >= peano4::ChildrenPerCell) return _valid = false;
+        if (not _stencil.add(AcceptedCellView<P>{fresh, N, AcceptedRepresentation::DGNodal}))
+          return _valid = false;
+        for (int entry = 0; entry < Values; entry++) {
+          _fresh[_children * Values + entry] = fresh[entry];
+          _represented[_children * Values + entry] = represented[entry];
+        }
+        ++_children;
+        return true;
+      }
+    }
+
+    GPU_CALLABLE_METHOD bool passes() const {
+      if constexpr (count<C>() == 0) return true;
+      else {
+        if (not _valid or _children != peano4::ChildrenPerCell) return false;
+        for (int child = 0; child < _children; child++) {
+          if (not _stencil.template transferPasses<N>(
+                _fresh.data() + child * Values, _represented.data() + child * Values, true)) return false;
+        }
+        return true;
+      }
+    }
+  };
+
+  TARGET_DECLARE_END
 
   template <int N, int V, typename C, typename P>
   double faceRatio(AcceptedCellView<P> own, AcceptedCellView<P> other,
@@ -329,8 +391,7 @@ namespace exahype2::amr::observation_detail {
   double localRatio(AcceptedCellView<P> view, const double* nodes, bool initial) {
     if constexpr (count<C>() == 0) return 0.0;
     else {
-      // A single DG cell has zero linear-observation prediction residual.
-      // Validate the view without constructing observation fields.
+      // The prediction error for DG comes from comparing the cell with its neighbours.
       if (not initial and not view.isFiniteVolume()) {
         return valid<V, C>() ? prediction_detail::localDetail<N, V, UnitConfig<C>>(view, nodes) : INFINITY;
       }
@@ -345,4 +406,51 @@ namespace exahype2::amr::observation_detail {
       return amr_detail::highestOrderDetailImpl<true, true, N, count<C>(), UnitConfig<C>>(values.data(), 1.0);
     }
   }
+  TARGET_DECLARE
+  /** Measure how closely the observables on both sides of a face fit one profile, in units of their budgets. */
+  template <int N, int V, typename C, int MaxPoints, typename P>
+  GPU_CALLABLE_METHOD double deviceFaceRatio(
+    AcceptedCellView<P> own, AcceptedCellView<P> other,
+    const NativeCellKey& ownKey, const NativeCellKey& otherKey,
+    const double* nodes, int normal, int ownSide
+  ) {
+    if constexpr (count<C>() == 0) return 0.0;
+    else {
+      if (own.pointsPerAxis > MaxPoints or other.pointsPerAxis > MaxPoints) return INFINITY;
+      constexpr int Capacity = peano4::power(MaxPoints, DIMENSIONS) * count<C>();
+      Stencil<V, C> stencil;
+      std::array<double, Capacity> left, right;
+      if (not stencil.add(own) or not stencil.add(other)
+          or not stencil.project(own, left.data(), Capacity) or not stencil.project(other, right.data(), Capacity)) return INFINITY;
+      return prediction_detail::deviceFaceDetail<N, count<C>(), UnitConfig<C>, MaxPoints>(
+        AcceptedCellView<double>{left.data(), own.pointsPerAxis, own.representation},
+        AcceptedCellView<double>{right.data(), other.pointsPerAxis, other.representation},
+        ownKey, otherKey, nodes, normal, ownSide);
+    }
+  }
+
+  /** Measure variation in one cell's observables in units of their error budgets. A score above one
+   * exceeds the budget.
+   */
+  template <int N, int V, typename C, int MaxPoints, typename P>
+  GPU_CALLABLE_METHOD double deviceLocalRatio(AcceptedCellView<P> view, const double* nodes, bool initial) {
+    if constexpr (count<C>() == 0) return 0.0;
+    else {
+      if (view.pointsPerAxis > MaxPoints) return INFINITY;
+      if (not initial and not view.isFiniteVolume()) {
+        return valid<V, C>() ? prediction_detail::deviceLocalDetail<N, V, UnitConfig<C>, MaxPoints>(view, nodes) : INFINITY;
+      }
+      constexpr int Capacity = peano4::power(MaxPoints, DIMENSIONS) * count<C>();
+      Stencil<V, C> stencil;
+      std::array<double, Capacity> values;
+      if (not stencil.add(view) or not stencil.project(view, values.data(), Capacity)) return INFINITY;
+      const AcceptedCellView<double> observed{values.data(), view.pointsPerAxis, view.representation};
+      if (not initial) return prediction_detail::deviceLocalDetail<N, count<C>(), UnitConfig<C>, MaxPoints>(observed, nodes);
+      if (view.isFiniteVolume()) return resolution_detail::fvResolutionDetail<count<C>(), UnitConfig<C>>(
+        values.data(), view.pointsPerAxis, 1.0);
+      if (view.pointsPerAxis != N) return INFINITY;
+      return amr_detail::highestOrderDetailImpl<true, true, N, count<C>(), UnitConfig<C>>(values.data(), 1.0);
+    }
+  }
+  TARGET_DECLARE_END
 } // namespace exahype2::amr::observation_detail

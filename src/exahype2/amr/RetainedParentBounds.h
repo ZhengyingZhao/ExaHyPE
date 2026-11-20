@@ -3,6 +3,7 @@
 // Bound the loss between fine DG polynomials and the stored parent polynomial.
 #pragma once
 #include "TransferBounds.h"
+#include <algorithm>
 #include <type_traits>
 #include <cstddef>
 
@@ -11,8 +12,9 @@ namespace exahype2::amr::detail::retained_parent {
   using Interval = bound::Interval;
   struct NoGeometry {};
 
-  // Divide intervals; a denominator containing zero yields an invalid bound.
-  inline Interval quotient(Interval a, Interval b) {
+  TARGET_DECLARE
+  // Bound a quotient of two intervals. A denominator that includes zero has no finite bound.
+  GPU_CALLABLE_METHOD inline Interval quotient(Interval a, Interval b) {
     if (not bound::valid(a) or not bound::valid(b) or (b.lo <= 0. and b.hi >= 0.)) return bound::bad();
     if (bound::zero(a)) return {0., 0.};
     const std::array<double, 2> numerator{a.lo, a.hi}, denominator{b.lo, b.hi};
@@ -22,19 +24,23 @@ namespace exahype2::amr::detail::retained_parent {
       const double divisor = std::abs(y);
       if (divisor < 1.) {
         // Round the safe range towards zero before attempting x/y.
-        const double safe = std::nextafter(std::numeric_limits<double>::max() * divisor, 0.);
+        const double safe = std::nextafter(bound::roundedMultiply(std::numeric_limits<double>::max(), divisor), 0.);
         if (std::abs(x) > safe) return bound::bad();
       }
-      values[entry++] = x / y;
+      values[entry++] = bound::roundedDivide(x, y);
     }
     for (double x : values) if (not std::isfinite(x)) return bound::bad();
-    return {bound::down(*std::min_element(values.begin(), values.end())),
-            bound::up(*std::max_element(values.begin(), values.end()))};
+    double lower = values[0], upper = values[0];
+    for (int entry = 1; entry < 4; entry++) {
+      lower = std::min(lower, values[entry]);
+      upper = std::max(upper, values[entry]);
+    }
+    return {bound::down(lower), bound::up(upper)};
   }
+  TARGET_DECLARE_END
 
-  /** Cache interval interpolation weights by node values.
-   * For child c, matrix[row*N+col] encloses L_col((c+node[row])/R),
-   * using the exact Lagrange basis of the stored double nodes.
+  /** Interpolation weights for evaluating the parent DG polynomial at each child's nodes.
+   * Entry (row, col) bounds the value of parent basis function col at child node row.
    */
   template<int N, int R>
   class Geometry {
@@ -68,18 +74,18 @@ namespace exahype2::amr::detail::retained_parent {
       }
       return _valid = true;
     }
-    [[nodiscard]] bool valid() const { return _valid; }
-    [[nodiscard]] const std::array<Interval, N*N>& matrix(int child) const { return _matrix[child]; }
+    TARGET_DECLARE
+    [[nodiscard]] GPU_CALLABLE_METHOD bool valid() const { return _valid; }
+    [[nodiscard]] GPU_CALLABLE_METHOD const std::array<Interval, N*N>& matrix(int child) const { return _matrix[child]; }
+    TARGET_DECLARE_END
   };
 
-  /** Enclose (fine polynomial - retained parent polynomial)/component_scale
-   * at the fine nodes, using the stored DG nodes and the exact affine child map.
-   *
-   * Partition of unity gives q(x)-reference = sum L_i(x)*(q_i-reference).
-   * Centering keeps equal constants exact and bounds uncertainty by variation.
+  TARGET_DECLARE
+  /** Bound the difference between the child's values and the stored parent's polynomial
+   * at each child node, in units of each component's scale.
    */
   template<int N, int V, int D, int R, typename P>
-  bool residual(const P* fine, const P* parent, const Geometry<N, R>& geometry,
+  GPU_CALLABLE_METHOD bool residual(const P* fine, const P* parent, const Geometry<N, R>& geometry,
                 int child, const std::array<double, V>& scales,
                 bound::Field<N, V, D>& output) {
     static_assert(std::is_same_v<P, float> or std::is_same_v<P, double>,
@@ -109,9 +115,7 @@ namespace exahype2::amr::detail::retained_parent {
     }
     return true;
   }
-  /** Cache normalization and first-axis contractions for one immutable parent,
-   * geometry and scale set, preserving residual()'s scalar operation order.
-   */
+  /** A parent DG polynomial and its component scales for comparing several children with the same parent. */
   template<int N, int V, int D, int R, typename P, std::size_t CacheBytes = 32*1024>
   class PreparedParent {
     using Field = bound::Field<N, V, D>;
@@ -129,7 +133,7 @@ namespace exahype2::amr::detail::retained_parent {
     const Geometry<N, R>* _geometry{nullptr};
     bool _valid{false};
   public:
-    bool prepare(const P* parent, const Geometry<N, R>& geometry, const std::array<double, V>& scales) {
+    GPU_CALLABLE_METHOD bool prepare(const P* parent, const Geometry<N, R>& geometry, const std::array<double, V>& scales) {
       static_assert(std::is_same_v<P, float> or std::is_same_v<P, double>);
       static_assert(N > 0 and V > 0 and D > 0 and D <= 3);
       _valid = false;
@@ -148,7 +152,8 @@ namespace exahype2::amr::detail::retained_parent {
       }
       return _valid = true;
     }
-    bool residual(const P* fine, int child, Field& output) {
+    /** Write bounds on this child's scaled difference from the parent at each child node. */
+    GPU_CALLABLE_METHOD bool residual(const P* fine, int child, Field& output) {
       if (fine == nullptr or not _valid or not _geometry->valid()
           or child < 0 or child >= bound::power(R, D) or not bound::arithmeticSupported()) return false;
       Field represented;
@@ -175,4 +180,5 @@ namespace exahype2::amr::detail::retained_parent {
       return true;
     }
   };
+  TARGET_DECLARE_END
 } // namespace exahype2::amr::detail::retained_parent

@@ -6,23 +6,27 @@
 #include "exahype2/dg/limiting/Detector.h"
 #include "exahype2/terms/PhysicalAdmissibility.h"
 
+TARGET_DECLARE
 namespace exahype2::amr {
-  /** Read the limiter status used to permit coarsening or request refinement. */
+  /** Tell AMR which cells the limiter marked for finer resolution and which may coarsen. */
   template<typename Layout>
   struct SubcellLimiterEvidence {
     static_assert(LimiterAdapterProtocol<Layout>);
-    static bool available(const int* status) { return status != nullptr; }
-    static bool known(const int* status) { return Layout::isKnown(Layout::classify(status)); }
-    static bool quietEligible(const int* status) { return Layout::quietEligible(Layout::classify(status)); }
-    static bool requiresResolution(const int* status) { return Layout::requiresResolution(Layout::classify(status)); }
-    static bool requestsRefinement(const int* status) {
+    static GPU_CALLABLE_METHOD bool available(const int* status) { return status != nullptr; }
+    static GPU_CALLABLE_METHOD bool known(const int* status) { return Layout::isKnown(Layout::classify(status)); }
+    static GPU_CALLABLE_METHOD bool quietEligible(const int* status) { return Layout::quietEligible(Layout::classify(status)); }
+    static GPU_CALLABLE_METHOD bool requiresResolution(const int* status) { return Layout::requiresResolution(Layout::classify(status)); }
+    static GPU_CALLABLE_METHOD bool requestsRefinement(const int* status) {
       const auto role = Layout::classify(status);
       return Layout::requiresResolution(role) and Layout::usesNativeFV(role);
     }
   };
 
+  /** Check that the parent DG values are finite. If the solver sets physical bounds,
+   * check them at DG nodes, subcell averages and Lobatto points.
+   */
   template <typename Solver, typename P>
-  bool parentPhysicallyAdmissible(
+  GPU_CALLABLE_METHOD bool parentPhysicallyAdmissible(
     const P* Q, int numberOfStates,
     const tarch::la::Vector<DIMENSIONS, double>& x, const tarch::la::Vector<DIMENSIONS, double>& h,
     const typename Solver::RuntimeParameters& parameters
@@ -40,8 +44,6 @@ namespace exahype2::amr {
       using Projection = typename Solver::template SubcellProjection<P>;
       constexpr int Subcells = Scheme::SubcellsPerAxis;
       constexpr int Volumes = peano4::power(Subcells, DIMENSIONS);
-      // The pointer members of generated tables address device memory. The AMR
-      // proof runs on the host, including in an accelerator build.
       constexpr auto nodesToSubcells = Projection::getNodesToSubcells1D();
       constexpr auto nodesToLobatto = Projection::getNodesToLobatto1D();
       if (not detail::projectionIsSafe<N, Subcells, V>(Q, nodesToSubcells.data())
@@ -66,9 +68,9 @@ namespace exahype2::amr {
     }
   }
 
-  /** Check parent observables against the children's combined extrema. */
+  /** Check the parent's observables against the range of the child values, allowing for the limiter tolerance. */
   template <typename Solver, typename P>
-  bool parentRespectsMaximumPrinciple(
+  GPU_CALLABLE_METHOD bool parentRespectsMaximumPrinciple(
     const P* parent, const P* const* children, double relaxation, double differencesScaling,
     const typename Solver::RuntimeParameters& parameters
   ) {
@@ -115,3 +117,4 @@ namespace exahype2::amr {
   }
 
 } // namespace exahype2::amr
+TARGET_DECLARE_END

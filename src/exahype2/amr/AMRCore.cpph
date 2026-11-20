@@ -6,6 +6,7 @@
 #include <set>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include "tarch/accelerator/ParallelFor.h"
 #include "tarch/mpi/Rank.h"
 
@@ -78,7 +79,7 @@ namespace exahype2::amr {
       view.values, amr_detail::resolutionTolerance<C>());
   }
 
-  /** Cache spatial evidence once per accepted cell and time step. */
+  /** An observable over its error budget raises the score above the refinement threshold. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   double AMRCore<N, V, C, P, A, T, E, S>::withObservation(double detail, double ratio) {
     double scaled = 0.0;
@@ -254,12 +255,9 @@ namespace exahype2::amr {
   }
 
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
-  template <typename SolutionView, typename StatusView>
-  void AMRCore<N, V, C, P, A, T, E, S>::beginStep(
-    const peano4::CellConnectivity& mesh, SolutionView solution, StatusView statuses,
-    const exahype2::TimeStepping& clock, const double* nodes,
-    const double* restriction, const double* prolongation, WaveSpeed waveSpeed,
-    PhysicalAdmissibility admissible, TransferAdmissibility transferAdmissible, NativeSubcells subcells
+  bool AMRCore<N, V, C, P, A, T, E, S>::prepareStep(
+    const peano4::CellConnectivity& mesh, const exahype2::TimeStepping& clock,
+    const double* nodes, const double* restriction, const double* prolongation
   ) {
     _initialising = false;
     _active = false;
@@ -306,14 +304,10 @@ namespace exahype2::amr {
     if constexpr (not T::IsFiniteVolume) _retainedParentGeometry.bind(nodes);
     _restriction = restriction;
     _prolongation = prolongation;
-    _waveSpeed = waveSpeed;
-    _admissible = admissible;
-    _transferAdmissible = transferAdmissible;
     _mesh = &mesh;
-    _subcells = subcells;
     _restrictionBound = T::IsFiniteVolume ? 1.0 : amplification(restriction, true);
     _prolongationBound = T::IsFiniteVolume ? 1.0 : amplification(prolongation, false);
-    // Reuse topology only if slots, indices and geometry still match.
+    // After a regrid, the same slot can refer to a different cell.
     const auto leaves = mesh.getCells();
     bool sameTopology = _topologyCached and _cells.size() == static_cast<std::size_t>(mesh.getNumberOfSlots())
       and _leaves.size() == static_cast<std::size_t>(leaves.size);
@@ -378,16 +372,32 @@ namespace exahype2::amr {
       }
       _topologyCached = true;
     }
+    return std::isfinite(_startTime) and _startTime >= 0.0;
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  template <typename SolutionView, typename StatusView>
+  void AMRCore<N, V, C, P, A, T, E, S>::beginStep(
+    const peano4::CellConnectivity& mesh, SolutionView solution, StatusView statuses,
+    const exahype2::TimeStepping& clock, const double* nodes,
+    const double* restriction, const double* prolongation, WaveSpeed waveSpeed,
+    PhysicalAdmissibility admissible, TransferAdmissibility transferAdmissible, NativeSubcells subcells
+  ) {
+    const bool validStartTime = prepareStep(mesh, clock, nodes, restriction, prolongation);
+    _waveSpeed = std::move(waveSpeed);
+    _admissible = std::move(admissible);
+    _transferAdmissible = std::move(transferAdmissible);
+    _subcells = subcells;
     if constexpr (S::CheckNeighbours) {
       if (static_cast<std::size_t>(mesh.getNumberOfSlots()) > _detailCacheCapacity) {
         _detailCacheCapacity = static_cast<std::size_t>(mesh.getNumberOfSlots());
         _detailCache = std::make_unique<DetailCache[]>(_detailCacheCapacity);
       }
     }
-    // Pool addresses may change after a regrid.
     for (const int slot : _leaves) {
       auto& cell = _cells[slot];
-      cell.state = solution.getChunk(slot);
+      if constexpr (std::is_null_pointer_v<SolutionView>) cell.state = nullptr;
+      else cell.state = solution.getChunk(slot);
       cell.status = statuses.getChunk(slot);
       if constexpr (S::CheckNeighbours) _detailCache[slot].state.store(0, std::memory_order_relaxed);
       if constexpr (not predictionMode()) {
@@ -395,7 +405,8 @@ namespace exahype2::amr {
         cell.quietReady = false;
       }
     }
-    if constexpr (S::CheckNeighbours and cacheAcceptedFaces()) bindAcceptedFaces(mesh);
+    if constexpr (S::CheckNeighbours and cacheAcceptedFaces() and not std::is_null_pointer_v<SolutionView>)
+      bindAcceptedFaces(mesh);
     if (_families.size() > _familyVoteCapacity) {
       _familyVotes = std::make_unique<std::atomic<int>[]>(_families.size());
       _familyPlans = std::make_unique<FamilyPlan[]>(_families.size());
@@ -405,7 +416,7 @@ namespace exahype2::amr {
       _familyVotes[i].store(0, std::memory_order_relaxed);
       _familyPlans[i].state.store(0, std::memory_order_relaxed);
     }
-    _active = std::isfinite(_startTime) and _startTime >= 0.0;
+    _active = validStartTime;
   }
 
   /** Link leaf and ancestor histories across mesh changes. */
@@ -542,11 +553,7 @@ namespace exahype2::amr {
 
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   double AMRCore<N, V, C, P, A, T, E, S>::advanceQuiet(double quiet, double crossing, bool moving, double dt) const {
-    if (not moving) crossing = _referenceTime;
-    if (crossing <= 0.0 or std::isnan(crossing)) return -1.0;
-    const double limit = std::numeric_limits<double>::max();
-    const double increment = crossing < 1.0 and dt > limit * crossing ? limit : dt / crossing;
-    return quiet > limit - increment ? limit : quiet + increment;
+    return amr_detail::advanceQuiet(quiet, crossing, moving, dt, _referenceTime);
   }
 
   /** Phase one checks accepted neighbours; phase two checks only eligible parents. */
@@ -916,7 +923,6 @@ namespace exahype2::amr {
     _active = false;
   }
 
-  /** Snapshot completed cache entries without forcing any further assessment. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   auto AMRCore<N, V, C, P, A, T, E, S>::statistics() const -> Statistics {
     Statistics result;
@@ -925,14 +931,7 @@ namespace exahype2::amr {
       if (_families[index].complete) result.completeFamilies++;
       const auto& plan = _familyPlans[index];
       if (plan.state.load(std::memory_order_acquire) != 2) continue;
-      result.assessedFamilies++;
-      if (plan.sizeVetoed) result.sizeVetoedFamilies++;
-      if (plan.transferSafe) result.transferPassed++;
-      if (plan.neighboursSafe) result.currentNeighboursPassed++;
-      if (plan.eligible) {
-        result.eligibleFamilies++;
-        result.quietReady++;
-      }
+      countAssessedFamily(result, plan);
       const int vote = _familyVotes[index].load(std::memory_order_acquire);
       if (vote == 3) result.eraseVotes++;
       else if (vote == 2 and plan.eligible) result.conflictVetoes++;

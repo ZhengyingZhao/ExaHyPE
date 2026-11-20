@@ -17,20 +17,30 @@
 namespace exahype2::amr {
   namespace amr_detail {
     namespace transfer_bound = ::exahype2::amr::detail::transfer_bound;
+    TARGET_DECLARE
     /** Return the resolution tolerance, defaulting to the transfer tolerance. */
     template <typename C>
-    constexpr double resolutionTolerance() {
+    GPU_CALLABLE_METHOD constexpr double resolutionTolerance() {
       if constexpr (requires { C::ResolutionTolerance; }) return C::ResolutionTolerance;
       return C::TransferTolerance;
     }
-    /** Select components of the prediction resolution norm only. */
+    /** Does this field count toward the prediction sensor's resolution error? */
     template <typename C>
-    bool resolutionComponent(int component) {
+    GPU_CALLABLE_METHOD bool resolutionComponent(int component) {
       if constexpr (requires { C::resolutionComponent(component); }) return C::resolutionComponent(component);
       return true;
     }
+    /** Add one step to a cell's quiet time, measured in the time a wave takes to cross the cell. */
+    GPU_CALLABLE_METHOD inline double advanceQuiet(double quiet, double crossing, bool moving, double dt, double referenceTime) {
+      if (not moving) crossing = referenceTime;
+      if (crossing <= 0.0 or std::isnan(crossing)) return -1.0;
+      const double limit = std::numeric_limits<double>::max();
+      const double increment = crossing < 1.0 and dt > limit * crossing ? limit : dt / crossing;
+      return quiet > limit - increment ? limit : quiet + increment;
+    }
+
     /** Return infinity if the Euclidean norm would overflow. */
-    inline double guardedHypot(double left, double right) {
+    GPU_CALLABLE_METHOD inline double guardedHypot(double left, double right) {
       const double limit = std::numeric_limits<double>::max();
       const double invalid = std::numeric_limits<double>::infinity();
       if (not std::isfinite(left) or not std::isfinite(right)) return invalid;
@@ -47,9 +57,9 @@ namespace exahype2::amr {
       return boundedLargest * factor;
     }
 
-    /** Interpolate a DG child with the solver's transfer arithmetic. */
+    /** Evaluate the parent's DG polynomial at the nodes of one child. */
     template <int N, int V, typename P>
-    void interpolateDGCell(const P* parent, P* child, const double* matrix, int position) {
+    GPU_CALLABLE_METHOD void interpolateDGCell(const P* parent, P* child, const double* matrix, int position) {
       double prepared[exahype2::dg::ReferencesAndBoundsEntries<V>];
       for (int component = 0; component < V; component++) {
         exahype2::dg::computeReferenceAndBoundOfParent<N, V>(parent, matrix, component, prepared);
@@ -59,9 +69,9 @@ namespace exahype2::amr {
       }
     }
 
-    /** Restrict DG children with the solver's transfer arithmetic. */
+    /** Project the children's DG solutions onto their parent. */
     template <int N, int V, typename P>
-    void restrictDGCell(const P* const* children, P* parent, const double* matrix) {
+    GPU_CALLABLE_METHOD void restrictDGCell(const P* const* children, P* parent, const double* matrix) {
       double prepared[exahype2::dg::ReferencesAndBoundsEntries<V>];
       for (int component = 0; component < V; component++) {
         exahype2::dg::computeReferenceAndBoundOfChildren<N, V>(children, matrix, component, prepared);
@@ -71,29 +81,32 @@ namespace exahype2::amr {
       }
     }
 
-    /** Prolong FV cell means with piecewise-constant interpolation. */
+    /** Give each fine volume the average of the coarse volume that contains it. */
     template <int N, int V, typename P>
-    void interpolateVolumes(const P* parent, P* child, int childPosition) {
+    GPU_CALLABLE_METHOD void interpolateVolumes(const P* parent, P* child, int childPosition) {
       const auto position = peano4::dDelinearised(childPosition, peano4::SubdivisionFactor);
-      peano4::dForEach(N, [&](const tarch::la::Vector<DIMENSIONS, int>& fine) {
+      for (int volume = 0; volume < peano4::power(N, DIMENSIONS); volume++) {
+        const auto fine = peano4::dDelinearised(volume, N);
         tarch::la::Vector<DIMENSIONS, int> coarse;
         for (int axis = 0; axis < DIMENSIONS; axis++) {
           coarse(axis) = (fine(axis) + N * position(axis)) / peano4::SubdivisionFactor;
         }
         const int fineIndex = peano4::dLinearised(fine, N) * V;
         const int coarseIndex = peano4::dLinearised(coarse, N) * V;
-        std::copy_n(parent + coarseIndex, V, child + fineIndex);
-      });
+        for (int component = 0; component < V; component++) child[fineIndex + component] = parent[coarseIndex + component];
+      }
     }
 
-    /** Restrict FV means with the solver's fixed-point average. */
+    /** Average the fine volumes that make up each coarse volume. */
     template <int N, int V, typename P>
-    void restrictVolumes(const P* const* children, P* parent) {
-      peano4::dForEach(N, [&](const tarch::la::Vector<DIMENSIONS, int>& coarse) {
+    GPU_CALLABLE_METHOD void restrictVolumes(const P* const* children, P* parent) {
+      for (int volume = 0; volume < peano4::power(N, DIMENSIONS); volume++) {
+        const auto coarse = peano4::dDelinearised(volume, N);
         const int target = peano4::dLinearised(coarse, N) * V;
         for (int component = 0; component < V; component++) {
           double values[peano4::ChildrenPerCell];
-          peano4::dForEach(peano4::SubdivisionFactor, [&](const tarch::la::Vector<DIMENSIONS, int>& offset) {
+          for (int subvolume = 0; subvolume < peano4::ChildrenPerCell; subvolume++) {
+            const auto offset = peano4::dDelinearised(subvolume, peano4::SubdivisionFactor);
             tarch::la::Vector<DIMENSIONS, int> position, fine;
             for (int axis = 0; axis < DIMENSIONS; axis++) {
               const int global = peano4::SubdivisionFactor * coarse(axis) + offset(axis);
@@ -103,15 +116,15 @@ namespace exahype2::amr {
             const P* child = children[peano4::dLinearised(position, peano4::SubdivisionFactor)];
             values[peano4::dLinearised(offset, peano4::SubdivisionFactor)] =
               static_cast<double>(child[peano4::dLinearised(fine, N) * V + component]);
-          });
+          }
           parent[target + component] = static_cast<P>(tarch::la::meanInFixedPoint(values));
         }
-      });
+      }
     }
 
     /** Check that tensor-product projection intermediates fit the storage type. */
     template <bool NativeArithmetic, int Inputs, int Samples, int V, typename P, typename MatrixPrecision>
-    bool projectionIsSafe(const P* Q, const MatrixPrecision* matrix) {
+    GPU_CALLABLE_METHOD bool projectionIsSafe(const P* Q, const MatrixPrecision* matrix) {
       if (Q == nullptr or matrix == nullptr) return false;
       const double limit = static_cast<double>(std::numeric_limits<P>::max());
       double bound = 0.0;
@@ -150,7 +163,7 @@ namespace exahype2::amr {
 
     /** Compute (a-b)/scale without overflowing representable differences. */
     template <bool NativeArithmetic>
-    inline double scaledDifference(double a, double b, double scale) {
+    GPU_CALLABLE_METHOD inline double scaledDifference(double a, double b, double scale) {
       if constexpr (NativeArithmetic) {
         return native_neighbour_detail::scaledDifference(a, b, scale);
       } else {
@@ -174,7 +187,7 @@ namespace exahype2::amr {
 
     /** Certify the scaled residual polynomial against the transfer tolerance. */
     template <int N, int V, typename C>
-    bool transferPolynomialIntervalsPasses(const transfer_bound::Field<N, V, DIMENSIONS>& input) {
+    GPU_CALLABLE_METHOD bool transferPolynomialIntervalsPasses(const transfer_bound::Field<N, V, DIMENSIONS>& input) {
       if (not transfer_bound::arithmeticSupported()) return false;
       if constexpr (requires { C::transferWeightLower(0, 0); C::transferWeightUpper(0, 0); }) {
         std::array<transfer_bound::Interval, N * N> weights;
@@ -190,7 +203,7 @@ namespace exahype2::amr {
 
     /** Certify the DG fine-minus-restored polynomial over the whole cell. */
     template <int N, int V, typename C, typename P>
-    bool transferPolynomialPasses(const P* fine, const P* restored) {
+    GPU_CALLABLE_METHOD bool transferPolynomialPasses(const P* fine, const P* restored) {
       if (fine == nullptr or restored == nullptr or not transfer_bound::arithmeticSupported()) return false;
       if constexpr (requires { C::transferWeightLower(0, 0); C::transferWeightUpper(0, 0); }) {
         std::array<transfer_bound::Interval, N * N> weights;
@@ -215,8 +228,9 @@ namespace exahype2::amr {
         return false;
       }
     }
+  /** Measure the contribution of the highest polynomial degree along the cell's coordinate axes. */
   template <bool NativeArithmetic, bool StopAtBudget, int N, int V, typename C, typename P>
-  double highestOrderDetailImpl(const P* Q, double budget) {
+  GPU_CALLABLE_METHOD double highestOrderDetailImpl(const P* Q, double budget) {
     static_assert(N > 0 and V > 0);
     if constexpr (N == 1 or not requires { C::highestModeWeight(0); }) {
       return 0.0;
@@ -277,7 +291,7 @@ namespace exahype2::amr {
                   or (std::abs(delta) > 1.0 and std::abs(weight) > limit / std::abs(delta))) return invalid;
               terms[node] = weight * delta;
             }
-            std::sort(terms.begin(), terms.end());
+            transfer_bound::sort(terms.begin(), terms.end());
             double positive = 0.0, negative = 0.0;
             for (const double term : terms) {
               if (term >= 0.0) {
@@ -285,15 +299,15 @@ namespace exahype2::amr {
                 positive += term;
               }
             }
-            for (auto entry = terms.rbegin(); entry != terms.rend(); ++entry) {
-              if (*entry < 0.0) {
-                if (negative > limit + *entry) return invalid;
-                negative += -*entry;
+            for (int entry = int(terms.size()); entry-- > 0;) {
+              if (terms[entry] < 0.0) {
+                if (negative > limit + terms[entry]) return invalid;
+                negative += -terms[entry];
               }
             }
             magnitudes[component] = std::abs(positive - negative);
           }
-          std::sort(magnitudes.begin(), magnitudes.end());
+          transfer_bound::sort(magnitudes.begin(), magnitudes.end());
           double norm = 0.0;
           for (const double magnitude : magnitudes) {
             if constexpr (NativeArithmetic) norm = amr_detail::guardedHypot(norm, magnitude);
@@ -311,11 +325,54 @@ namespace exahype2::amr {
   /** Default observer that accepts all initial samples. */
   struct NoInitialObservation {
     template <typename P>
-    bool add(const P*, const P*) { return true; }
-    bool passes() const { return true; }
+    GPU_CALLABLE_METHOD bool add(const P*, const P*) { return true; }
+    GPU_CALLABLE_METHOD bool passes() const { return true; }
   };
 
-  /** Compare fine initial samples with the prolonged DG polynomial. */
+  /** Check the DG nodes and interpolation data and set the width of a child cell for sampling. */
+  template <bool NativeArithmetic, int N, int V, typename C, typename P>
+  GPU_CALLABLE_METHOD bool prepareInitialSampling(
+    const P* Q, const double* nodes, const double* prolongation,
+    const tarch::la::Vector<DIMENSIONS, double>& x, const tarch::la::Vector<DIMENSIONS, double>& h,
+    tarch::la::Vector<DIMENSIONS, double>& childWidth
+  ) {
+    if (not transfer_bound::arithmeticSupported()
+        or not std::isfinite(resolutionTolerance<C>()) or resolutionTolerance<C>() <= 0.0) return false;
+    for (int node = 0; node < N; node++) {
+      if (not std::isfinite(nodes[node]) or nodes[node] < 0.0 or nodes[node] > 1.0
+          or (node > 0 and nodes[node] <= nodes[node - 1])) return false;
+    }
+    for (int interval = 0; interval < peano4::SubdivisionFactor; interval++) {
+      if (not amr_detail::projectionIsSafe<NativeArithmetic, N, N, V>(Q, prolongation + interval * N * N)) return false;
+    }
+    for (int axis = 0; axis < DIMENSIONS; axis++) {
+      if (not std::isfinite(x(axis)) or not std::isfinite(h(axis)) or h(axis) <= 0.0) return false;
+      childWidth(axis) = h(axis) / peano4::SubdivisionFactor;
+      if (not std::isfinite(childWidth(axis)) or childWidth(axis) <= 0.0) return false;
+    }
+    return true;
+  }
+
+  /** Does the parent's prediction agree with the initial condition at this child node within tolerance? */
+  template <int V, typename C, typename P>
+  GPU_CALLABLE_METHOD bool initialSampleResidualPasses(const P* fresh, const P* represented) {
+    std::array<double, V> residuals;
+    for (int component = 0; component < V; component++) {
+      if constexpr (requires { C::resolutionComponent(component); }) {
+        if (not std::isfinite(static_cast<double>(fresh[component]))
+            or not std::isfinite(static_cast<double>(represented[component]))) return false;
+        if (not resolutionComponent<C>(component)) { residuals[component] = 0.0; continue; }
+      }
+      residuals[component] = transfer_bound::magnitude(transfer_bound::difference(
+        static_cast<double>(fresh[component]), static_cast<double>(represented[component]), C::stateScale(component)
+      ));
+    }
+    return transfer_bound::normPasses<V>(residuals, resolutionTolerance<C>());
+  }
+
+  TARGET_DECLARE_END
+
+  /** Check whether the parent DG solution represents the initial condition sampled on each child. */
   template <bool NativeArithmetic, int N, int V, typename C, typename P,
             typename Observer = NoInitialObservation>
   bool initialDataPasses(
@@ -332,69 +389,89 @@ namespace exahype2::amr {
     static_assert(N > 0 and V > 0);
     constexpr int Nodes = peano4::power(N, DIMENSIONS), Values = Nodes * V;
     using Coordinates = tarch::la::Vector<DIMENSIONS, double>;
-    if (Q == nullptr or nodes == nullptr or prolongation == nullptr or initialCondition == nullptr
-        or not transfer_bound::arithmeticSupported()
-        or not std::isfinite(resolutionTolerance<C>()) or resolutionTolerance<C>() <= 0.0) return false;
-    for (int node = 0; node < N; node++) {
-      if (not std::isfinite(nodes[node]) or nodes[node] < 0.0 or nodes[node] > 1.0
-          or (node > 0 and nodes[node] <= nodes[node - 1])) return false;
-    }
-    for (int interval = 0; interval < peano4::SubdivisionFactor; interval++) {
-      if (not amr_detail::projectionIsSafe<NativeArithmetic, N, N, V>(Q, prolongation + interval * N * N)) return false;
-    }
+    if (Q == nullptr or nodes == nullptr or prolongation == nullptr or initialCondition == nullptr) return false;
     Coordinates childWidth;
-    for (int axis = 0; axis < DIMENSIONS; axis++) {
-      if (not std::isfinite(x(axis)) or not std::isfinite(h(axis)) or h(axis) <= 0.0) return false;
-      childWidth(axis) = h(axis) / peano4::SubdivisionFactor;
-      if (not std::isfinite(childWidth(axis)) or childWidth(axis) <= 0.0) return false;
-    }
+    if (not prepareInitialSampling<NativeArithmetic, N, V, C>(Q, nodes, prolongation, x, h, childWidth)) return false;
     for (int child = 0; child < peano4::ChildrenPerCell; child++) {
       Coordinates centre;
-      int remaining = child;
+      const auto position = peano4::dDelinearised(child, peano4::SubdivisionFactor);
       for (int axis = 0; axis < DIMENSIONS; axis++) {
-        const int position = remaining % peano4::SubdivisionFactor;
-        remaining /= peano4::SubdivisionFactor;
-        centre(axis) = x(axis) + (position + 0.5 - 0.5 * peano4::SubdivisionFactor) * childWidth(axis);
+        centre(axis) = x(axis) + (position(axis) + 0.5 - 0.5 * peano4::SubdivisionFactor) * childWidth(axis);
         if (not std::isfinite(centre(axis))) return false;
       }
       P fresh[Values], represented[Values];
       std::fill_n(fresh, Values, std::numeric_limits<P>::quiet_NaN());
       amr_detail::interpolateDGCell<N, V>(Q, represented, prolongation, child);
       for (int node = 0; node < Nodes; node++) {
-        auto index = tarch::la::Vector<DIMENSIONS, int>(0);
-        int entry = node;
-        for (int axis = 0; axis < DIMENSIONS; axis++) {
-          index(axis) = entry % N;
-          entry /= N;
-        }
-        const auto point = exahype2::dg::getQuadraturePoint(centre, childWidth, index, nodes);
+        const auto point = exahype2::dg::getQuadraturePoint(centre, childWidth, peano4::dDelinearised(node, N), nodes);
         for (int axis = 0; axis < DIMENSIONS; axis++) if (not std::isfinite(point(axis))) return false;
         initialCondition(fresh + node * V, point, childWidth);
-        std::array<double, V> residuals;
-        for (int component = 0; component < V; component++) {
-          if constexpr (requires { C::resolutionComponent(component); }) {
-            // Validate sampled and represented values even for excluded components.
-            if (not std::isfinite(static_cast<double>(fresh[node * V + component]))
-                or not std::isfinite(static_cast<double>(represented[node * V + component]))) return false;
-            if (not resolutionComponent<C>(component)) { residuals[component] = 0.0; continue; }
-          }
-          residuals[component] = transfer_bound::magnitude(transfer_bound::difference(
-            static_cast<double>(fresh[node * V + component]),
-            static_cast<double>(represented[node * V + component]), C::stateScale(component)
-          ));
-        }
-        if (not transfer_bound::normPasses<V>(residuals, resolutionTolerance<C>())) return false;
+        if (not initialSampleResidualPasses<V, C>(fresh + node * V, represented + node * V)) return false;
       }
       if (admissible != nullptr and (not admissible(fresh, Nodes, centre, childWidth)
           or not admissible(represented, Nodes, centre, childWidth))) return false;
-      // Derive observation budgets from the same independent fine samples.
       if (not observer.add(fresh, represented)) return false;
     }
     return observer.passes();
   }
 
+  TARGET_DECLARE
+  template <typename Callback>
+  GPU_CALLABLE_METHOD bool callbackAvailable(const Callback& callback) {
+    if constexpr (requires { callback != nullptr; }) return callback != nullptr;
+    else return true;
+  }
+
+  /** Check whether the parent DG solution represents the initial condition sampled on each child. */
+  template <bool NativeArithmetic, int N, int V, typename C, typename P,
+            typename InitialCondition, typename Admissible, typename Observer = NoInitialObservation>
+  GPU_CALLABLE_METHOD bool deviceInitialDataPasses(
+    const P* Q,
+    const tarch::la::Vector<DIMENSIONS, double>& x,
+    const tarch::la::Vector<DIMENSIONS, double>& h,
+    const double* nodes, const double* prolongation,
+    InitialCondition initialCondition, Admissible admissible,
+    Observer observer = {}
+  ) {
+    if constexpr (std::is_same_v<InitialCondition, std::nullptr_t>) return false;
+    else {
+      static_assert(N > 0 and V > 0);
+      constexpr int Nodes = peano4::power(N, DIMENSIONS), Values = Nodes * V;
+      using Coordinates = tarch::la::Vector<DIMENSIONS, double>;
+      if (Q == nullptr or nodes == nullptr or prolongation == nullptr or not callbackAvailable(initialCondition)) return false;
+      Coordinates childWidth;
+      if (not prepareInitialSampling<NativeArithmetic, N, V, C>(Q, nodes, prolongation, x, h, childWidth)) return false;
+      for (int child = 0; child < peano4::ChildrenPerCell; child++) {
+        Coordinates centre;
+        const auto position = peano4::dDelinearised(child, peano4::SubdivisionFactor);
+        for (int axis = 0; axis < DIMENSIONS; axis++) {
+          centre(axis) = x(axis) + (position(axis) + 0.5 - 0.5 * peano4::SubdivisionFactor) * childWidth(axis);
+          if (not std::isfinite(centre(axis))) return false;
+        }
+        P fresh[Values], represented[Values];
+        for (int value = 0; value < Values; value++) fresh[value] = std::numeric_limits<P>::quiet_NaN();
+        amr_detail::interpolateDGCell<N, V>(Q, represented, prolongation, child);
+        for (int node = 0; node < Nodes; node++) {
+          const auto point = exahype2::dg::getQuadraturePoint(centre, childWidth, peano4::dDelinearised(node, N), nodes);
+          for (int axis = 0; axis < DIMENSIONS; axis++) if (not std::isfinite(point(axis))) return false;
+          initialCondition(fresh + node * V, point, childWidth);
+          if (not initialSampleResidualPasses<V, C>(fresh + node * V, represented + node * V)) return false;
+        }
+        if constexpr (not std::is_same_v<Admissible, std::nullptr_t>) {
+          if (callbackAvailable(admissible) and (not admissible(fresh, Nodes, centre, childWidth)
+              or not admissible(represented, Nodes, centre, childWidth))) return false;
+        }
+        if (not observer.add(fresh, represented)) return false;
+      }
+      return observer.passes();
+    }
+  }
+
+  TARGET_DECLARE_END
+
   } // namespace amr_detail
 
+  TARGET_DECLARE
   namespace native_detail {
     namespace transfer_bound = ::exahype2::amr::detail::transfer_bound;
     using amr_detail::guardedHypot;
@@ -402,39 +479,41 @@ namespace exahype2::amr {
     using amr_detail::restrictVolumes;
     using amr_detail::transferPolynomialPasses;
     template <int I, int S, int V, typename P, typename M>
-    bool projectionIsSafe(const P* Q, const M* matrix) {
+    GPU_CALLABLE_METHOD bool projectionIsSafe(const P* Q, const M* matrix) {
       return amr_detail::projectionIsSafe<true, I, S, V>(Q, matrix);
     }
-    inline double scaledDifference(double a, double b, double scale) {
+    GPU_CALLABLE_METHOD inline double scaledDifference(double a, double b, double scale) {
       return amr_detail::scaledDifference<true>(a, b, scale);
     }
     template <bool Stop, int N, int V, typename C, typename P>
-    double nativeHighestOrderDetailImpl(const P* Q, double budget) {
+    GPU_CALLABLE_METHOD double nativeHighestOrderDetailImpl(const P* Q, double budget) {
       return amr_detail::highestOrderDetailImpl<true, Stop, N, V, C>(Q, budget);
     }
   }
   namespace detail {
     using amr_detail::transferPolynomialPasses;
     template <int I, int S, int V, typename P, typename M>
-    bool projectionIsSafe(const P* Q, const M* matrix) {
+    GPU_CALLABLE_METHOD bool projectionIsSafe(const P* Q, const M* matrix) {
       return amr_detail::projectionIsSafe<false, I, S, V>(Q, matrix);
     }
-    inline double scaledDifference(double a, double b, double scale) {
+    GPU_CALLABLE_METHOD inline double scaledDifference(double a, double b, double scale) {
       return amr_detail::scaledDifference<false>(a, b, scale);
     }
     template <bool Stop, int N, int V, typename C, typename P>
-    double highestOrderDetailImpl(const P* Q, double budget) {
+    GPU_CALLABLE_METHOD double highestOrderDetailImpl(const P* Q, double budget) {
       return amr_detail::highestOrderDetailImpl<false, Stop, N, V, C>(Q, budget);
     }
   }
   template <int N, int V, typename C, typename P>
-  double nativeHighestOrderDetail(const P* Q) {
+  GPU_CALLABLE_METHOD double nativeHighestOrderDetail(const P* Q) {
     return amr_detail::highestOrderDetailImpl<true, false, N, V, C>(Q, std::numeric_limits<double>::infinity());
   }
   template <int N, int V, typename C, typename P>
-  double highestOrderDetail(const P* Q) {
+  GPU_CALLABLE_METHOD double highestOrderDetail(const P* Q) {
     return amr_detail::highestOrderDetailImpl<false, false, N, V, C>(Q, std::numeric_limits<double>::infinity());
   }
+
+  TARGET_DECLARE_END
 
   template <int N, int V, typename C, typename P,
             typename Observer = amr_detail::NoInitialObservation>
@@ -461,4 +540,27 @@ namespace exahype2::amr {
     return amr_detail::initialDataPasses<false, N, V, C>(
       Q, x, h, nodes, prolongation, initialCondition, admissible, std::move(observer));
   }
+  TARGET_DECLARE
+  template <int N, int V, typename C, typename P,
+            typename InitialCondition, typename Admissible, typename Observer = amr_detail::NoInitialObservation>
+  GPU_CALLABLE_METHOD bool nativeDeviceInitialDataPasses(
+    const P* Q, const tarch::la::Vector<DIMENSIONS, double>& x,
+    const tarch::la::Vector<DIMENSIONS, double>& h, const double* nodes, const double* prolongation,
+    InitialCondition initialCondition, Admissible admissible, Observer observer = {}
+  ) {
+    return amr_detail::deviceInitialDataPasses<true, N, V, C>(
+      Q, x, h, nodes, prolongation, initialCondition, admissible, observer);
+  }
+
+  template <int N, int V, typename C, typename P,
+            typename InitialCondition, typename Admissible, typename Observer = amr_detail::NoInitialObservation>
+  GPU_CALLABLE_METHOD bool deviceInitialDataPasses(
+    const P* Q, const tarch::la::Vector<DIMENSIONS, double>& x,
+    const tarch::la::Vector<DIMENSIONS, double>& h, const double* nodes, const double* prolongation,
+    InitialCondition initialCondition, Admissible admissible, Observer observer = {}
+  ) {
+    return amr_detail::deviceInitialDataPasses<false, N, V, C>(
+      Q, x, h, nodes, prolongation, initialCondition, admissible, observer);
+  }
+  TARGET_DECLARE_END
 } // namespace exahype2::amr

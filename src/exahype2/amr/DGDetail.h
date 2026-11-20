@@ -3,11 +3,13 @@
 #pragma once
 
 #include "NativeNeighbours.h"
+#include "TransferBounds.h"
 
+TARGET_DECLARE
 namespace exahype2::amr::resolution_detail {
   /** Sum finite terms with order-independent fixed-point accumulation. */
   template <int Count>
-  bool sumTerms(const std::array<double, Count>& terms, double& result) {
+  GPU_CALLABLE_METHOD bool sumTerms(const std::array<double, Count>& terms, double& result) {
     double largest = 0.0;
     for (const double term : terms) {
       if (not std::isfinite(term)) return false;
@@ -26,7 +28,7 @@ namespace exahype2::amr::resolution_detail {
     }
   }
 
-  /** Cache normal Taylor coefficients for repeated tangential face sampling. */
+  /** The Taylor coefficients of a DG polynomial in the direction perpendicular to a cell face. */
   template <int N, int V, typename C, typename P>
   class DGFaceExpansion {
     static_assert(N > 0 and V > 0);
@@ -37,7 +39,7 @@ namespace exahype2::amr::resolution_detail {
     int _normal = -1;
 
     /** Build left-face Taylor weights when generated tables are unavailable. */
-    bool makeWeights(std::array<double, N * N>& weights) const {
+    GPU_CALLABLE_METHOD bool makeWeights(std::array<double, N * N>& weights) const {
       using namespace native_neighbour_detail;
       for (int node = 0; node < N; node++) {
         std::array<double, N> polynomial{};
@@ -65,7 +67,7 @@ namespace exahype2::amr::resolution_detail {
 
   public:
     /** Prepare normal Taylor coefficients scaled by normalRatio^order. */
-    bool prepare(const P* Q, const double* nodes, int normal, int side, double normalRatio) {
+    GPU_CALLABLE_METHOD bool prepare(const P* Q, const double* nodes, int normal, int side, double normalRatio) {
       using namespace native_neighbour_detail;
       _normal = -1;
       if (Q == nullptr or nodes == nullptr or normal < 0 or normal >= DIMENSIONS
@@ -84,7 +86,11 @@ namespace exahype2::amr::resolution_detail {
         if (not makeWeights(weights)) return false;
         if (side == 1) {
           for (int order = 0; order < N; order++) {
-            for (int node = 0; node < N / 2; node++) std::swap(weights[order * N + node], weights[order * N + N - 1 - node]);
+            for (int node = 0; node < N / 2; node++) {
+              const double value = weights[order * N + node];
+              weights[order * N + node] = weights[order * N + N - 1 - node];
+              weights[order * N + N - 1 - node] = value;
+            }
             if (order % 2 != 0) for (int node = 0; node < N; node++) weights[order * N + node] = -weights[order * N + node];
           }
         }
@@ -127,8 +133,8 @@ namespace exahype2::amr::resolution_detail {
       return true;
     }
 
-    /** Evaluate the face Taylor coefficients; ignore the point's normal coordinate. */
-    bool sample(const std::array<double, DIMENSIONS>& point, std::array<double, N * V>& jet) const {
+    /** Evaluate the Taylor coefficients at a point on the face, in local coordinates from 0 to 1. */
+    GPU_CALLABLE_METHOD bool sample(const std::array<double, DIMENSIONS>& point, std::array<double, N * V>& jet) const {
       if (_normal < 0) return false;
       std::array<double, DIMENSIONS> centred{};
       for (int axis = 0; axis < DIMENSIONS; axis++) {
@@ -139,8 +145,8 @@ namespace exahype2::amr::resolution_detail {
       return sampleCentered(centred, jet);
     }
 
-    /** Use centred face coordinates to retain reflection symmetry. */
-    bool sampleCentered(const std::array<double, DIMENSIONS>& point, std::array<double, N * V>& jet) const {
+    /** Evaluate the same coefficients in face coordinates from -0.5 to 0.5. */
+    GPU_CALLABLE_METHOD bool sampleCentered(const std::array<double, DIMENSIONS>& point, std::array<double, N * V>& jet) const {
       using namespace native_neighbour_detail;
       if (_normal < 0) return false;
       std::array<std::array<double, N>, DIMENSIONS> basis{};
@@ -174,7 +180,7 @@ namespace exahype2::amr::resolution_detail {
           index /= N;
           if (axis != _normal) factors[count++] = basis[axis][node];
         }
-        std::sort(factors.begin(), factors.end());
+        detail::transfer_bound::sort(factors.begin(), factors.end());
         weights[fibre] = 1.0;
         for (const double factor : factors) if (not product(weights[fibre], factor, weights[fibre])) return false;
       }
@@ -203,3 +209,5 @@ namespace exahype2::amr::resolution_detail {
     }
   };
 } // namespace exahype2::amr::resolution_detail
+
+TARGET_DECLARE_END

@@ -5,6 +5,7 @@
 #include "exahype2/terms/CellPredicate.h"
 #include "exahype2/terms/FacePredicate.h"
 #include "exahype2/terms/MeasuredUnknowns.h"
+#include "exahype2/terms/RefinementCriterion.h"
 #include "tarch/Assertions.h"
 #include "tarch/MemoryUsage.h"
 #include "tarch/accelerator/ParallelFor.h"
@@ -136,9 +137,8 @@ exahype2::dg::Solver<Derived, StoragePrecision, ComputePrecision>::initialise(
 }
 
 /**
- * Moves the solution into the slots of the new cell connectivity and measures the wave speeds of the
- * new grid. readValuesFromGlobalReduction() recomputes the time step size. The next time step fills
- * the face pools.
+ * Transfers the DG solution to the new grid and checks the newly created cells for refinement.
+ * Adaptive time stepping uses wave speeds on the new grid. Face data are filled on the next step.
  */
 template <typename Derived, typename StoragePrecision, typename ComputePrecision>
 template <typename RuntimeParameters>
@@ -208,22 +208,29 @@ exahype2::dg::Solver<Derived, StoragePrecision, ComputePrecision>::regrid(
     }
     createdCells.push_back(slot);
   }
-  const auto criterionSolution = [&]() {
-    if constexpr (exahype2::terms::RefinementCriterionOnHost<Derived>) {
-      return downloadSolution().getView();
-    } else {
-      return std::as_const(_solution).getView();
-    }
-  }();
-  _votes.voteOnCells<Derived>(
-    cellConnectivity,
-    createdCells,
-    criterionSolution,
-    _timeStepping.getLimits(),
-    _timeStepping.getTimeStamp(),
-    requests,
-    parameters
-  );
+  if constexpr (exahype2::terms::HasDeviceAMRAssessment<Derived, CellPool, RuntimeParameters>) {
+    static_cast<Derived&>(*this).assessAMROnDevice(
+      cellConnectivity, std::as_const(_solution).getView(), _timeStepping,
+      requests, parameters, tarch::Span<const int>{createdCells.data(), static_cast<int>(createdCells.size())}, true
+    );
+  } else {
+    const auto criterionSolution = [&]() {
+      if constexpr (exahype2::terms::RefinementCriterionOnHost<Derived>) {
+        return downloadSolution().getView();
+      } else {
+        return std::as_const(_solution).getView();
+      }
+    }();
+    _votes.voteOnCells<Derived>(
+      cellConnectivity,
+      createdCells,
+      criterionSolution,
+      _timeStepping.getLimits(),
+      _timeStepping.getTimeStamp(),
+      requests,
+      parameters
+    );
+  }
 }
 
 /**
@@ -748,8 +755,8 @@ exahype2::dg::Solver<Derived, StoragePrecision, ComputePrecision>::measureError(
 }
 
 /**
- * Casts the refinement votes of the cells the solver advances. The first call after a regrid
- * returns at once.
+ * Records whether each cell this solver advances should split, stay as it is, or join its siblings.
+ * A disabled assessment votes Keep. An enabled assessment skips voting on the first step after a regrid.
  */
 template <typename Derived, typename StoragePrecision, typename ComputePrecision>
 template <typename RuntimeParameters>
@@ -770,37 +777,45 @@ exahype2::dg::Solver<Derived, StoragePrecision, ComputePrecision>::assessRefinem
     }
     return;
   }
-  // A host criterion may still advance its histories when votes pause after a regrid.
-  const auto criterionSolution = [&]() {
-    if constexpr (exahype2::terms::RefinementCriterionOnHost<Derived>) {
-      return downloadSolution().getView();
-    } else {
-      return std::as_const(_solution).getView();
-    }
-  }();
-  if (_meshChangedSinceLastTimeStep) {
+  if constexpr (exahype2::terms::HasDeviceAMRAssessment<Derived, CellPool, RuntimeParameters>) {
+    static_cast<Derived&>(*this).assessAMROnDevice(
+      cellConnectivity, std::as_const(_solution).getView(), _timeStepping,
+      requests, parameters, cellConnectivity.getCells(), not _meshChangedSinceLastTimeStep
+    );
     _meshChangedSinceLastTimeStep = false;
-    return;
-  }
-  if constexpr (exahype2::terms::HasCellPredicate<Derived>) {
-    _votes.voteOnCells<Derived>(
-      cellConnectivity,
-      _ownedCellsOnHost,
-      criterionSolution,
-      _timeStepping.getLimits(),
-      _timeStepping.getTimeStamp(),
-      requests,
-      parameters
-    );
   } else {
-    _votes.voteOnEveryCell<Derived>(
-      cellConnectivity,
-      criterionSolution,
-      _timeStepping.getLimits(),
-      _timeStepping.getTimeStamp(),
-      requests,
-      parameters
-    );
+    // The legacy criterion reads the current solution even on steps when voting is paused.
+    const auto criterionSolution = [&]() {
+      if constexpr (exahype2::terms::RefinementCriterionOnHost<Derived>) {
+        return downloadSolution().getView();
+      } else {
+        return std::as_const(_solution).getView();
+      }
+    }();
+    if (_meshChangedSinceLastTimeStep) {
+      _meshChangedSinceLastTimeStep = false;
+      return;
+    }
+    if constexpr (exahype2::terms::HasCellPredicate<Derived>) {
+      _votes.voteOnCells<Derived>(
+        cellConnectivity,
+        _ownedCellsOnHost,
+        criterionSolution,
+        _timeStepping.getLimits(),
+        _timeStepping.getTimeStamp(),
+        requests,
+        parameters
+      );
+    } else {
+      _votes.voteOnEveryCell<Derived>(
+        cellConnectivity,
+        criterionSolution,
+        _timeStepping.getLimits(),
+        _timeStepping.getTimeStamp(),
+        requests,
+        parameters
+      );
+    }
   }
 }
 

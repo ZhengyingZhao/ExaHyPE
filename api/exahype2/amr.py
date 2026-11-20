@@ -1,6 +1,6 @@
 # This file is part of the ExaHyPE2 project. For conditions of distribution and
 # use, please see the copyright notice at www.peano-framework.org
-"""Adaptive refinement criteria for FV, ADER-DG and RKDG solvers."""
+"""Adaptive mesh refinement for FV, ADER-DG and RKDG solvers."""
 
 import math
 import warnings
@@ -65,24 +65,23 @@ class LinearObservable:
         object.__setattr__(self, "relative_tolerance", relative)
 
 
-def _observable_declarations(observables, values):
-    """Generate linear-observable settings for both solver adapters."""
+def _observable_declarations(observables, values, method):
+    """Give the C++ criterion the weights and error tolerances for each observable."""
     count = len(observables)
     lines = ["    static constexpr int NumberOfObservables = {};".format(count)]
     if count == 0:
         return lines
     weights = ", ".join(repr(x) for observation in observables for x in observation.weights)
     lines += [
-        "    static double observableWeight(int observable, int component) {",
-        # Keep array initialisers distinct from Jinja template expressions.
+        "    " + method + " double observableWeight(int observable, int component) {",
         "      constexpr double weights[{}]{{{}}};".format(count * values, weights),
         "      return observable >= 0 and observable < {} and component >= 0 and component < {}".format(count, values),
         "        ? weights[observable * {} + component] : std::numeric_limits<double>::quiet_NaN();".format(values),
         "    }",
     ]
-    for method, field in (("Absolute", "absolute_tolerance"), ("Relative", "relative_tolerance")):
+    for tolerance, field in (("Absolute", "absolute_tolerance"), ("Relative", "relative_tolerance")):
         lines += [
-            "    static double observable{}Tolerance(int observable) {{".format(method),
+            "    {} double observable{}Tolerance(int observable) {{".format(method, tolerance),
             "      constexpr double tolerances[{}]{{{}}};".format(
                 count, ", ".join(repr(getattr(observation, field)) for observation in observables)),
             "      return observable >= 0 and observable < {} ? tolerances[observable] : std::numeric_limits<double>::quiet_NaN();".format(count),
@@ -91,11 +90,11 @@ def _observable_declarations(observables, values):
     return lines
 
 
-def _resolution_component_declarations(components):
-    """Generate the optional component filter for the prediction norm."""
+def _resolution_component_declarations(components, method):
+    """Tell the prediction check which fields to measure. The default uses every field."""
     if components is None:
         return []
-    return ["    static bool resolutionComponent(int component) {",
+    return ["    " + method + " bool resolutionComponent(int component) {",
             "      return " + " or ".join("component == {}".format(c) for c in components) + ";",
             "    }"]
 
@@ -173,10 +172,10 @@ def _taylor_weights(solver):
     return tuple(left + right)
 
 
-def _taylor_declarations(count, weights):
-    """Emit the shared DG Taylor-weight accessor."""
+def _taylor_declarations(count, weights, method):
+    """Give the criterion the weights for evaluating DG Taylor coefficients at a face."""
     return [
-        "    static double taylorWeight(int side, int order, int node) {",
+        "    " + method + " double taylorWeight(int side, int order, int node) {",
         "      constexpr double weights[{}]{{{}}};".format(len(weights), ", ".join(repr(x) for x in weights)),
         "      return side >= 0 and side < 2 and order >= 0 and order < {0} and node >= 0 and node < {0}".format(count),
         "        ? weights[(side * {0} + order) * {0} + node] : std::numeric_limits<double>::quiet_NaN();".format(count),
@@ -239,19 +238,28 @@ def _transfer_weights(solver):
 
 @dataclass(frozen=True, kw_only=True)
 class _AMRSettings:
-    """Settings shared by all solver adapters.
+    """Choose how a solver decides which cells to refine, keep or coarsen.
 
-    state_scales supplies a positive scale for each stored field, including auxiliaries.
-    transfer_tolerance limits information lost during coarsening.
-    resolution_tolerance limits scaled spatial detail and defaults to transfer_tolerance.
-    resolution_indicator selects prediction compatibility or modal/face-derivative checks.
-    quiet_time and reference_time control the coarsening delay in legacy mode.
-    sample_initial_data compares DG polynomials with the pointwise initial condition.
-    linear_observables adds budgets for linear state combinations in prediction mode.
-    assessment_interval evaluates every N accepted positive steps in prediction mode;
-    other steps vote Keep. Initialisation is assessed independently of this interval.
-    resolution_components selects fields for the prediction norm; None uses all fields.
-    Transfer, finite-state and admissibility checks always cover all stored fields.
+    Set execution to "cpu" for host assessment or "gpu" to use the configured
+    accelerator backend. Give each stored field, including auxiliaries, a
+    positive scale in state_scales. transfer_tolerance limits the error allowed
+    when coarsening. resolution_tolerance limits spatial detail after scaling
+    and defaults to transfer_tolerance.
+
+    With resolution_indicator="prediction", the criterion checks how well
+    nearby solution profiles agree. resolution_components selects the fields
+    for this check, and None uses all fields. The checks for transfer error,
+    finite values and physical admissibility use the full state. linear_observables
+    sets tolerances for weighted sums of fields. With assessment_interval=N, the
+    solver assesses the first accepted step and then every N steps that advance
+    time. On skipped steps it votes Keep. The initial mesh is assessed separately.
+
+    With resolution_indicator="legacy", the criterion measures variation in
+    each cell and across its faces. quiet_time and reference_time control how
+    long a cell must stay quiet before it can coarsen.
+
+    For DG solvers, sample_initial_data compares the initial polynomial with
+    pointwise initial values on its children.
     """
 
     state_scales: tuple
@@ -264,8 +272,11 @@ class _AMRSettings:
     linear_observables: tuple = ()
     assessment_interval: int = 1
     resolution_components: tuple[int, ...] | None = None
+    execution: str = "cpu"
 
     def __post_init__(self):
+        if self.execution not in ("cpu", "gpu"):
+            raise ValueError("execution must be 'cpu' or 'gpu'.")
         if self.resolution_indicator not in ("prediction", "legacy"):
             raise ValueError("resolution_indicator must be 'prediction' or 'legacy'.")
         if not isinstance(self.sample_initial_data, bool):
@@ -340,8 +351,8 @@ def _check_refinement_callback(solver, external_callback):
         )
 
 
-def _runtime_callback(member, operation, solver_template="", *, snapshot=False):
-    """Bind runtime parameters to a criterion callback."""
+def _runtime_callback(member, operation, solver_template="", *, snapshot=False, device=False):
+    """Return a C++ callback that calls a solver function with its runtime parameters."""
     coordinates = "const tarch::la::Vector<DIMENSIONS, double>&"
     arguments = {
         "WaveSpeed": ("const StoragePrecision* Q, {0} x, {0} h, double t, double dt, int normal".format(coordinates),
@@ -354,19 +365,21 @@ def _runtime_callback(member, operation, solver_template="", *, snapshot=False):
         "InitialDataPasses": ("const StoragePrecision* Q, {0} x, {0} h".format(coordinates), "Q, x, h"),
     }
     declaration, forwarded = arguments[operation]
-    capture, parameters = ("criterionParameters", "*criterionParameters") if snapshot else ("&parameters", "parameters")
-    return "[{}]({}) {{ return {}{}<{}>({}, {}); }}".format(
-        capture, declaration, member, operation, solver_template, forwarded, parameters)
+    capture, parameters = ("criterionParameters", "*criterionParameters") if snapshot else (
+        "parameters" if device else "&parameters", "parameters")
+    return "[{}]{}({}) {{ return {}{}<{}>({}, {}); }}".format(
+        capture, " GPU_CALLABLE_METHOD " if device else "", declaration,
+        member, operation, solver_template, forwarded, parameters)
 
 
 def _with_parameter_snapshot(body):
-    """Share an immutable parameter snapshot among the assessment callbacks."""
+    """Give the CPU callbacks a shared copy of the runtime parameters for this assessment."""
     return ("{\nconst auto criterionParameters = std::make_shared<const RuntimeParameters>(parameters);\n"
             + body + "\n}\n")
 
 
 def _host_operator_declarations():
-    """Keep host transfer tables alive while the criterion holds their pointers."""
+    """Declare the DG nodes and parent-child transfer tables used by the CPU criterion."""
     return """
   inline static constexpr auto _amrQuadratureNodes = Quadrature<double>::getQuadraturePoints1D();
   inline static constexpr auto _amrRestriction = DGMatrices<double>::getWeightedRestrictionMatrix1D();
@@ -374,12 +387,60 @@ def _host_operator_declarations():
 """
 
 
+def _initial_data_declarations(solver, nodes, *, native, device, method):
+    """Generate the DG check that compares the initial polynomial with initial values on finer cells."""
+    if native:
+        member, config = "_nativeCriterion", "NativeCriterionConfig"
+        check = "nativeDeviceInitialDataPasses" if device else "nativeInitialDataPasses"
+    else:
+        member, config = "_limiterCriterion", "LimiterCriterionConfig"
+        check = "deviceInitialDataPasses" if device else "initialDataPasses"
+    tables = ""
+    pointers = "_amrQuadratureNodes.data(), _amrProlongation.data()"
+    monitor = "InitialDataMonitor"
+    if device:
+        tables = ("    constexpr auto deviceNodes = Quadrature<double>::getQuadraturePoints1D();\n"
+                  "    constexpr auto deviceProlongation = DGMatrices<double>::getProlongationMatrix1D();\n")
+        pointers = "deviceNodes.data(), deviceProlongation.data()"
+        monitor = "DeviceInitialDataMonitor"
+    return """
+  template <typename Solver = ::{{FULL_QUALIFIED_SOLVER_NAME}}>
+  %(method)s void %(member)sInitialCondition(
+    %(storage)s* Q,
+    const tarch::la::Vector<DIMENSIONS, double>& x,
+    const tarch::la::Vector<DIMENSIONS, double>& h,
+    const RuntimeParameters& parameters
+  ) {
+    static_assert(::exahype2::terms::HasInitialCondition<Solver, %(storage)s>);
+    static_assert(not ::exahype2::terms::InitialisesPatches<Solver>);
+    Solver::initialCondition(Q, x, h, parameters);
+  }
+  template <typename Solver = ::{{FULL_QUALIFIED_SOLVER_NAME}}>
+  %(method)s bool %(member)sInitialDataPasses(
+    const %(storage)s* Q,
+    const tarch::la::Vector<DIMENSIONS, double>& x,
+    const tarch::la::Vector<DIMENSIONS, double>& h,
+    const RuntimeParameters& parameters
+  ) {
+%(tables)s    return ::exahype2::amr::%(check)s<%(nodes)d, %(values)d, %(config)s>(
+      Q, x, h, %(pointers)s,
+      %(initial_condition)s, %(admissible)s,
+      ::exahype2::amr::observation_detail::%(monitor)s<
+        %(nodes)d, %(values)d, %(config)s, %(storage)s>{}
+    );
+  }
+""" % {"method": method, "member": member, "config": config, "nodes": nodes,
+       "storage": solver.precision.storage, "values": solver.state.number_of_values,
+       "tables": tables, "check": check, "pointers": pointers, "monitor": monitor,
+       "initial_condition": _runtime_callback(member, "InitialCondition", "Solver", device=device),
+       "admissible": _runtime_callback(member, "Admissible", "Solver", device=device)}
+
+
 def _refresh_accepted_solution(member):
-    """Refresh limiter mirrors; assessRefinement() downloads the solution itself."""
+    """Give the CPU criterion the latest limiter status and FV subcell values."""
     refresh = ""
     if member == "_limiterCriterion":
         refresh = """
-// Refresh the same host pools bound before stepping, after application hooks.
 {
   auto& criterionLimiter = const_cast<typename SolverFamily::LimiterType&>(getLimiter());
   (void)criterionLimiter.downloadStatuses();
@@ -389,10 +450,77 @@ def _refresh_accepted_solution(member):
     return refresh
 
 
+def _device_callbacks(policy, solver, adapter, member):
+    """Let AMR kernels call the solver's PDE functions with a copy of its runtime parameters."""
+    storage = solver.precision.storage
+    transfer = ("return " + member + "TransferAdmissible<Solver>(parent, children, parameters);"
+                if adapter is _ADERDGAdapter else "return true;")
+    initial = ("return " + member + "InitialDataPasses<Solver>(Q, x, h, parameters);"
+               if policy.sample_initial_data else "return true;")
+    statuses = "getLimiter().getStatuses()" if adapter is _ADERDGAdapter else "::exahype2::amr::NoStatusView{}"
+    subcells = ("getLimiter().getSubcells()" if adapter is _ADERDGAdapter else
+                "typename ::tarch::accelerator::ChunkedMemoryPool<StoragePrecision>::ConstView{}")
+    return """
+  template <typename Solver>
+  struct %(member)sDeviceCallbacks final {
+    RuntimeParameters parameters;
+    static constexpr bool HasInitialDataCheck = %(sampling)s;
+    GPU_CALLABLE_METHOD double waveSpeed(
+      const %(storage)s* Q, const tarch::la::Vector<DIMENSIONS,double>& x,
+      const tarch::la::Vector<DIMENSIONS,double>& h, double t, double dt, int normal
+    ) const { return %(member)sWaveSpeed<Solver>(Q, x, h, t, dt, normal, parameters); }
+    GPU_CALLABLE_METHOD bool admissible(
+      const %(storage)s* Q, int numberOfStates, const tarch::la::Vector<DIMENSIONS,double>& x,
+      const tarch::la::Vector<DIMENSIONS,double>& h
+    ) const { return %(member)sAdmissible<Solver>(Q, numberOfStates, x, h, parameters); }
+    GPU_CALLABLE_METHOD bool transferAdmissible(
+      const %(storage)s* parent, const %(storage)s* const* children
+    ) const { %(transfer)s }
+    GPU_CALLABLE_METHOD bool initialDataPasses(
+      const %(storage)s* Q, const tarch::la::Vector<DIMENSIONS,double>& x,
+      const tarch::la::Vector<DIMENSIONS,double>& h
+    ) const { %(initial)s }
+  };
+  // Assess the solution on the device. If castVotes is true, submit mesh requests for the selected cells.
+  template <typename Solver = ::{{FULL_QUALIFIED_SOLVER_NAME}}>
+  void assessAMROnDevice(
+    const ::peano4::CellConnectivity& mesh,
+    typename ::tarch::accelerator::ChunkedMemoryPool<StoragePrecision>::ConstView solution,
+    const ::exahype2::TimeStepping& clock, ::exahype2::RefinementRequests& requests,
+    const RuntimeParameters& parameters, ::tarch::Span<const int> cells, bool castVotes=true
+  ) {
+    %(member)s.assess(mesh, solution, %(statuses)s, %(subcells)s, clock, requests, cells,
+      %(member)sDeviceCallbacks<Solver>{parameters}, castVotes);
+  }
+""" % {"member": member, "storage": storage, "transfer": transfer, "initial": initial,
+       "sampling": "true" if policy.sample_initial_data else "false", "statuses": statuses, "subcells": subcells}
+
+
+def _device_begin_step(adapter, member):
+    """Provide the device criterion with this step's mesh, clock and any DG transfer tables."""
+    tables = "nullptr, nullptr, nullptr" if adapter is _NativeFVAdapter else (
+        "_amrQuadratureNodes.data(), _amrRestriction.data(), _amrProlongation.data(),\n"
+        "  ::exahype2::amr::DeviceDGOperators{Quadrature<double>::QuadraturePoints1D,\n"
+        "    DGMatrices<double>::WeightedRestrictionMatrix1D, DGMatrices<double>::ProlongationMatrix1D}")
+    return """
+static_assert(not ::exahype2::terms::HasCellPredicate<::{{FULL_QUALIFIED_SOLVER_NAME}}>,
+  "The GPU AMR criterion requires a complete, uncoupled solver domain.");
+%(member)s.beginStep(cellConnectivity, getTimeStepping(), %(tables)s);
+""" % {"member": member, "tables": tables}
+
+
 def _install_policy(policy, solver, adapter, declarations, *, member, header, policy_attribute,
                     external_callback, additional_headers=()):
-    """Connect AMR to initialisation and completed-step callbacks."""
-    begin_step = adapter.begin_step()
+    """Attach the criterion to the solver for mesh initialisation and time stepping."""
+    device = policy.execution == "gpu"
+    if device and external_callback:
+        raise ValueError("execution='gpu' cannot use external_callback=True: the device backend owns the complete AMR assessment.")
+    if device and policy.sample_initial_data:
+        solver.pde_terms.set_device_callable("initial_condition")
+    begin_step = _device_begin_step(adapter, member) if device else adapter.begin_step()
+    if device:
+        header = "exahype2/amr/DeviceCriterion.h"
+        declarations += _device_callbacks(policy, solver, adapter, member)
     solver.add_includes(
         header,
         *additional_headers,
@@ -405,7 +533,7 @@ def _install_policy(policy, solver, adapter, declarations, *, member, header, po
     solver.add_declarations(declarations)
     counter, selected = member + "AcceptedSteps", member + "AssessThisStep"
     reset = "\n" + member + ".reset();\n"
-    refresh = _refresh_accepted_solution(member)
+    refresh = "" if device else _refresh_accepted_solution(member)
     assessment = refresh + "\nthis->assessRefinement(cellConnectivity, requests, parameters);\n" + member + ".finishStep();\n"
     if policy.assessment_interval > 1:
         solver.add_declarations("inline static unsigned long long " + counter + "=0;\n"
@@ -416,22 +544,25 @@ def _install_policy(policy, solver, adapter, declarations, *, member, header, po
         assessment = ("if(" + selected + "){\n" + refresh + "}\n"
                       "this->assessRefinement(cellConnectivity, requests, parameters, " + selected + ");\n"
                       "if(" + selected + ")" + member + ".finishStep();\n"
-                      # Count only steps with positive time advance.
                       "if(getTimeStepping().getTimeStepSizeOfLastStep()>0.)++" + counter + ";\n")
     solver.on_start_simulation(reset)
     samples = ", " + _runtime_callback(member, "InitialDataPasses", snapshot=True) if policy.sample_initial_data else ""
-    solver._refinement_initialisation_implementation = _with_parameter_snapshot(
-        "\n" + member + ".beginInitialisation(" + _runtime_callback(member, "Admissible", snapshot=True)
-        + samples + ");\n"
+    solver._refinement_initialisation_implementation = (
+        "\n" + member + ".beginInitialisation();\n" if device else _with_parameter_snapshot(
+            "\n" + member + ".beginInitialisation(" + _runtime_callback(member, "Admissible", snapshot=True)
+            + samples + ");\n"
+        )
     )
     solver.on_start_time_step(begin_step)
-    # Assess the accepted solution after all application finish hooks.
+    # User hooks can still change the solution that AMR will assess.
     solver._refinement_assessment_implementation = assessment
     solver.on_finish_simulation("\n" + member + ".reset();\n")
     solver.set_pde_terms(refinement_criterion=True if external_callback else (
+        "return ::exahype2::RefinementCommand::Keep;" if device else
         "return {{SOLVER_NAME}}Base::" + member + ".command(Q, x, h, t);"
     ))
-    solver.pde_terms.set_host_only("refinement_criterion")
+    if not device:
+        solver.pde_terms.set_host_only("refinement_criterion")
     setattr(solver, policy_attribute, policy)
     return solver
 
@@ -445,7 +576,7 @@ class Limiter(_AMRSettings):
     """
 
     def install(self, solver, *, external_callback=False):
-        """Attach AMR; set external_callback=True to keep an existing C++ callback."""
+        """Attach the criterion. For CPU assessment, external_callback=True keeps an existing C++ callback."""
         if not isinstance(external_callback, bool):
             raise TypeError("external_callback must be a boolean.")
         adapter = _solver_adapter(solver)
@@ -483,13 +614,15 @@ class Limiter(_AMRSettings):
         return _transfer_weights(solver)
 
     def _declarations(self, solver):
-        """Generate the C++ settings, weights and calls to the solver's PDE terms."""
+        """Give the C++ criterion the settings and physical checks for this limited solver."""
+        device = self.execution == "gpu"
+        method = "GPU_CALLABLE_METHOD static" if device else "static"
         scales = ", ".join(repr(value) for value in self.state_scales)
         modal_weights = ", ".join(repr(value) for value in self._highest_mode_weights(solver))
         lower, upper, amplification = self._transfer_weights(solver)
         declarations = """
   static constexpr bool DeferTimeStepRefinement = true;
-  static constexpr bool RefinementCriterionOnHost = true;
+  static constexpr bool RefinementCriterionOnHost = %(on_host)s;
   struct LimiterCriterionConfig final {
     // PatchSize is the limiter's number of subcells per axis.
     using LimiterAdapter = ::exahype2::amr::NativeSubcellLimiter<PatchSize>;
@@ -498,35 +631,33 @@ class Limiter(_AMRSettings):
     static constexpr bool UsePredictionCriterion = %(prediction)s;
     static constexpr double QuietTime = %(quiet)r;
     static constexpr double ReferenceTime = %(reference)r;
-    // Reuse quiet progress within the accepted step.
     static constexpr bool ReuseQuietProgress = %(reuse_quiet)s;
-    static double stateScale(int component) {
-      // Normalise stored fields for the AMR checks.
+    %(method)s double stateScale(int component) {
       constexpr double scales[%(values)d]{%(scales)s};
       return component >= 0 and component < %(values)d
         ? scales[component] : std::numeric_limits<double>::quiet_NaN();
     }
 %(observables)s
 %(resolution_components)s
-    static double highestModeWeight(int node) {
-      // Map nodal values to the highest-order Legendre coefficient.
+    %(method)s double highestModeWeight(int node) {
+      // Each weight gives one node's contribution to the highest Legendre coefficient.
       constexpr double weights[%(nodes)d]{%(modal_weights)s};
       return node >= 0 and node < %(nodes)d
         ? weights[node] : std::numeric_limits<double>::quiet_NaN();
     }
 %(taylor)s
     static constexpr double TransferAmplification = %(amplification)r;
-    // Bound the nodal-to-Bernstein transform weights.
-    static double transferWeightLower(int node, int mode) {
+    // Each pair of bounds encloses one weight of the nodal-to-Bernstein transform.
+    %(method)s double transferWeightLower(int node, int mode) {
       constexpr double weights[%(transfer_weights)d]{%(lower)s};
       return weights[node * %(nodes)d + mode];
     }
-    static double transferWeightUpper(int node, int mode) {
+    %(method)s double transferWeightUpper(int node, int mode) {
       constexpr double weights[%(transfer_weights)d]{%(upper)s};
       return weights[node * %(nodes)d + mode];
     }
   };
-  inline static ::exahype2::amr::Criterion<
+  inline static ::exahype2::amr::%(criterion)s<
     %(nodes)d, %(values)d, LimiterCriterionConfig, %(storage)s,
     ::exahype2::amr::HybridAcceptedSolutionAdapter<
       %(nodes)d, %(values)d, %(storage)s, LimiterCriterionConfig::LimiterAdapter
@@ -537,9 +668,9 @@ class Limiter(_AMRSettings):
   > _limiterCriterion{};
   static auto getAMRStatistics() { return _limiterCriterion.statistics(); }
 
-  // Convert stored values to the precision used by the wave-speed term.
+  // The quiet-time check uses the wave speed normal to a cell face.
   template <typename Solver = ::{{FULL_QUALIFIED_SOLVER_NAME}}>
-  static double _limiterCriterionWaveSpeed(
+  %(method)s double _limiterCriterionWaveSpeed(
     const %(storage)s* Q,
     const tarch::la::Vector<DIMENSIONS, double>& x,
     const tarch::la::Vector<DIMENSIONS, double>& h,
@@ -556,7 +687,7 @@ class Limiter(_AMRSettings):
     }
   }
   template <typename Solver = ::{{FULL_QUALIFIED_SOLVER_NAME}}>
-  static bool _limiterCriterionAdmissible(
+  %(method)s bool _limiterCriterionAdmissible(
     const %(storage)s* Q, int numberOfStates,
     const tarch::la::Vector<DIMENSIONS, double>& x,
     const tarch::la::Vector<DIMENSIONS, double>& h,
@@ -573,16 +704,19 @@ class Limiter(_AMRSettings):
     }
   }
   template <typename Solver = ::{{FULL_QUALIFIED_SOLVER_NAME}}>
-  static bool _limiterCriterionTransferAdmissible(
+  %(method)s bool _limiterCriterionTransferAdmissible(
     const %(storage)s* parent, const %(storage)s* const* children,
     const RuntimeParameters& parameters
   ) {
-    // Apply the configured maximum-principle check to the trial parent.
+    // The proposed parent's observables must stay within the children's bounds, up to the limiter tolerance.
     return ::exahype2::amr::parentRespectsMaximumPrinciple<Solver>(
       parent, children, %(dmp_relaxation)r, %(dmp_scaling)r, parameters
     );
   }
 """ % {
+            "method": method,
+            "on_host": "false" if device else "true",
+            "criterion": "DeviceCriterion" if device else "Criterion",
             "transfer": self.transfer_tolerance,
             "resolution": self.resolution_tolerance,
             "prediction": "true" if self.resolution_indicator == "prediction" else "false",
@@ -592,10 +726,10 @@ class Limiter(_AMRSettings):
             "values": solver.state.number_of_values,
             "nodes": solver.order + 1,
             "scales": scales,
-            "observables": "\n".join(_observable_declarations(self.linear_observables, solver.state.number_of_values)),
-            "resolution_components": "\n".join(_resolution_component_declarations(self.resolution_components)),
+            "observables": "\n".join(_observable_declarations(self.linear_observables, solver.state.number_of_values, method)),
+            "resolution_components": "\n".join(_resolution_component_declarations(self.resolution_components, method)),
             "modal_weights": modal_weights,
-            "taylor": "\n".join(_taylor_declarations(solver.order + 1, _taylor_weights(solver))),
+            "taylor": "\n".join(_taylor_declarations(solver.order + 1, _taylor_weights(solver), method)),
             "transfer_weights": len(lower),
             "lower": ", ".join(repr(value) for value in lower),
             "upper": ", ".join(repr(value) for value in upper),
@@ -606,39 +740,7 @@ class Limiter(_AMRSettings):
             "compute": solver.precision.compute,
         }
         if self.sample_initial_data:
-            declarations += """
-  template <typename Solver = ::{{FULL_QUALIFIED_SOLVER_NAME}}>
-  static void _limiterCriterionInitialCondition(
-    %(storage)s* Q,
-    const tarch::la::Vector<DIMENSIONS, double>& x,
-    const tarch::la::Vector<DIMENSIONS, double>& h,
-    const RuntimeParameters& parameters
-  ) {
-    static_assert(::exahype2::terms::HasInitialCondition<Solver, %(storage)s>);
-    static_assert(not ::exahype2::terms::InitialisesPatches<Solver>);
-    Solver::initialCondition(Q, x, h, parameters);
-  }
-  template <typename Solver = ::{{FULL_QUALIFIED_SOLVER_NAME}}>
-  static bool _limiterCriterionInitialDataPasses(
-    const %(storage)s* Q,
-    const tarch::la::Vector<DIMENSIONS, double>& x,
-    const tarch::la::Vector<DIMENSIONS, double>& h,
-    const RuntimeParameters& parameters
-  ) {
-    // Compare the coarse polynomial with initial data sampled on child cells.
-    return ::exahype2::amr::initialDataPasses<
-      %(nodes)d, %(values)d, LimiterCriterionConfig
-    >(
-      Q, x, h, _amrQuadratureNodes.data(), _amrProlongation.data(),
-      %(initial_condition)s, %(admissible)s,
-      ::exahype2::amr::observation_detail::InitialDataMonitor<
-        %(nodes)d, %(values)d, LimiterCriterionConfig, %(storage)s>{}
-    );
-  }
-""" % {"storage": solver.precision.storage, "nodes": solver.order + 1,
-       "values": solver.state.number_of_values,
-       "initial_condition": _runtime_callback("_limiterCriterion", "InitialCondition", "Solver"),
-       "admissible": _runtime_callback("_limiterCriterion", "Admissible", "Solver")}
+            declarations += _initial_data_declarations(solver, solver.order + 1, native=False, device=device, method=method)
         return _host_operator_declarations() + declarations
 
     @staticmethod
@@ -668,13 +770,12 @@ class _ADERDGAdapter:
 
     @staticmethod
     def begin_step():
-        """Bind the live DG/FV pools, limiter roles and solver transfer matrices."""
+        """Give CPU assessment access to the DG solution, limiter status and accepted FV subcells."""
         return _with_parameter_snapshot("""
 static_assert(
   not ::exahype2::terms::HasCellPredicate<::{{FULL_QUALIFIED_SOLVER_NAME}}>,
   "The independent limiter criterion requires a complete, uncoupled solver domain."
 );
-// Read the accepted solution and limiter status from the live solver pools.
 auto& criterionLimiter = const_cast<typename SolverFamily::LimiterType&>(getLimiter());
 _limiterCriterion.beginStep(
   cellConnectivity, this->downloadSolution().getView(), criterionLimiter.downloadStatuses().getView(), getTimeStepping(),
@@ -737,7 +838,7 @@ class Native(_AMRSettings):
         return adapter
 
     def install(self, solver, *, external_callback=False):
-        """Attach AMR; set external_callback=True to keep an existing C++ callback."""
+        """Attach the criterion. For CPU assessment, external_callback=True keeps an existing C++ callback."""
         if not isinstance(external_callback, bool):
             raise TypeError("external_callback must be a boolean.")
         adapter = self._validate_solver(solver)
@@ -749,13 +850,16 @@ class Native(_AMRSettings):
         )
 
     def _declarations(self, solver, adapter):
-        """Generate C++ settings, DG weights and optional PDE-term wrappers."""
+        """Give the C++ criterion this solver's field scales, tolerances and physical checks."""
+        device = self.execution == "gpu"
+        method = "GPU_CALLABLE_METHOD static" if device else "static"
+        criterion = "DeviceCriterion" if device else "Criterion"
         count = adapter.count(solver)
         values = solver.state.number_of_values
         storage, compute = solver.precision.storage, solver.precision.compute
         lines = [
             "\n  static constexpr bool DeferTimeStepRefinement = true;",
-            "  static constexpr bool RefinementCriterionOnHost = true;",
+            "  static constexpr bool RefinementCriterionOnHost = {};".format("false" if device else "true"),
             "  struct NativeCriterionConfig final {",
             "    static constexpr bool ReuseQuietProgress = true;",
             "    static constexpr bool IsFiniteVolume = {};".format("true" if adapter is _NativeFVAdapter else "false"),
@@ -765,40 +869,41 @@ class Native(_AMRSettings):
                 "true" if self.resolution_indicator == "prediction" else "false"),
             "    static constexpr double QuietTime = {!r};".format(self.quiet_time),
             "    static constexpr double ReferenceTime = {!r};".format(self.reference_time),
-            "    static double stateScale(int component) {",
+            "    " + method + " double stateScale(int component) {",
             "      constexpr double scales[{}]{{{}}};".format(values, ", ".join(repr(x) for x in self.state_scales)),
             "      return component >= 0 and component < {} ? scales[component] : std::numeric_limits<double>::quiet_NaN();".format(values),
             "    }",
         ]
-        lines += _observable_declarations(self.linear_observables, values)
-        lines += _resolution_component_declarations(self.resolution_components)
+        lines += _observable_declarations(self.linear_observables, values, method)
+        lines += _resolution_component_declarations(self.resolution_components, method)
         if adapter is _NativeDGAdapter:
             layout = _NativeDGLayout(solver)
             weights = _highest_mode_weights(layout)
             lower, upper, amplification = _transfer_weights(layout)
             lines += [
-                "    static double highestModeWeight(int node) {",
+                "    " + method + " double highestModeWeight(int node) {",
                 "      constexpr double weights[{}]{{{}}};".format(count, ", ".join(repr(x) for x in weights)),
                 "      return node >= 0 and node < {} ? weights[node] : std::numeric_limits<double>::quiet_NaN();".format(count),
                 "    }",
                 "    static constexpr double TransferAmplification = {!r};".format(amplification),
             ]
-            lines += _taylor_declarations(count, _taylor_weights(layout))
+            lines += _taylor_declarations(count, _taylor_weights(layout), method)
             for name, table in (("Lower", lower), ("Upper", upper)):
                 lines += [
-                    "    static double transferWeight{}(int node, int mode) {{".format(name),
+                    "    {} double transferWeight{}(int node, int mode) {{".format(method, name),
                     "      constexpr double weights[{}]{{{}}};".format(len(table), ", ".join(repr(x) for x in table)),
                     "      return weights[node * {} + mode];".format(count),
                     "    }",
                 ]
         lines += [
             "  };",
-            "  inline static ::exahype2::amr::Criterion<{}, {}, NativeCriterionConfig, {}> _nativeCriterion{{}};".format(count, values, storage),
+            "  inline static ::exahype2::amr::{}<{}, {}, NativeCriterionConfig, {}> _nativeCriterion{{}};".format(
+                criterion, count, values, storage),
             "  static auto getAMRStatistics() { return _nativeCriterion.statistics(); }",
         ]
         declarations = "\n".join(lines) + "\n" + """
   template <typename Solver = ::{{FULL_QUALIFIED_SOLVER_NAME}}>
-  static double _nativeCriterionWaveSpeed(
+  %(method)s double _nativeCriterionWaveSpeed(
     const %(storage)s* Q,
     const tarch::la::Vector<DIMENSIONS, double>& x,
     const tarch::la::Vector<DIMENSIONS, double>& h,
@@ -815,7 +920,7 @@ class Native(_AMRSettings):
     }
   }
   template <typename Solver = ::{{FULL_QUALIFIED_SOLVER_NAME}}>
-  static bool _nativeCriterionAdmissible(
+  %(method)s bool _nativeCriterionAdmissible(
     const %(storage)s* Q, int numberOfStates,
     const tarch::la::Vector<DIMENSIONS, double>& x,
     const tarch::la::Vector<DIMENSIONS, double>& h,
@@ -827,37 +932,9 @@ class Native(_AMRSettings):
       return true;
     }
   }
-""" % {"storage": storage, "compute": compute, "values": values}
+""" % {"method": method, "storage": storage, "compute": compute, "values": values}
         if self.sample_initial_data:
-            declarations += """
-  template <typename Solver = ::{{FULL_QUALIFIED_SOLVER_NAME}}>
-  static void _nativeCriterionInitialCondition(
-    %(storage)s* Q,
-    const tarch::la::Vector<DIMENSIONS, double>& x,
-    const tarch::la::Vector<DIMENSIONS, double>& h,
-    const RuntimeParameters& parameters
-  ) {
-    static_assert(::exahype2::terms::HasInitialCondition<Solver, %(storage)s>);
-    static_assert(not ::exahype2::terms::InitialisesPatches<Solver>);
-    Solver::initialCondition(Q, x, h, parameters);
-  }
-  template <typename Solver = ::{{FULL_QUALIFIED_SOLVER_NAME}}>
-  static bool _nativeCriterionInitialDataPasses(
-    const %(storage)s* Q,
-    const tarch::la::Vector<DIMENSIONS, double>& x,
-    const tarch::la::Vector<DIMENSIONS, double>& h,
-    const RuntimeParameters& parameters
-  ) {
-    return ::exahype2::amr::nativeInitialDataPasses<%(count)d, %(values)d, NativeCriterionConfig>(
-      Q, x, h, _amrQuadratureNodes.data(), _amrProlongation.data(),
-      %(initial_condition)s, %(admissible)s,
-      ::exahype2::amr::observation_detail::InitialDataMonitor<
-        %(count)d, %(values)d, NativeCriterionConfig, %(storage)s>{}
-    );
-  }
-""" % {"storage": storage, "count": count, "values": values,
-       "initial_condition": _runtime_callback("_nativeCriterion", "InitialCondition", "Solver"),
-       "admissible": _runtime_callback("_nativeCriterion", "Admissible", "Solver")}
+            declarations += _initial_data_declarations(solver, count, native=True, device=device, method=method)
         if adapter is _NativeDGAdapter:
             declarations = _host_operator_declarations() + declarations
         return declarations

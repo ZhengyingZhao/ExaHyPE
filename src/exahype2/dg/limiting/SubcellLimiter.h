@@ -87,6 +87,10 @@ public:
   INLINE_METHOD void readValuesFromGlobalReduction(const tarch::mpi::ReductionRecord& record);
 
   [[nodiscard]] INLINE_METHOD tarch::accelerator::ChunkedMemoryPool<int>::View getStatuses();
+  /** Which cells use the DG solution and which need the limiter's finite-volume solution. */
+  [[nodiscard]] INLINE_METHOD typename StatusPool::ConstView getStatuses() const;
+  /** Finite-volume subcell values in solver memory for cells handled by the limiter. */
+  [[nodiscard]] INLINE_METHOD typename CellPool::ConstView getSubcells() const;
   [[nodiscard]] INLINE_METHOD const StatusPool& downloadStatuses();
   [[nodiscard]] INLINE_METHOD const CellPool& downloadSubcells();
   [[nodiscard]] INLINE_METHOD int getNumberOfTroubledCells() const;

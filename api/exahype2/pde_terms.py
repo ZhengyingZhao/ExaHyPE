@@ -524,6 +524,10 @@ class PDETerms:
         """Keep a term's declaration and definition out of device compilation."""
         self._table[name] = replace(self._table[name], gpu=False)
 
+    def set_device_callable(self, name):
+        """Mark the named PDE term so generated GPU kernels can call it."""
+        self._table[name] = replace(self._table[name], gpu=True)
+
     def is_set(self, name):
         return name in self._values
 
