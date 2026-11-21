@@ -109,50 +109,57 @@ namespace exahype2::amr::prediction_detail {
     return minmod(difference(volume, volume - stride), difference(volume + stride, volume));
   }
 
-  TARGET_DECLARE_END
-
-  /**
-   * Cache slopes and centred means for one immutable FV view within a sensor call.
-   * All means use the same state reference.
-   */
+  /** Slopes and centred means for one FV patch, filled as the sensor requests them. */
   template <int V, typename C, typename P>
-  class FVDataCache {
+  struct CachedFVData {
     struct Entry {
       std::array<double, DIMENSIONS> slopes{};
       double mean = 0.0;
       unsigned int knownSlopes = 0;
       bool knownMean = false;
     };
-    AcceptedCellView<P> _view;
-    std::array<double, V> _reference{};
-    std::vector<Entry> _entries;
+    AcceptedCellView<P> view;
+    const std::array<double, V>& reference;
+    Entry* entries;
 
-  public:
-    // Callers validate the view with finitePatch before creating a cache.
-    explicit FVDataCache(AcceptedCellView<P> view, const std::array<double, V>& reference = {}) :
-      _view(view), _reference(reference),
-      _entries(view.isFiniteVolume() ? static_cast<std::size_t>(view.numberOfStates()) * V : 0) {}
-
-    double slope(int volume, int axis, int component) {
-      auto& entry = _entries[static_cast<std::size_t>(volume) * V + component];
+    GPU_CALLABLE_METHOD double slope(int volume, int axis, int component) const {
+      auto& entry = entries[static_cast<std::size_t>(volume) * V + component];
       const unsigned int bit = 1u << axis;
       if ((entry.knownSlopes & bit) == 0) {
-        entry.slopes[axis] = fvSlope<V, C>(_view, volume, axis, component);
+        entry.slopes[axis] = fvSlope<V, C>(view, volume, axis, component);
         entry.knownSlopes |= bit;
       }
       return entry.slopes[axis];
     }
 
-    double mean(int volume, int component) {
-      auto& entry = _entries[static_cast<std::size_t>(volume) * V + component];
+    GPU_CALLABLE_METHOD double mean(int volume, int component) const {
+      auto& entry = entries[static_cast<std::size_t>(volume) * V + component];
       if (not entry.knownMean) {
         entry.mean = resolutionDifference<C>(
-          static_cast<double>(_view.values[volume * V + component]),
-          _reference[component], component);
+          static_cast<double>(view.values[volume * V + component]),
+          reference[component], component);
         entry.knownMean = true;
       }
       return entry.mean;
     }
+  };
+
+  TARGET_DECLARE_END
+
+  /** Owns the cached entries for one FV patch on the host. */
+  template <int V, typename C, typename P>
+  class FVDataCache {
+    using View = CachedFVData<V, C, P>;
+    AcceptedCellView<P> _view;
+    std::array<double, V> _reference;
+    std::vector<typename View::Entry> _entries;
+
+  public:
+    explicit FVDataCache(AcceptedCellView<P> view, const std::array<double, V>& reference = {}) :
+      _view(view), _reference(reference),
+      _entries(view.isFiniteVolume() ? static_cast<std::size_t>(view.numberOfStates()) * V : 0) {}
+
+    View getView() { return {_view, _reference, _entries.data()}; }
   };
 
   /** Estimate the variation a patch's FV averages miss, both within a volume and across its faces.
@@ -169,7 +176,8 @@ namespace exahype2::amr::prediction_detail {
     int volumes = 0;
     if (not resolution_detail::finitePatch<V, C>(view.values, view.pointsPerAxis, volumes))
       return std::numeric_limits<double>::infinity();
-    FVDataCache<V, C, P> data(view);
+    FVDataCache<V, C, P> cache(view);
+    const auto data = cache.getView();
     double result = 0.0;
     std::vector<double> representationTerms;
     representationTerms.reserve(static_cast<std::size_t>(volumes) * V * DIMENSIONS);
@@ -646,7 +654,7 @@ namespace exahype2::amr::prediction_detail {
   template <int V, typename FVData>
   GPU_CALLABLE_METHOD bool reconstructFVProfile(
     int count, int normal, const std::array<double, DIMENSIONS>& point,
-    FVData& data, std::span<double> values, int first
+    const FVData& data, std::span<double> values, int first
   ) {
     int tangential = 0, stride = 1;
     std::array<int, DIMENSIONS> index{};
@@ -677,8 +685,8 @@ namespace exahype2::amr::prediction_detail {
 
   template <int V, typename C, typename P>
   bool fvProfile(AcceptedCellView<P> view, int normal, const std::array<double, DIMENSIONS>& point,
-                 FVDataCache<V, C, P>& data, std::span<double> values, int first) {
-    return reconstructFVProfile<V>(view.pointsPerAxis, normal, point, data, values, first);
+                 FVDataCache<V, C, P>& cache, std::span<double> values, int first) {
+    return reconstructFVProfile<V>(view.pointsPerAxis, normal, point, cache.getView(), values, first);
   }
 
   template <int V, typename C, typename P>

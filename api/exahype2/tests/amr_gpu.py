@@ -43,7 +43,7 @@ def solver_for(family):
 
 class AMRGPUGenerationTest(unittest.TestCase):
     def render(self, family, *, external_callback=False, interval=1, sampling=False, install=True,
-               execution="cpu", external_initial=False):
+               execution="cpu", external_initial=False, **amr_options):
         """Return the solver and its generated C++ files for a CUDA project."""
         solver = solver_for(family)
         if external_initial:
@@ -52,7 +52,7 @@ class AMRGPUGenerationTest(unittest.TestCase):
         policy = exahype2.amr.AMR(
             state_scales=(1.0, 1.0), assessment_interval=interval,
             sample_initial_data=sampling,
-            execution=execution,
+            execution=execution, **amr_options,
         )
         if install:
             policy.install(solver, external_callback=external_callback)
@@ -84,6 +84,17 @@ class AMRGPUGenerationTest(unittest.TestCase):
                 for name in ("AMRGPU.h", "AMRGPU.cpph"):
                     for block in re.findall(r"TARGET_DECLARE\b(.*?)TARGET_DECLARE_END", files[name], re.S):
                         self.assertNotIn("refinementCriterion", block)
+
+    def test_host_criterion_config_can_be_used_by_cuda_sensor_templates(self):
+        observation = exahype2.amr.LinearObservable(weights=(1.0, -1.0), absolute_tolerance=0.01)
+        for family in ("ader", "limited"):
+            with self.subTest(family=family):
+                _, files = self.render(family, linear_observables=(observation,), resolution_components=(1,))
+                for method in ("double stateScale", "double highestModeWeight", "double taylorWeight",
+                               "double transferWeightLower", "double transferWeightUpper", "double observableWeight",
+                               "double observableAbsoluteTolerance", "double observableRelativeTolerance",
+                               "bool resolutionComponent"):
+                    self.assertIn("GPU_CALLABLE_METHOD static " + method + "(", files["AMRGPUBase.h"])
 
     def test_assessment_runs_after_both_application_finish_hooks(self):
         for family in ("fv", "ader", "rk", "limited"):

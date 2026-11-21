@@ -395,40 +395,24 @@ namespace exahype2::amr::detail::transfer_bound {
     return out;
   }
   /** Bisect all axes until every box passes or the round limit is reached. */
-  template <int N, int V, int D, int Rounds>
+  template <int N, int V, int D, int Remaining>
   GPU_CALLABLE_METHOD bool refinedHullPasses(const Field<N, V, D> &q, double budget, const std::array<int, D> &order) {
-    static_assert(Rounds >= 0);
-    // Device kernels cannot recurse. Each depth keeps its box and the next of its half boxes to visit.
-    Field<N, V, D> boxes[Rounds + 1];
-    int next[Rounds + 1];
-    int depth = 0;
-    boxes[0] = q;
-    next[0] = -1;
-    while (depth >= 0) {
-      if (next[depth] < 0) {
-        if (hullPasses<N, V, D>(boxes[depth], budget)) {
-          depth--;
-          continue;
+    if (hullPasses<N, V, D>(q, budget)) {
+      return true;
+    }
+    if constexpr (Remaining > 0) {
+      for (int box = 0; box < (1 << D); box++) {
+        auto subbox = q;
+        for (int axis : order) {
+          subbox = half<N, V, D>(subbox, axis, (box & (1 << axis)) != 0);
         }
-        // One unresolved box at the last round leaves the whole bound unproved.
-        if (depth == Rounds) {
+        if (!refinedHullPasses<N, V, D, Remaining - 1>(subbox, budget, order)) {
           return false;
         }
-        next[depth] = 0;
       }
-      if (next[depth] == (1 << D)) {
-        depth--;
-        continue;
-      }
-      const int box = next[depth]++;
-      boxes[depth + 1] = boxes[depth];
-      for (int axis : order) {
-        boxes[depth + 1] = half<N, V, D>(boxes[depth + 1], axis, (box & (1 << axis)) != 0);
-      }
-      next[depth + 1] = -1;
-      depth++;
+      return true;
     }
-    return true;
+    return false;
   }
   // Detect points whose norm lower bound exceeds the budget.
   template <int V> GPU_CALLABLE_METHOD bool pointAbove(const std::array<Interval, V> &point, double budget) {
@@ -693,26 +677,19 @@ namespace exahype2::amr::detail::transfer_bound {
       for (int a : order) {
         coefficients = contract<N, V, D>(coefficients, matrix, a);
       }
-      if (hullPasses<N, V, D>(coefficients, budget)) {
+      // For constant and multilinear fields every control vector is a corner.
+      // Bisection preserves those corners, so a failing hull cannot improve.
+      constexpr int UniformRounds = N <= 2 ? 0 : 3;
+      const bool proved = split ? refinedHullPasses<N, V, D, UniformRounds>(coefficients, budget, order)
+                                : hullPasses<N, V, D>(coefficients, budget);
+      if (proved) {
         return true;
-      }
-      if (split) {
-        // Try up to three rounds of uniform bisection before adaptive subdivision.
-        bool all = true;
-        for (int box = 0; box < (1 << D) && all; box++) {
-          auto subbox = coefficients;
-          for (int a : order) {
-            subbox = half<N, V, D>(subbox, a, (box & (1 << a)) != 0);
-          }
-          all = refinedHullPasses<N, V, D, 2>(subbox, budget, order);
-        }
-        if (all) {
-          return true;
-        }
       }
     } while (nextPermutation(order.begin(), order.end()));
     // Refine unresolved hulls and reject over-budget point witnesses.
-    if (split) {
+    if constexpr (N <= 2) {
+      return false;
+    } else if (split) {
       for (int a = 0; a < D; a++) {
         order[a] = a;
       }

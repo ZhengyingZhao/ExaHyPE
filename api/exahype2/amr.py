@@ -65,7 +65,7 @@ class LinearObservable:
         object.__setattr__(self, "relative_tolerance", relative)
 
 
-def _observable_declarations(observables, values, method):
+def _observable_declarations(observables, values):
     """Give the C++ criterion the weights and error tolerances for each observable."""
     count = len(observables)
     lines = ["    static constexpr int NumberOfObservables = {};".format(count)]
@@ -73,7 +73,7 @@ def _observable_declarations(observables, values, method):
         return lines
     weights = ", ".join(repr(x) for observation in observables for x in observation.weights)
     lines += [
-        "    " + method + " double observableWeight(int observable, int component) {",
+        "    GPU_CALLABLE_METHOD static double observableWeight(int observable, int component) {",
         "      constexpr double weights[{}]{{{}}};".format(count * values, weights),
         "      return observable >= 0 and observable < {} and component >= 0 and component < {}".format(count, values),
         "        ? weights[observable * {} + component] : std::numeric_limits<double>::quiet_NaN();".format(values),
@@ -81,7 +81,7 @@ def _observable_declarations(observables, values, method):
     ]
     for tolerance, field in (("Absolute", "absolute_tolerance"), ("Relative", "relative_tolerance")):
         lines += [
-            "    {} double observable{}Tolerance(int observable) {{".format(method, tolerance),
+            "    GPU_CALLABLE_METHOD static double observable{}Tolerance(int observable) {{".format(tolerance),
             "      constexpr double tolerances[{}]{{{}}};".format(
                 count, ", ".join(repr(getattr(observation, field)) for observation in observables)),
             "      return observable >= 0 and observable < {} ? tolerances[observable] : std::numeric_limits<double>::quiet_NaN();".format(count),
@@ -90,11 +90,11 @@ def _observable_declarations(observables, values, method):
     return lines
 
 
-def _resolution_component_declarations(components, method):
+def _resolution_component_declarations(components):
     """Tell the prediction check which fields to measure. The default uses every field."""
     if components is None:
         return []
-    return ["    " + method + " bool resolutionComponent(int component) {",
+    return ["    GPU_CALLABLE_METHOD static bool resolutionComponent(int component) {",
             "      return " + " or ".join("component == {}".format(c) for c in components) + ";",
             "    }"]
 
@@ -172,10 +172,10 @@ def _taylor_weights(solver):
     return tuple(left + right)
 
 
-def _taylor_declarations(count, weights, method):
+def _taylor_declarations(count, weights):
     """Give the criterion the weights for evaluating DG Taylor coefficients at a face."""
     return [
-        "    " + method + " double taylorWeight(int side, int order, int node) {",
+        "    GPU_CALLABLE_METHOD static double taylorWeight(int side, int order, int node) {",
         "      constexpr double weights[{}]{{{}}};".format(len(weights), ", ".join(repr(x) for x in weights)),
         "      return side >= 0 and side < 2 and order >= 0 and order < {0} and node >= 0 and node < {0}".format(count),
         "        ? weights[(side * {0} + order) * {0} + node] : std::numeric_limits<double>::quiet_NaN();".format(count),
@@ -714,14 +714,14 @@ class Limiter(_AMRSettings):
     static constexpr double QuietTime = %(quiet)r;
     static constexpr double ReferenceTime = %(reference)r;
     static constexpr bool ReuseQuietProgress = %(reuse_quiet)s;
-    %(method)s double stateScale(int component) {
+    GPU_CALLABLE_METHOD static double stateScale(int component) {
       constexpr double scales[%(values)d]{%(scales)s};
       return component >= 0 and component < %(values)d
         ? scales[component] : std::numeric_limits<double>::quiet_NaN();
     }
 %(observables)s
 %(resolution_components)s
-    %(method)s double highestModeWeight(int node) {
+    GPU_CALLABLE_METHOD static double highestModeWeight(int node) {
       // Each weight gives one node's contribution to the highest Legendre coefficient.
       constexpr double weights[%(nodes)d]{%(modal_weights)s};
       return node >= 0 and node < %(nodes)d
@@ -730,11 +730,11 @@ class Limiter(_AMRSettings):
 %(taylor)s
     static constexpr double TransferAmplification = %(amplification)r;
     // Each pair of bounds encloses one weight of the nodal-to-Bernstein transform.
-    %(method)s double transferWeightLower(int node, int mode) {
+    GPU_CALLABLE_METHOD static double transferWeightLower(int node, int mode) {
       constexpr double weights[%(transfer_weights)d]{%(lower)s};
       return weights[node * %(nodes)d + mode];
     }
-    %(method)s double transferWeightUpper(int node, int mode) {
+    GPU_CALLABLE_METHOD static double transferWeightUpper(int node, int mode) {
       constexpr double weights[%(transfer_weights)d]{%(upper)s};
       return weights[node * %(nodes)d + mode];
     }
@@ -808,10 +808,10 @@ class Limiter(_AMRSettings):
             "values": solver.state.number_of_values,
             "nodes": solver.order + 1,
             "scales": scales,
-            "observables": "\n".join(_observable_declarations(self.linear_observables, solver.state.number_of_values, method)),
-            "resolution_components": "\n".join(_resolution_component_declarations(self.resolution_components, method)),
+            "observables": "\n".join(_observable_declarations(self.linear_observables, solver.state.number_of_values)),
+            "resolution_components": "\n".join(_resolution_component_declarations(self.resolution_components)),
             "modal_weights": modal_weights,
-            "taylor": "\n".join(_taylor_declarations(solver.order + 1, _taylor_weights(solver), method)),
+            "taylor": "\n".join(_taylor_declarations(solver.order + 1, _taylor_weights(solver))),
             "transfer_weights": len(lower),
             "lower": ", ".join(repr(value) for value in lower),
             "upper": ", ".join(repr(value) for value in upper),
@@ -954,28 +954,28 @@ class Native(_AMRSettings):
                 "true" if self.resolution_indicator == "prediction" else "false"),
             "    static constexpr double QuietTime = {!r};".format(self.quiet_time),
             "    static constexpr double ReferenceTime = {!r};".format(self.reference_time),
-            "    " + method + " double stateScale(int component) {",
+            "    GPU_CALLABLE_METHOD static double stateScale(int component) {",
             "      constexpr double scales[{}]{{{}}};".format(values, ", ".join(repr(x) for x in self.state_scales)),
             "      return component >= 0 and component < {} ? scales[component] : std::numeric_limits<double>::quiet_NaN();".format(values),
             "    }",
         ]
-        lines += _observable_declarations(self.linear_observables, values, method)
-        lines += _resolution_component_declarations(self.resolution_components, method)
+        lines += _observable_declarations(self.linear_observables, values)
+        lines += _resolution_component_declarations(self.resolution_components)
         if adapter is _NativeDGAdapter:
             layout = _NativeDGLayout(solver)
             weights = _highest_mode_weights(layout)
             lower, upper, amplification = _transfer_weights(layout)
             lines += [
-                "    " + method + " double highestModeWeight(int node) {",
+                "    GPU_CALLABLE_METHOD static double highestModeWeight(int node) {",
                 "      constexpr double weights[{}]{{{}}};".format(count, ", ".join(repr(x) for x in weights)),
                 "      return node >= 0 and node < {} ? weights[node] : std::numeric_limits<double>::quiet_NaN();".format(count),
                 "    }",
                 "    static constexpr double TransferAmplification = {!r};".format(amplification),
             ]
-            lines += _taylor_declarations(count, _taylor_weights(layout), method)
+            lines += _taylor_declarations(count, _taylor_weights(layout))
             for name, table in (("Lower", lower), ("Upper", upper)):
                 lines += [
-                    "    {} double transferWeight{}(int node, int mode) {{".format(method, name),
+                    "    GPU_CALLABLE_METHOD static double transferWeight{}(int node, int mode) {{".format(name),
                     "      constexpr double weights[{}]{{{}}};".format(len(table), ", ".join(repr(x) for x in table)),
                     "      return weights[node * {} + mode];".format(count),
                     "    }",

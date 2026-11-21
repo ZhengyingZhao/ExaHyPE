@@ -559,7 +559,7 @@ UNIT_TEST("AMR magnitude bounds never accept a transfer that the interval certif
 }
 
 namespace {
-  /** The recursive definition of the bisection that the certificate now evaluates with a fixed stack. */
+  /** The run-time recursion that the certificate replaces by one instantiation per round. */
   template <int N, int V, int D>
   bool passesRecursiveHullRefinement(
     const bound::Field<N, V, D>& box, double budget, const std::array<int, D>& order, int remaining
