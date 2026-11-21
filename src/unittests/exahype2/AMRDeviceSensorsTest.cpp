@@ -352,20 +352,21 @@ namespace {
   /** Fields of both scales measured in units of one and of two. */
   struct ProfileConfig {
     static constexpr double TransferTolerance = 1.0e-3;
-    static double           stateScale(int component) { return component == 0 ? 1.0 : 2.0; }
+    // The sensor and certificate templates that read this configuration are device callable.
+    static GPU_CALLABLE_METHOD double stateScale(int component) { return component == 0 ? 1.0 : 2.0; }
     // The Lagrange polynomials of the two Gauss nodes at both ends of the unit interval, enclosed by four ulps.
-    static double transferWeight(int node, int mode) {
+    static GPU_CALLABLE_METHOD double transferWeight(int node, int mode) {
       constexpr double weights[4]{1.3660254037844386, -0.36602540378443865, -0.36602540378443865, 1.3660254037844386};
       return weights[node * 2 + mode];
     }
-    static double transferWeightLower(int node, int mode) {
+    static GPU_CALLABLE_METHOD double transferWeightLower(int node, int mode) {
       double weight = transferWeight(node, mode);
-      for (int step = 0; step < 4; ++step) weight = std::nextafter(weight, -std::numeric_limits<double>::infinity());
+      for (int step = 0; step < 4; ++step) weight = bound::down(weight);
       return weight;
     }
-    static double transferWeightUpper(int node, int mode) {
+    static GPU_CALLABLE_METHOD double transferWeightUpper(int node, int mode) {
       double weight = transferWeight(node, mode);
-      for (int step = 0; step < 4; ++step) weight = std::nextafter(weight, std::numeric_limits<double>::infinity());
+      for (int step = 0; step < 4; ++step) weight = bound::up(weight);
       return weight;
     }
   };
