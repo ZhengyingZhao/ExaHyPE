@@ -534,14 +534,20 @@ def _install_policy(policy, solver, adapter, declarations, *, member, header, po
     counter, selected = member + "AcceptedSteps", member + "AssessThisStep"
     reset = "\n" + member + ".reset();\n"
     refresh = "" if device else _refresh_accepted_solution(member)
-    assessment = refresh + "\nthis->assessRefinement(cellConnectivity, requests, parameters);\n" + member + ".finishStep();\n"
+    # The host votes share cell and family evidence. Evaluating it in parallel stages first keeps the votes
+    # from waiting on each other. A device solution only reaches the host inside assessRefinement(), so those
+    # builds evaluate the evidence within the votes.
+    stages = "" if device else (
+        "if (this->getSolution().isHostAccessible()) " + member + ".assess(getTimeStepping().getTimeStamp());\n")
+    assessment = (refresh + "\n" + stages + "this->assessRefinement(cellConnectivity, requests, parameters);\n"
+                  + member + ".finishStep();\n")
     if policy.assessment_interval > 1:
         solver.add_declarations("inline static unsigned long long " + counter + "=0;\n"
                                 "inline static bool " + selected + "=true;\n")
         reset += counter + "=0;" + selected + "=true;\n"
         begin_step = (selected + "=(" + counter + " % " + str(policy.assessment_interval) + " == 0);\n"
                       "if(" + selected + "){\n" + begin_step + "\n}\n")
-        assessment = ("if(" + selected + "){\n" + refresh + "}\n"
+        assessment = ("if(" + selected + "){\n" + refresh + stages + "}\n"
                       "this->assessRefinement(cellConnectivity, requests, parameters, " + selected + ");\n"
                       "if(" + selected + ")" + member + ".finishStep();\n"
                       "if(getTimeStepping().getTimeStepSizeOfLastStep()>0.)++" + counter + ";\n")

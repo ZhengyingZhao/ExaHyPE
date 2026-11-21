@@ -156,6 +156,12 @@ namespace exahype2::amr {
   /** Reuse face indices while connectivity matches, including periodic and mixed-level neighbours. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   void AMRCore<N, V, C, P, A, T, E, S>::bindAcceptedFaces(const peano4::CellConnectivity& mesh) {
+    if (_stencilsBound) {
+      // The same leaves keep their neighbours, so only the face scores of the last step expire.
+      for (std::size_t face = 0; face < _acceptedFaceCount; face++)
+        _acceptedFaces[face].state.store(0, std::memory_order_relaxed);
+      return;
+    }
     bool changed = _nativeStencils.size() != _cells.size();
     _nativeStencils.resize(_cells.size());
     std::vector<NativeFace> faces;
@@ -194,6 +200,7 @@ namespace exahype2::amr {
     }
     for (std::size_t face = 0; face < _acceptedFaceCount; face++)
       _acceptedFaces[face].state.store(0, std::memory_order_relaxed);
+    _stencilsBound = true;
   }
 
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
@@ -322,8 +329,10 @@ namespace exahype2::amr {
         sameTopology = cell.key[axis + 1] == lattice(axis);
       }
     }
+    _topologyChanged = not sameTopology;
     if (not sameTopology) {
       _topologyCached = false;
+      _stencilsBound = false;
       _cells.assign(mesh.getNumberOfSlots(), Cell{});
       _leaves.assign(leaves.begin(), leaves.end());
       _families.clear();
@@ -407,15 +416,19 @@ namespace exahype2::amr {
     }
     if constexpr (S::CheckNeighbours and cacheAcceptedFaces() and not std::is_null_pointer_v<SolutionView>)
       bindAcceptedFaces(mesh);
+    else _stencilsBound = false;
     if (_families.size() > _familyVoteCapacity) {
       _familyVotes = std::make_unique<std::atomic<int>[]>(_families.size());
       _familyPlans = std::make_unique<FamilyPlan[]>(_families.size());
+      _familyRequests = std::make_unique<std::atomic<bool>[]>(_families.size());
       _familyVoteCapacity = _families.size();
     }
     for (std::size_t i = 0; i < _families.size(); i++) {
       _familyVotes[i].store(0, std::memory_order_relaxed);
       _familyPlans[i].state.store(0, std::memory_order_relaxed);
+      _familyRequests[i].store(false, std::memory_order_relaxed);
     }
+    _assessed = false;
     _active = validStartTime;
   }
 
@@ -574,10 +587,22 @@ namespace exahype2::amr {
       // Deduplicate directed face checks by accepted slot or proposed family.
       // Slot -1 identifies the parent's periodic self-neighbour.
       std::set<std::array<int, 3>> checked;
+      const int ownFamily = static_cast<int>(&family - _families.data());
+      // The stencils bound for this step list the same neighbours as the mesh, in the same order.
+      const auto visitNeighbours = [&](int childSlot, auto&& visit) {
+        if constexpr (cacheAcceptedFaces()) {
+          if (_stencilsBound) {
+            const auto& stencil = _nativeStencils[childSlot];
+            for (const auto& face : stencil.faces) visit(face.slot, face.normal, face.side);
+            return stencil.complete;
+          }
+        }
+        return forEachNativeNeighbour(*_mesh, childSlot, visit);
+      };
       for (const int childSlot : family.slots) {
-        const bool complete = forEachNativeNeighbour(*_mesh, childSlot, [&](int slot, int normal, int ownSide) {
+        const bool complete = visitNeighbours(childSlot, [&](int slot, int normal, int ownSide) {
           if (not passes) return;
-          if (std::find(family.slots.begin(), family.slots.end(), slot) != family.slots.end()) {
+          if (slot >= 0 and slot < static_cast<int>(_cells.size()) and _cells[slot].family == ownFamily) {
             const int position = _cells[childSlot].key[normal + 1] % peano4::SubdivisionFactor;
             const bool exterior = ownSide == 0 ? position == 0 : position == peano4::SubdivisionFactor - 1;
             // Compare both sides of the parent when coarsening closes a periodic seam.
@@ -707,11 +732,15 @@ namespace exahype2::amr {
         }
         if (not amr_detail::transfer_bound::normPasses<V>(residuals, C::TransferTolerance)) return false;
       }
-      if (not T::polynomialPasses(children[child], restored)) return false;
+      // DG bounds the loss against the retained parent polynomial below.
+      if constexpr (T::IsFiniteVolume) {
+        if (not T::polynomialPasses(children[child], restored)) return false;
+      }
       if constexpr (observation_detail::count<C>() > 0)
         if (not observedTransfer.template transferPasses<N>(children[child], restored, T::IsFiniteVolume)) return false;
       if constexpr (not T::IsFiniteVolume) {
-        // Bound loss against the retained parent polynomial as well as the numerical prolongation.
+        // The nodal check above compares with the solver's prolongation. Between the nodes, the loss is
+        // bounded against the parent polynomial that coarsening retains.
         std::array<double, V> scales;
         for (int component = 0; component < V; component++) {
           scales[component] = C::stateScale(component);
@@ -721,8 +750,15 @@ namespace exahype2::amr {
           if (not preparedParent.prepare(parent, _retainedParentGeometry, scales)) return false;
           parentPrepared = true;
         }
-        if (not preparedParent.residual(children[child], child, residual)
-            or not amr_detail::transferPolynomialIntervalsPasses<N, V, C>(residual)) return false;
+        bool certified = false;
+        if constexpr (observation_detail::count<C>() == 0) {
+          // A residual far below the tolerance passes on magnitude bounds, without interval evaluation.
+          std::array<double, V> magnitudes;
+          certified = preparedParent.magnitudes(children[child], magnitudes)
+            and amr_detail::transferMagnitudesPass<N, V, C>(magnitudes);
+        }
+        if (not certified and (not preparedParent.residual(children[child], child, residual)
+            or not amr_detail::transferPolynomialIntervalsPasses<N, V, C>(residual))) return false;
         if constexpr (observation_detail::count<C>() > 0) {
           // Use unscaled residuals for observables to avoid overflowing scaled weights.
           const bool unitScales = std::all_of(scales.begin(), scales.end(), [](double scale) { return scale == 1.; });
@@ -856,36 +892,74 @@ namespace exahype2::amr {
     if (found == _lookup.end()) return Command::Keep;
     const auto& cell = _cells[found->second];
     if (cell.state != Q or not E::available(cell.status)) return Command::Keep;
+    switch (ownEvidence(cell, x, h)) {
+      case OwnEvidence::Refine: return Command::Refine;
+      case OwnEvidence::Keep: return Command::Keep;
+      case OwnEvidence::Siblings: break;
+    }
+    return familyPasses(cell.family, time, _clock->getTimeStepSizeOfLastStep()) ? Command::Erase : Command::Keep;
+  }
+
+  /** Decide from the cell and its neighbours alone. Siblings means that only the family can still coarsen it. */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  auto AMRCore<N, V, C, P, A, T, E, S>::ownEvidence(
+    const Cell& cell, const Coordinates& x, const Coordinates& h
+  ) const -> OwnEvidence {
     if (E::requiresResolution(cell.status)) {
       if constexpr (predictionMode() and requires { E::requestsRefinement(cell.status); }) {
         // Active limiter cells request refinement; halo cells use the spatial sensor.
         if (E::requestsRefinement(cell.status))
-          return locallyConstant(cell) ? Command::Keep : Command::Refine;
+          return locallyConstant(cell) ? OwnEvidence::Keep : OwnEvidence::Refine;
       } else {
-        return locallyConstant(cell) ? Command::Keep : Command::Refine;
+        return locallyConstant(cell) ? OwnEvidence::Keep : OwnEvidence::Refine;
       }
     }
     if constexpr (not predictionMode()) {
-      if (not E::quietEligible(cell.status)) return Command::Keep;
+      if (not E::quietEligible(cell.status)) return OwnEvidence::Keep;
     } else if constexpr (requires { E::known(cell.status); }) {
-      if (not E::known(cell.status)) return Command::Keep;
+      if (not E::known(cell.status)) return OwnEvidence::Keep;
     }
     const auto view = accepted(cell);
     if constexpr (predictionMode()) {
       // Keep the cell when accepted solution data are unavailable.
-      if (view.values == nullptr or view.pointsPerAxis <= 0) return Command::Keep;
+      if (view.values == nullptr or view.pointsPerAxis <= 0) return OwnEvidence::Keep;
     }
     // Give resolution violations priority over coarsening requests.
     const auto detail = cellDetail(cell);
-    if (detail.value > amr_detail::resolutionTolerance<C>()) return Command::Refine;
+    if (detail.value > amr_detail::resolutionTolerance<C>()) return OwnEvidence::Refine;
     if constexpr (S::CheckCommandPhysical) {
-      if (_admissible != nullptr and not _admissible(view.values, view.numberOfStates(), x, h)) return Command::Refine;
+      if (_admissible != nullptr and not _admissible(view.values, view.numberOfStates(), x, h)) return OwnEvidence::Refine;
     }
     // Preserve cells required by the limiter stencil.
-    if (not E::quietEligible(cell.status)) return Command::Keep;
+    if (not E::quietEligible(cell.status)) return OwnEvidence::Keep;
     // Require complete neighbour data before coarsening.
-    if (not detail.complete) return Command::Keep;
-    return familyPasses(cell.family, time, _clock->getTimeStepSizeOfLastStep()) ? Command::Erase : Command::Keep;
+    if (not detail.complete) return OwnEvidence::Keep;
+    return OwnEvidence::Siblings;
+  }
+
+  /**
+   * The stages follow the dependencies of command(): cells first, then one proposed parent per family, then the
+   * comparison of neighbouring proposed parents. Each stage evaluates what the votes would request anyway.
+   */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  void AMRCore<N, V, C, P, A, T, E, S>::assess(double time) {
+    // The solver pauses its votes on the first step after a regrid, so that step has nothing to prepare.
+    if (_assessed or _initialising or _topologyChanged or not fresh(time)) return;
+    _assessed = true;
+    const double dt = _clock->getTimeStepSizeOfLastStep();
+    const int leaves = static_cast<int>(_leaves.size()), families = static_cast<int>(_families.size());
+    tarch::accelerator::parallelForOnHost(tarch::accelerator::Range(leaves), [&](int entry) {
+      const auto& cell = _cells[_leaves[entry]];
+      if (cell.state == nullptr or not E::available(cell.status)) return;
+      if (ownEvidence(cell, cell.centre, cell.width) == OwnEvidence::Siblings and cell.family >= 0)
+        _familyRequests[cell.family].store(true, std::memory_order_relaxed);
+    });
+    tarch::accelerator::parallelForOnHost(tarch::accelerator::Range(families), [&](int family) {
+      if (_familyRequests[family].load(std::memory_order_relaxed)) (void)familyPlan(family, time, dt);
+    });
+    tarch::accelerator::parallelForOnHost(tarch::accelerator::Range(families), [&](int family) {
+      if (_familyRequests[family].load(std::memory_order_relaxed)) (void)familyPasses(family, time, dt);
+    });
   }
 
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
@@ -983,9 +1057,13 @@ namespace exahype2::amr {
     _quietOrder.clear();
     _familyVotes.reset();
     _familyPlans.reset();
+    _familyRequests.reset();
     _familyVoteCapacity = 0;
     _topologyCached = false;
     _historyNeedsPruning = false;
+    _stencilsBound = false;
+    _topologyChanged = true;
+    _assessed = false;
   }
 
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>

@@ -47,6 +47,7 @@ namespace exahype2::amr::detail::retained_parent {
     static_assert(N > 0 and R > 1);
     std::array<double, N> _nodes{};
     std::array<std::array<Interval, N*N>, R> _matrix{};
+    double _largestRowSum = 0.;
     bool _bound = false, _valid = false;
   public:
     bool bind(const double* nodes) {
@@ -55,6 +56,7 @@ namespace exahype2::amr::detail::retained_parent {
       std::copy_n(nodes, N, _nodes.begin());
       _bound = true;
       _valid = false;
+      _largestRowSum = 0.;
       for (int node = 0; node < N; node++)
         if (not std::isfinite(nodes[node]) or nodes[node] < 0. or nodes[node] > 1.
             or (node > 0 and nodes[node] <= nodes[node-1])) return false;
@@ -71,12 +73,18 @@ namespace exahype2::amr::detail::retained_parent {
           if (not bound::valid(weight)) return false;
           _matrix[child][row*N+col] = weight;
         }
+        double rowSum = 0.;
+        for (int col = 0; col < N; col++)
+          rowSum = bound::up(bound::roundedAdd(rowSum, bound::magnitude(_matrix[child][row*N+col])));
+        _largestRowSum = std::max(_largestRowSum, rowSum);
       }
-      return _valid = true;
+      return _valid = std::isfinite(_largestRowSum);
     }
     TARGET_DECLARE
     [[nodiscard]] GPU_CALLABLE_METHOD bool valid() const { return _valid; }
     [[nodiscard]] GPU_CALLABLE_METHOD const std::array<Interval, N*N>& matrix(int child) const { return _matrix[child]; }
+    /** The largest sum of weight magnitudes over the parent nodes that one child node reads along an axis. */
+    [[nodiscard]] GPU_CALLABLE_METHOD double largestRowSum() const { return _largestRowSum; }
     TARGET_DECLARE_END
   };
 
@@ -129,7 +137,7 @@ namespace exahype2::amr::detail::retained_parent {
   private:
     std::conditional_t<CachesAxis0, Axis0Cache, std::array<char, 0>> _axis0;
     Field _normalised;
-    std::array<double, V> _reference, _scales;
+    std::array<double, V> _reference, _scales, _represented;
     const Geometry<N, R>* _geometry{nullptr};
     bool _valid{false};
   public:
@@ -150,7 +158,43 @@ namespace exahype2::amr::detail::retained_parent {
         value = bound::difference(static_cast<double>(parent[node*V+component]), _reference[component], scales[component]);
         if (not bound::valid(value)) return false;
       }
+      // Each axis multiplies the parent's largest magnitude by at most the largest row sum.
+      // The factor above one covers the outward rounding of the interval contractions.
+      for (int component = 0; component < V; component++) {
+        double largest = 0.;
+        for (int node = 0; node < bound::power(N, D); node++)
+          largest = std::max(largest, bound::magnitude(_normalised[node*V+component]));
+        for (int axis = 0; axis <= D and largest != 0.; axis++) {
+          const double factor = axis < D ? geometry.largestRowSum() : 1. + 0x1p-40;
+          largest = std::isfinite(largest) and bound::productSafe(largest, factor)
+            ? bound::up(bound::roundedMultiply(largest, factor)) : INFINITY;
+        }
+        // The smallest normal number exceeds every rounding step of subnormal intermediates.
+        if (largest != 0. and std::isfinite(largest))
+          largest = bound::up(bound::roundedAdd(largest, std::numeric_limits<double>::min()));
+        _represented[component] = largest;
+      }
       return _valid = true;
+    }
+    /** Bound each component of this child's scaled difference from the parent at every child node without
+     * evaluating the parent. The bounds are at least the magnitudes that residual() returns.
+     * Returns false if no finite bound exists.
+     */
+    GPU_CALLABLE_METHOD bool magnitudes(const P* fine, std::array<double, V>& output) const {
+      if (fine == nullptr or not _valid) return false;
+      for (int component = 0; component < V; component++) {
+        double largest = 0.;
+        for (int node = 0; node < bound::power(N, D); node++) {
+          const auto centred = bound::difference(static_cast<double>(fine[node*V+component]), _reference[component], _scales[component]);
+          if (not bound::valid(centred)) return false;
+          largest = std::max(largest, bound::magnitude(centred));
+        }
+        if (not std::isfinite(_represented[component]) or not bound::sumSafe(largest, _represented[component])) return false;
+        // The second rounding step covers the outward rounding of the final interval subtraction.
+        output[component] = bound::up(bound::up(bound::roundedAdd(largest, _represented[component])));
+        if (not std::isfinite(output[component])) return false;
+      }
+      return true;
     }
     /** Write bounds on this child's scaled difference from the parent at each child node. */
     GPU_CALLABLE_METHOD bool residual(const P* fine, int child, Field& output) {

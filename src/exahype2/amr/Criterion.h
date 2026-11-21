@@ -61,6 +61,8 @@ namespace exahype2::amr {
                    PhysicalAdmissibility admissible = nullptr, TransferAdmissibility transferAdmissible = nullptr,
                    NativeSubcells subcells = {});
 
+    /** Evaluate the evidence of all cells in parallel before the cells call command(). */
+    void assess(double time) { _core.assess(time); }
     /** Return Refine, Keep or Erase for this cell's accepted state. */
     [[nodiscard]] exahype2::RefinementCommand command(
       const Precision* Q, const Coordinates& x, const Coordinates& h, double time) const;

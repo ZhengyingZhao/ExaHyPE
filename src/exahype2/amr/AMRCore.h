@@ -68,6 +68,10 @@ namespace exahype2::amr {
                    const double* restriction, const double* prolongation, WaveSpeed waveSpeed = nullptr,
                    PhysicalAdmissibility admissible = nullptr, TransferAdmissibility transferAdmissible = nullptr,
                    NativeSubcells subcells = {});
+    /** Evaluates this step's evidence in parallel stages. command() then only reads the results.
+     * Call it once the accepted solution is in the storage bound by beginStep().
+     * The votes are the same without this call, but concurrent command() calls then wait for each other. */
+    void assess(double time);
     [[nodiscard]] exahype2::RefinementCommand command(
       const Precision* Q, const Coordinates& x, const Coordinates& h, double time) const;
     void finishStep();
@@ -176,6 +180,8 @@ namespace exahype2::amr {
     std::vector<int> _quietOrder;
     mutable std::unique_ptr<std::atomic<int>[]> _familyVotes;
     mutable std::unique_ptr<FamilyPlan[]> _familyPlans;
+    /** Families with a child that leaves the decision to its siblings. */
+    std::unique_ptr<std::atomic<bool>[]> _familyRequests;
     std::size_t _familyVoteCapacity{0};
     const exahype2::TimeStepping* _clock{nullptr};
     const double* _nodes{nullptr};
@@ -200,6 +206,12 @@ namespace exahype2::amr {
     bool _initialising{false};
     bool _topologyCached{false};
     bool _historyNeedsPruning{false};
+    bool _stencilsBound{false};
+    bool _topologyChanged{true};
+    bool _assessed{false};
+    /** What a cell's own state and neighbours say before its siblings are consulted. */
+    enum class OwnEvidence { Keep, Refine, Siblings };
+    [[nodiscard]] OwnEvidence ownEvidence(const Cell& cell, const Coordinates& x, const Coordinates& h) const;
 
     [[nodiscard]] static Geometry geometry(const Coordinates& x, const Coordinates& h);
     [[nodiscard]] static double amplification(const double* matrix, bool restriction);

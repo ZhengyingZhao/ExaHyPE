@@ -201,6 +201,28 @@ namespace exahype2::amr {
       } else return false;
     }
 
+    /** Certify the transfer tolerance from upper bounds on the nodal residual magnitudes alone.
+     * A true result implies that transferPolynomialIntervalsPasses() accepts every residual within these bounds.
+     */
+    template <int N, int V, typename C>
+    GPU_CALLABLE_METHOD bool transferMagnitudesPass(const std::array<double, V>& magnitudes) {
+      if (not transfer_bound::arithmeticSupported()) return false;
+      const double budget = C::TransferTolerance;
+      if (not std::isfinite(budget) or budget <= 0.0) return false;
+      // The interval test rejects any nodal magnitude above the budget before it bounds the polynomial.
+      for (const double magnitude : magnitudes) if (not std::isfinite(magnitude) or magnitude > budget) return false;
+      if constexpr (requires { C::transferWeightLower(0, 0); C::transferWeightUpper(0, 0); }) {
+        std::array<transfer_bound::Interval, N * N> weights;
+        for (int node = 0; node < N; node++) for (int mode = 0; mode < N; mode++)
+          weights[mode * N + node] = {C::transferWeightLower(node, mode), C::transferWeightUpper(node, mode)};
+        double amplification = 0.0;
+        return transfer_bound::transformAmplification<N>(weights, amplification)
+          and transfer_bound::amplifiedMaximaPass<V, DIMENSIONS>(magnitudes, budget, amplification);
+      } else if constexpr (N == 1) {
+        return transfer_bound::normPasses<V>(magnitudes, budget);
+      } else return false;
+    }
+
     /** Certify the DG fine-minus-restored polynomial over the whole cell. */
     template <int N, int V, typename C, typename P>
     GPU_CALLABLE_METHOD bool transferPolynomialPasses(const P* fine, const P* restored) {

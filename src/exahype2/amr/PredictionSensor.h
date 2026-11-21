@@ -380,6 +380,8 @@ namespace exahype2::amr::prediction_detail {
   template <int N>
   struct DGProfileGeometry {
     std::array<double, peano4::power(N, DIMENSIONS - 1)> weights{};
+    /** The tangential node that the point lies on, or -1 if the profile needs interpolation. */
+    int single{-1};
     bool valid{false};
     GPU_CALLABLE_METHOD DGProfileGeometry(const double* originalNodes, int normal, const std::array<double, DIMENSIONS>& point);
   };
@@ -388,10 +390,23 @@ namespace exahype2::amr::prediction_detail {
   GPU_CALLABLE_METHOD DGProfileGeometry<N>::DGProfileGeometry(const double* originalNodes, int normal,
                                          const std::array<double, DIMENSIONS>& point) {
     constexpr int FaceNodes = peano4::power(N, DIMENSIONS - 1);
+    // A sample of a conforming face meets a node up to the roundoff of the face mapping.
+    constexpr double NodeDistance = 16.0 * std::numeric_limits<double>::epsilon();
     const int stride = peano4::power(N, normal);
     std::array<std::array<double, N>, DIMENSIONS> basis{};
+    bool onNodes = true;
     for (int axis = 0; axis < DIMENSIONS; axis++) {
       if (axis == normal) continue;
+      int nearest = -1;
+      for (int node = 0; node < N; node++) {
+        if (std::abs(point[axis] - originalNodes[node]) <= NodeDistance) nearest = node;
+      }
+      if (nearest >= 0) {
+        // Use the node itself: its Lagrange weight is exactly one and the others vanish.
+        for (int node = 0; node < N; node++) basis[axis][node] = node == nearest ? 1.0 : 0.0;
+        continue;
+      }
+      onNodes = false;
       for (int node = 0; node < N; node++) {
         const double coordinate = originalNodes[node];
         double weight = 1.0;
@@ -413,6 +428,7 @@ namespace exahype2::amr::prediction_detail {
         if (axis != normal and not native_neighbour_detail::product(weight, basis[axis][entry % N], weight)) return;
       }
       weights[fibre] = weight;
+      if (onNodes and weight != 0.0) single = fibre;
     }
     valid = true;
   }
@@ -445,19 +461,39 @@ namespace exahype2::amr::prediction_detail {
       if (not std::isfinite(point[axis])) return nullptr;
       positions[tangent++] = std::bit_cast<std::uint64_t>(point[axis]);
     }
-    using Key = std::tuple<int, decltype(nodes), decltype(positions)>;
-    static thread_local std::map<Key, DGProfileGeometry<N>> cache;
-    const Key key{normal, nodes, positions};
-    const auto found = cache.find(key);
-    if (found != cache.end()) return &found->second;
+    // A face repeats few sample points, so a hashed table answers most lookups with one comparison.
+    struct Entry {
+      int normal{-1};
+      std::array<std::uint64_t, N> nodes{};
+      std::array<std::uint64_t, DIMENSIONS - 1> positions{};
+      std::optional<DGProfileGeometry<N>> geometry;
+    };
+    constexpr std::size_t Capacity = 4096, Probes = 2;
+    static thread_local std::vector<Entry> cache(Capacity);
+    std::uint64_t hash = 0x9E3779B97F4A7C15ULL * static_cast<std::uint64_t>(normal + 1);
+    for (const auto position : positions) hash = (hash ^ position ^ (position >> 29)) * 0x9E3779B97F4A7C15ULL;
+    const std::size_t first = static_cast<std::size_t>(hash >> 52);
+    for (std::size_t probe = 0; probe < Probes; probe++) {
+      const auto& entry = cache[(first + probe) % Capacity];
+      if (entry.geometry and entry.normal == normal and entry.positions == positions and entry.nodes == nodes)
+        return &*entry.geometry;
+    }
     DGProfileGeometry<N> geometry(originalNodes, normal, point);
     if (not geometry.valid) {
       local.emplace(std::move(geometry));
       return &*local;
     }
-    constexpr std::size_t Capacity = 1024;
-    if (cache.size() >= Capacity) cache.clear();
-    return &cache.try_emplace(key, std::move(geometry)).first->second;
+    // Fill a free slot; a full neighbourhood drops its first entry.
+    std::size_t target = first;
+    for (std::size_t probe = 0; probe < Probes; probe++) {
+      if (not cache[(first + probe) % Capacity].geometry) { target = (first + probe) % Capacity; break; }
+    }
+    auto& entry = cache[target];
+    entry.normal = normal;
+    entry.nodes = nodes;
+    entry.positions = positions;
+    entry.geometry.emplace(std::move(geometry));
+    return &*entry.geometry;
   }
 
   /** Interpolate a DG normal profile at one tangential point. */
@@ -501,6 +537,14 @@ namespace exahype2::amr::prediction_detail {
       return true;
     }
 
+    /** Divide the entries up to last by the largest magnitude, each entry once. */
+    static void normalise(Group& group, int last) {
+      for (; group.normalizedCount <= last; ++group.normalizedCount) {
+        auto& value = group.data[group.normalizedCount];
+        value = group.largest == 0.0 ? 0.0 : value / group.largest;
+      }
+    }
+
   public:
     DGSourceProfileCache(AcceptedCellView<P> view, int normal, const std::array<double, V>& reference) :
       _view(view), _reference(reference), _normal(normal), _stride(peano4::power(N, normal)) {}
@@ -526,12 +570,17 @@ namespace exahype2::amr::prediction_detail {
             values[(first + node) * V + component] = group.data[0];
             continue;
           }
+          if (geometry->single >= 0) {
+            // On a node the weighted sum has one term. Its sum is that term, and a zero sum is positive.
+            normalise(group, geometry->single);
+            const double value = group.data[geometry->single];
+            if (not native_neighbour_detail::product(value == 0.0 ? 0.0 : value, group.largest,
+                values[(first + node) * V + component])) return false;
+            continue;
+          }
+          normalise(group, FaceNodes - 1);
           std::array<double, FaceNodes> terms{};
           for (int fibre = 0; fibre < FaceNodes; ++fibre) {
-            if (fibre >= group.normalizedCount) {
-              group.data[fibre] = group.largest == 0.0 ? 0.0 : group.data[fibre] / group.largest;
-              ++group.normalizedCount;
-            }
             if (not native_neighbour_detail::product(geometry->weights[fibre], group.data[fibre], terms[fibre])) return false;
           }
           double sum = 0.0;
@@ -572,6 +621,13 @@ namespace exahype2::amr::prediction_detail {
       }
       if (std::all_of(differences.begin(), differences.end(), [&](double value) { return value == differences[0]; })) {
         values[(first + node) * V + component] = differences[0];
+        continue;
+      }
+      if (geometry->single >= 0) {
+        // On a node the weighted sum has one term. Its sum is that term, and a zero sum is positive.
+        const double value = largest == 0.0 ? 0.0 : differences[geometry->single] / largest;
+        if (not native_neighbour_detail::product(value == 0.0 ? 0.0 : value, largest,
+            values[(first + node) * V + component])) return false;
         continue;
       }
       for (int fibre = 0; fibre < FaceNodes; fibre++) {

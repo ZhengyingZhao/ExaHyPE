@@ -135,11 +135,23 @@ namespace exahype2::amr::detail::transfer_bound {
   GPU_CALLABLE_METHOD inline Interval bad() { return {-INFINITY, INFINITY}; }
   GPU_CALLABLE_METHOD inline bool valid(Interval x) { return std::isfinite(x.lo) && std::isfinite(x.hi) && x.lo <= x.hi; }
   GPU_CALLABLE_METHOD inline bool zero(Interval x) { return x.lo == 0. && x.hi == 0.; }
+  // The neighbouring doubles. These return the same bits as std::nextafter without a library call.
   GPU_CALLABLE_METHOD inline double down(double x) {
-    return x == -std::numeric_limits<double>::max() ? -INFINITY : std::nextafter(x, -INFINITY);
+    if (std::isnan(x) || x == -INFINITY) return x;
+    if (x == 0.) return -std::numeric_limits<double>::denorm_min();
+    const auto bits = std::bit_cast<std::uint64_t>(x);
+    return std::bit_cast<double>(x > 0. ? bits - 1 : bits + 1);
   }
   GPU_CALLABLE_METHOD inline double up(double x) {
-    return x == std::numeric_limits<double>::max() ? INFINITY : std::nextafter(x, INFINITY);
+    if (std::isnan(x) || x == INFINITY) return x;
+    if (x == 0.) return std::numeric_limits<double>::denorm_min();
+    const auto bits = std::bit_cast<std::uint64_t>(x);
+    return std::bit_cast<double>(x > 0. ? bits + 1 : bits - 1);
+  }
+  GPU_CALLABLE_METHOD inline double towardsZero(double x) {
+    if (std::isnan(x)) return x;
+    if (x == 0.) return 0.;
+    return std::bit_cast<double>(std::bit_cast<std::uint64_t>(x) - 1);
   }
   // Check for overflow before evaluating interval endpoints.
   GPU_CALLABLE_METHOD inline bool sumSafe(double a, double b) {
@@ -151,11 +163,11 @@ namespace exahype2::amr::detail::transfer_bound {
     if (aa > 1.) {
       // Prevent speculative division by a zero or tiny operand.
       volatile double divisor = aa;
-      if (bb > std::nextafter(roundedDivide(limit, divisor), 0.)) return false;
+      if (bb > towardsZero(roundedDivide(limit, divisor))) return false;
     }
     if (bb > 1.) {
       volatile double divisor = bb;
-      if (aa > std::nextafter(roundedDivide(limit, divisor), 0.)) return false;
+      if (aa > towardsZero(roundedDivide(limit, divisor))) return false;
     }
     return true;
   }
@@ -183,6 +195,25 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     if (zero(a) || zero(b)) {
       return {0., 0.};
+    }
+    // Operands of one sign take their bounds from two known corners. Rounding keeps the order of the
+    // four products, so these are the bounds of the general case below.
+    const bool positiveA = a.lo >= 0., negativeA = a.hi <= 0., positiveB = b.lo >= 0., negativeB = b.hi <= 0.;
+    if ((positiveA || negativeA) && (positiveB || negativeB)) {
+      const double lowerA = positiveA == positiveB ? (positiveA ? a.lo : a.hi) : (positiveA ? a.hi : a.lo);
+      const double lowerB = positiveA == positiveB ? (positiveA ? b.lo : b.hi) : (positiveA ? b.lo : b.hi);
+      const double upperA = positiveA == positiveB ? (positiveA ? a.hi : a.lo) : (positiveA ? a.lo : a.hi);
+      const double upperB = positiveA == positiveB ? (positiveA ? b.hi : b.lo) : (positiveA ? b.hi : b.lo);
+      // The corner of the largest magnitudes decides whether any product overflows.
+      const double largestA = positiveA ? a.hi : a.lo, largestB = positiveB ? b.hi : b.lo;
+      if (!productSafe(largestA, largestB)) {
+        return bad();
+      }
+      const double lower = roundedMultiply(lowerA, lowerB), upper = roundedMultiply(upperA, upperB);
+      if (!std::isfinite(lower) || !std::isfinite(upper)) {
+        return bad();
+      }
+      return {down(lower), up(upper)};
     }
     if (!productSafe(a.lo, b.lo) || !productSafe(a.lo, b.hi) || !productSafe(a.hi, b.lo) || !productSafe(a.hi, b.hi)) {
       return bad();
@@ -364,22 +395,38 @@ namespace exahype2::amr::detail::transfer_bound {
     return out;
   }
   /** Bisect all axes until every box passes or the round limit is reached. */
-  template <int N, int V, int D>
-  GPU_CALLABLE_METHOD bool refinedHullPasses(const Field<N, V, D> &q, double budget, const std::array<int, D> &order, int remaining) {
-    if (hullPasses<N, V, D>(q, budget)) {
-      return true;
-    }
-    if (remaining == 0) {
-      return false;
-    }
-    for (int box = 0; box < (1 << D); box++) {
-      auto subbox = q;
+  template <int N, int V, int D, int Rounds>
+  GPU_CALLABLE_METHOD bool refinedHullPasses(const Field<N, V, D> &q, double budget, const std::array<int, D> &order) {
+    static_assert(Rounds >= 0);
+    // Device kernels cannot recurse. Each depth keeps its box and the next of its half boxes to visit.
+    Field<N, V, D> boxes[Rounds + 1];
+    int next[Rounds + 1];
+    int depth = 0;
+    boxes[0] = q;
+    next[0] = -1;
+    while (depth >= 0) {
+      if (next[depth] < 0) {
+        if (hullPasses<N, V, D>(boxes[depth], budget)) {
+          depth--;
+          continue;
+        }
+        // One unresolved box at the last round leaves the whole bound unproved.
+        if (depth == Rounds) {
+          return false;
+        }
+        next[depth] = 0;
+      }
+      if (next[depth] == (1 << D)) {
+        depth--;
+        continue;
+      }
+      const int box = next[depth]++;
+      boxes[depth + 1] = boxes[depth];
       for (int axis : order) {
-        subbox = half<N, V, D>(subbox, axis, (box & (1 << axis)) != 0);
+        boxes[depth + 1] = half<N, V, D>(boxes[depth + 1], axis, (box & (1 << axis)) != 0);
       }
-      if (!refinedHullPasses<N, V, D>(subbox, budget, order, remaining - 1)) {
-        return false;
-      }
+      next[depth + 1] = -1;
+      depth++;
     }
     return true;
   }
@@ -559,6 +606,49 @@ namespace exahype2::amr::detail::transfer_bound {
     })();)
     return HullResult::Unknown;
   }
+  /** Bound the growth of nodal magnitudes under the nodal-to-Bernstein transform of one axis by the
+   * largest absolute row sum. Returns false for an invalid weight.
+   */
+  template <int N>
+  GPU_CALLABLE_METHOD bool transformAmplification(const std::array<Interval, N * N> &matrix, double &amplification) {
+    amplification = 0.;
+    for (int row = 0; row < N; row++) {
+      std::array<double, N> terms;
+      for (int col = 0; col < N; col++) {
+        if (!valid(matrix[row * N + col])) {
+          return false;
+        }
+        terms[col] = magnitude(matrix[row * N + col]);
+      }
+      sort(terms.begin(), terms.end());
+      double sum = 0.;
+      for (double x : terms) {
+        if (x != 0.) {
+          if (!sumSafe(sum, x)) {
+            sum = INFINITY;
+            break;
+          }
+          sum = up(roundedAdd(sum, x));
+        }
+      }
+      amplification = std::max(amplification, sum);
+    }
+    return true;
+  }
+  /** Return true if nodal magnitudes of at most maxima keep every Bernstein coefficient within budget.
+   * Larger maxima never pass where smaller ones fail.
+   */
+  template <int V, int D>
+  GPU_CALLABLE_METHOD bool amplifiedMaximaPass(std::array<double, V> maxima, double budget, double amplification) {
+    for (int axis = 0; axis < D; axis++) {
+      for (double &x : maxima) {
+        if (x != 0.) {
+          x = std::isfinite(amplification) && productSafe(x, amplification) ? up(roundedMultiply(x, amplification)) : INFINITY;
+        }
+      }
+    }
+    return normPasses<V>(maxima, budget);
+  }
   /** Return true if the error intervals at the nodes imply that the polynomial stays within budget
    * everywhere in the cell.
    */
@@ -587,36 +677,10 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     // Bound transform amplification by its largest absolute row sum.
     double amplification = 0.;
-    for (int row = 0; row < N; row++) {
-      std::array<double, N> terms;
-      for (int col = 0; col < N; col++) {
-        if (!valid(matrix[row * N + col])) {
-          return false;
-        }
-        terms[col] = magnitude(matrix[row * N + col]);
-      }
-      sort(terms.begin(), terms.end());
-      double sum = 0.;
-      for (double x : terms) {
-        if (x != 0.) {
-          if (!sumSafe(sum, x)) {
-            sum = INFINITY;
-            break;
-          }
-          sum = up(roundedAdd(sum, x));
-        }
-      }
-      amplification = std::max(amplification, sum);
+    if (!transformAmplification<N>(matrix, amplification)) {
+      return false;
     }
-    auto fast = maxima;
-    for (int axis = 0; axis < D; axis++) {
-      for (double &x : fast) {
-        if (x != 0.) {
-          x = std::isfinite(amplification) && productSafe(x, amplification) ? up(roundedMultiply(x, amplification)) : INFINITY;
-        }
-      }
-    }
-    if (normPasses<V>(fast, budget)) {
+    if (amplifiedMaximaPass<V, D>(maxima, budget, amplification)) {
       return true;
     }
     // Any contraction order with a passing enclosing hull certifies the bound.
@@ -640,7 +704,7 @@ namespace exahype2::amr::detail::transfer_bound {
           for (int a : order) {
             subbox = half<N, V, D>(subbox, a, (box & (1 << a)) != 0);
           }
-          all = refinedHullPasses<N, V, D>(subbox, budget, order, 2);
+          all = refinedHullPasses<N, V, D, 2>(subbox, budget, order);
         }
         if (all) {
           return true;

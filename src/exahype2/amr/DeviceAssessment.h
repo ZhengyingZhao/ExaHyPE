@@ -416,8 +416,11 @@ namespace exahype2::amr::device_detail {
             return false;
           }
         }
-        if (not T::polynomialPasses(children[child], restored)) {
-          return false;
+        // DG bounds the loss against the retained parent polynomial below.
+        if constexpr (T::IsFiniteVolume) {
+          if (not T::polynomialPasses(children[child], restored)) {
+            return false;
+          }
         }
         if constexpr (observation_detail::count<C>() > 0) {
           if (not observedTransfer.template transferPasses<N>(children[child], restored, T::IsFiniteVolume)) {

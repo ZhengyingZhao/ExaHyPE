@@ -2,6 +2,7 @@
 // use, please see the copyright notice at www.peano-framework.org
 #pragma once
 
+#include "TransferBounds.h"
 #include "peano4/CellConnectivity.h"
 #include "tarch/la/FixedPointSum.h"
 
@@ -29,7 +30,7 @@ namespace exahype2::amr {
       if (std::abs(right) > 1.0) {
         // Prevent speculative division from overflowing.
         volatile double divisor = std::abs(right);
-        if (std::abs(left) > std::nextafter(largest / divisor, 0.0)) return false;
+        if (std::abs(left) > detail::transfer_bound::towardsZero(largest / divisor)) return false;
       }
       if (std::abs(left) <= 1.e150 and std::abs(right) <= 1.e150) result = left * right;
       else {
@@ -57,7 +58,7 @@ namespace exahype2::amr {
       if (not std::isfinite(numerator) or not std::isfinite(denominator) or denominator == 0.0) return false;
       if (std::abs(denominator) < 1.0) {
         volatile double factor = std::abs(denominator);
-        if (std::abs(numerator) > std::nextafter(largest * factor, 0.0)) return false;
+        if (std::abs(numerator) > detail::transfer_bound::towardsZero(largest * factor)) return false;
       }
       if (std::abs(numerator) <= 1.e150 and std::abs(denominator) >= 1.e-150) result = numerator / denominator;
       else {
@@ -184,7 +185,7 @@ namespace exahype2::amr {
           largestTerm = std::max(largestTerm, std::abs(term));
         }
         // Bound the sum independently of node order before fixed-point rounding.
-        if (largestTerm > std::nextafter(std::numeric_limits<double>::max() / Count, 0.0)) return false;
+        if (largestTerm > detail::transfer_bound::towardsZero(std::numeric_limits<double>::max() / Count)) return false;
         tarch::la::FixedPointSum<Count> accumulator;
         accumulator.clear(largestTerm);
         for (const double term : terms) accumulator.add(term);
@@ -310,7 +311,7 @@ namespace exahype2::amr {
         for (const double magnitude : magnitudes) unitNorm = std::hypot(unitNorm, magnitude / largest);
         if (unitNorm > 1.0) {
           volatile double divisor = unitNorm;
-          if (largest > std::nextafter(std::numeric_limits<double>::max() / divisor, 0.0)) return invalid;
+          if (largest > detail::transfer_bound::towardsZero(std::numeric_limits<double>::max() / divisor)) return invalid;
         }
         double norm = 0.0;
         if (not product(largest, unitNorm, norm)) return invalid;

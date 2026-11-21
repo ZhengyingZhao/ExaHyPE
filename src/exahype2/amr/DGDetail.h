@@ -19,7 +19,7 @@ namespace exahype2::amr::resolution_detail {
       result = terms[0];
       return true;
     } else {
-      if (largest > std::nextafter(std::numeric_limits<double>::max() / Count, 0.0)) return false;
+      if (largest > detail::transfer_bound::towardsZero(std::numeric_limits<double>::max() / Count)) return false;
       tarch::la::FixedPointSum<Count> accumulator;
       accumulator.clear(largest);
       for (const double term : terms) accumulator.add(term);
