@@ -8,9 +8,25 @@
 #include <thread>
 #include <utility>
 #include "tarch/accelerator/ParallelFor.h"
+#include "tarch/instrumentation/Warning.h"
 #include "tarch/mpi/Rank.h"
 
 namespace exahype2::amr {
+  namespace amr_detail {
+    /** Publishes a fallback result if a cached computation leaves by an exception, so that no waiting thread hangs. */
+    template <typename Fallback>
+    class PublishOnUnwind final {
+      Fallback _fallback;
+      bool _armed{true};
+    public:
+      explicit PublishOnUnwind(Fallback fallback) : _fallback(std::move(fallback)) {}
+      PublishOnUnwind(const PublishOnUnwind&) = delete;
+      PublishOnUnwind& operator=(const PublishOnUnwind&) = delete;
+      ~PublishOnUnwind() { if (_armed) _fallback(); }
+      void release() { _armed = false; }
+    };
+  }
+
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   auto AMRCore<N, V, C, P, A, T, E, S>::geometry(const Coordinates& x, const Coordinates& h) -> Geometry {
     Geometry key{};
@@ -108,7 +124,12 @@ namespace exahype2::amr {
       auto& cache = _detailCache[cell.slot];
       int expected = 0;
       if (cache.state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+        amr_detail::PublishOnUnwind unresolved([&] {
+          cache.evidence = {std::numeric_limits<double>::infinity(), false};
+          cache.state.store(2, std::memory_order_release);
+        });
         cache.evidence = computeCellDetail(cell);
+        unresolved.release();
         cache.state.store(2, std::memory_order_release);
       } else {
         while (cache.state.load(std::memory_order_acquire) != 2) std::this_thread::yield();
@@ -210,7 +231,12 @@ namespace exahype2::amr {
     if (face.state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
       const auto& left = _cells[face.left];
       const auto& right = _cells[face.right];
+      amr_detail::PublishOnUnwind unresolved([&] {
+        face.value = std::numeric_limits<double>::infinity();
+        face.state.store(2, std::memory_order_release);
+      });
       face.value = faceDetail(accepted(left), accepted(right), left.key, right.key, face.normal, 1);
+      unresolved.release();
       face.state.store(2, std::memory_order_release);
     } else {
       while (face.state.load(std::memory_order_acquire) != 2) std::this_thread::yield();
@@ -267,6 +293,7 @@ namespace exahype2::amr {
     const double* nodes, const double* restriction, const double* prolongation
   ) {
     _initialising = false;
+    _initialNeighbours = false;
     _active = false;
     if constexpr (S::RequireSingleRank) {
       if (tarch::mpi::Rank::getInstance().getNumberOfRanks() != 1) {
@@ -314,6 +341,58 @@ namespace exahype2::amr {
     _mesh = &mesh;
     _restrictionBound = T::IsFiniteVolume ? 1.0 : amplification(restriction, true);
     _prolongationBound = T::IsFiniteVolume ? 1.0 : amplification(prolongation, false);
+    bindTopology(mesh);
+    const bool validStartTime = std::isfinite(_startTime) and _startTime >= 0.0;
+    if (not validStartTime and not _warnedAboutStartTime) {
+      _warnedAboutStartTime = true;
+      LOG_WARNING("AMR assessment needs a finite, nonnegative start time, but this step starts at t=" << _startTime
+        << ". Every cell keeps its resolution until the simulation time is nonnegative.");
+    }
+    return validStartTime;
+  }
+
+  /**
+   * The initial mesh uses the sensor of the time steps once every cell holds its initial data.
+   * Without this call, initialisation falls back to a check of each cell on its own.
+   */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  template <typename SolutionView, typename StatusView>
+  void AMRCore<N, V, C, P, A, T, E, S>::bindInitialState(
+    const peano4::CellConnectivity& mesh, SolutionView solution, StatusView statuses, const double* nodes
+  ) {
+    if (not _initialising) return;
+    _initialNeighbours = false;
+    if constexpr (predictionMode() and S::CheckNeighbours and cacheAcceptedFaces()) {
+      if constexpr (not T::IsFiniteVolume) {
+        if (nodes == nullptr) return;
+        for (int node = 0; node < N; node++) {
+          if (not std::isfinite(nodes[node]) or nodes[node] < 0.0 or nodes[node] > 1.0
+              or (node > 0 and nodes[node] <= nodes[node - 1])) return;
+        }
+      }
+      _nodes = nodes;
+      _mesh = &mesh;
+      bindTopology(mesh);
+      if (static_cast<std::size_t>(mesh.getNumberOfSlots()) > _detailCacheCapacity) {
+        _detailCacheCapacity = static_cast<std::size_t>(mesh.getNumberOfSlots());
+        _detailCache = std::make_unique<DetailCache[]>(_detailCacheCapacity);
+      }
+      for (const int slot : _leaves) {
+        auto& cell = _cells[slot];
+        cell.state = solution.getChunk(slot);
+        cell.status = statuses.getChunk(slot);
+        _detailCache[slot].state.store(0, std::memory_order_relaxed);
+      }
+      // Every round of the initial mesh writes new data, so the face scores of the last round expire.
+      _stencilsBound = false;
+      bindAcceptedFaces(mesh);
+      _initialNeighbours = true;
+    }
+  }
+
+  /** Rebuild the cells, sibling groups and lookup tables unless the leaves are those of the previous call. */
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  void AMRCore<N, V, C, P, A, T, E, S>::bindTopology(const peano4::CellConnectivity& mesh) {
     // After a regrid, the same slot can refer to a different cell.
     const auto leaves = mesh.getCells();
     bool sameTopology = _topologyCached and _cells.size() == static_cast<std::size_t>(mesh.getNumberOfSlots())
@@ -381,7 +460,6 @@ namespace exahype2::amr {
       }
       _topologyCached = true;
     }
-    return std::isfinite(_startTime) and _startTime >= 0.0;
   }
 
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
@@ -428,6 +506,7 @@ namespace exahype2::amr {
       _familyPlans[i].state.store(0, std::memory_order_relaxed);
       _familyRequests[i].store(false, std::memory_order_relaxed);
     }
+    _unboundVotes.store(0, std::memory_order_relaxed);
     _assessed = false;
     _active = validStartTime;
   }
@@ -788,6 +867,10 @@ namespace exahype2::amr {
     auto& plan = _familyPlans[family];
     int expected = 0;
     if (plan.state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+      amr_detail::PublishOnUnwind unresolved([&] {
+        plan.sizeVetoed = plan.transferSafe = plan.neighboursSafe = plan.safe = plan.eligible = false;
+        plan.state.store(2, std::memory_order_release);
+      });
       const auto& siblings = _families[family];
       plan.sizeVetoed = false;
       if (siblings.complete and _clock != nullptr) {
@@ -801,6 +884,7 @@ namespace exahype2::amr {
           plan.safe = false;
           plan.eligible = false;
           plan.sizeVetoed = true;
+          unresolved.release();
           plan.state.store(2, std::memory_order_release);
           return plan;
         }
@@ -828,6 +912,7 @@ namespace exahype2::amr {
           and peano4::SubdivisionFactor * tarch::la::max(first.width)
             <= _clock->getLimits().maxAdmissiblePatchSize;
       }
+      unresolved.release();
       plan.state.store(2, std::memory_order_release);
     } else {
       while (plan.state.load(std::memory_order_acquire) == 1) std::this_thread::yield();
@@ -842,10 +927,12 @@ namespace exahype2::amr {
     auto& result = _familyVotes[family];
     int expected = 0;
     if (result.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+      amr_detail::PublishOnUnwind unresolved([&] { result.store(2, std::memory_order_release); });
       const auto& plan = familyPlan(family, time, dt);
       // Check eligible parents against neighbouring proposed parents.
       const bool passed = plan.eligible
         and parentPassesNeighbours(_families[family], plan.parent.data(), plan.key, time, dt, true);
+      unresolved.release();
       result.store(passed ? 3 : 2, std::memory_order_release);
       return passed;
     }
@@ -881,17 +968,32 @@ namespace exahype2::amr {
           observedUnresolved = observation_detail::localRatio<N, V, C>(initial, nullptr, true) > 1.0;
         }
       }
-      return not finite(Q) or (_admissible != nullptr and not _admissible(Q, Nodes, x, h))
-        or observedUnresolved
-        or (_initialDataCheck != nullptr ? not _initialDataCheck(Q, x, h)
-          : initialDetail() > amr_detail::resolutionTolerance<C>())
+      if (not finite(Q) or (_admissible != nullptr and not _admissible(Q, Nodes, x, h)) or observedUnresolved)
+        return Command::Refine;
+      if (_initialDataCheck != nullptr and not _initialDataCheck(Q, x, h)) return Command::Refine;
+      if (_initialNeighbours) {
+        // With the mesh bound, the initial cells face the same sensor as the cells of a time step.
+        const auto found = _lookup.find(geometry(x, h));
+        if (found != _lookup.end() and _cells[found->second].state == Q) {
+          return cellDetail(_cells[found->second]).value > amr_detail::resolutionTolerance<C>()
+            ? Command::Refine : Command::Keep;
+        }
+      }
+      return _initialDataCheck == nullptr and initialDetail() > amr_detail::resolutionTolerance<C>()
         ? Command::Refine : Command::Keep;
     }
     if (not fresh(time)) return Command::Keep;
     const auto found = _lookup.find(geometry(x, h));
-    if (found == _lookup.end()) return Command::Keep;
+    if (found == _lookup.end()) {
+      _unboundVotes.fetch_add(1, std::memory_order_relaxed);
+      return Command::Keep;
+    }
     const auto& cell = _cells[found->second];
-    if (cell.state != Q or not E::available(cell.status)) return Command::Keep;
+    if (cell.state != Q) {
+      _unboundVotes.fetch_add(1, std::memory_order_relaxed);
+      return Command::Keep;
+    }
+    if (not E::available(cell.status)) return Command::Keep;
     switch (ownEvidence(cell, x, h)) {
       case OwnEvidence::Refine: return Command::Refine;
       case OwnEvidence::Keep: return Command::Keep;
@@ -934,7 +1036,7 @@ namespace exahype2::amr {
     if (not E::quietEligible(cell.status)) return OwnEvidence::Keep;
     // Require complete neighbour data before coarsening.
     if (not detail.complete) return OwnEvidence::Keep;
-    return OwnEvidence::Siblings;
+    return _assessCoarsening ? OwnEvidence::Siblings : OwnEvidence::Keep;
   }
 
   /**
@@ -963,8 +1065,19 @@ namespace exahype2::amr {
   }
 
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
+  void AMRCore<N, V, C, P, A, T, E, S>::setCoarseningAssessment(bool enabled) {
+    _assessCoarsening = enabled;
+  }
+
+  template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   void AMRCore<N, V, C, P, A, T, E, S>::finishStep() {
     if (not _active) return;
+    const auto unbound = _unboundVotes.load(std::memory_order_relaxed);
+    if (unbound > 0 and not _warnedAboutUnboundVotes) {
+      _warnedAboutUnboundVotes = true;
+      LOG_WARNING(unbound << " refinement votes kept their cell because its geometry or solution pointer was not the "
+        "one bound by beginStep(). Call command() with the accepted solution of the cells of this step.");
+    }
     if constexpr (not predictionMode()) {
       if (_clock != nullptr and fresh(_clock->getTimeStamp())) {
         const double time = _clock->getTimeStamp(), dt = _clock->getTimeStepSizeOfLastStep();
@@ -1018,6 +1131,7 @@ namespace exahype2::amr {
         if (detail.evidence.value > amr_detail::resolutionTolerance<C>()) result.refineEvidence++;
       }
     }
+    result.unboundVotes = _unboundVotes.load(std::memory_order_relaxed);
     return result;
   }
 
@@ -1063,7 +1177,10 @@ namespace exahype2::amr {
     _historyNeedsPruning = false;
     _stencilsBound = false;
     _topologyChanged = true;
+    _initialNeighbours = false;
     _assessed = false;
+    _assessCoarsening = true;
+    _unboundVotes.store(0, std::memory_order_relaxed);
   }
 
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>

@@ -58,6 +58,20 @@ def generate(solver):
         return {path.name: path.read_text() for path in generated.iterdir() if path.is_file()}
 
 
+class AMRHostSettingsTest(unittest.TestCase):
+    def test_coarsening_interval_is_validated(self):
+        for invalid in (0, -1, 2**31):
+            with self.assertRaises(ValueError):
+                exahype2.amr.AMR(state_scales=(1.0, 1.0), coarsening_interval=invalid)
+        for invalid in (True, 2.0, "2"):
+            with self.assertRaises(TypeError):
+                exahype2.amr.AMR(state_scales=(1.0, 1.0), coarsening_interval=invalid)
+        with self.assertRaisesRegex(ValueError, "prediction mode"):
+            exahype2.amr.AMR(state_scales=(1.0, 1.0), coarsening_interval=2, resolution_indicator="legacy")
+        with self.assertRaisesRegex(ValueError, "execution='cpu'"):
+            exahype2.amr.AMR(state_scales=(1.0, 1.0), coarsening_interval=2, execution="gpu")
+
+
 class AMRHostGenerationTest(unittest.TestCase):
     def test_stages_precede_the_votes_of_every_host_assessment(self):
         for family, member in (("fv", "_nativeCriterion"), ("rk", "_nativeCriterion"),
@@ -71,6 +85,46 @@ class AMRHostGenerationTest(unittest.TestCase):
                 votes = base.index("this->assessRefinement(cellConnectivity, requests, parameters);")
                 self.assertLess(stages, votes)
                 self.assertLess(votes, base.index(member + ".finishStep();"))
+
+    def test_native_criteria_bind_the_initial_mesh_before_the_initial_votes(self):
+        for family, nodes in (("fv", "nullptr"), ("rk", "_amrQuadratureNodes.data()"), ("ader", "_amrQuadratureNodes.data()")):
+            with self.subTest(family=family):
+                solver = solver_for(family)
+                exahype2.amr.AMR(state_scales=(1.0, 1.0)).install(solver)
+                base = generate(solver)["AMRHostBase.cpp"]
+                begin = base.index("_nativeCriterion.beginInitialisation(")
+                bind = base.index("_nativeCriterion.bindInitialState(cellConnectivity, this->downloadSolution().getView(), "
+                                  + nodes + ");")
+                self.assertLess(begin, bind)
+                self.assertLess(bind, base.index("SolverFamily::initialise(cellConnectivity, requests, parameters);"))
+        solver = solver_for("limited")
+        exahype2.amr.AMR(state_scales=(1.0, 1.0)).install(solver)
+        self.assertNotIn("bindInitialState", generate(solver)["AMRHostBase.cpp"])
+
+    def test_coarsening_interval_counts_assessed_steps(self):
+        solver = solver_for("ader")
+        exahype2.amr.AMR(state_scales=(1.0, 1.0), coarsening_interval=4).install(solver)
+        files = generate(solver)
+        self.assertIn("inline static unsigned long long _nativeCriterionCoarseningAssessments=0;", files["AMRHostBase.h"])
+        base = files["AMRHostBase.cpp"]
+        select = base.index("_nativeCriterion.setCoarseningAssessment(_nativeCriterionCoarseningAssessments % 4 == 0);")
+        self.assertLess(base.index("_nativeCriterion.beginStep("), select)
+        count = base.index("if(getTimeStepping().getTimeStepSizeOfLastStep()>0.)++_nativeCriterionCoarseningAssessments;")
+        self.assertLess(base.index("_nativeCriterion.finishStep();"), count)
+
+        default = solver_for("ader")
+        exahype2.amr.AMR(state_scales=(1.0, 1.0)).install(default)
+        self.assertNotIn("setCoarseningAssessment", generate(default)["AMRHostBase.cpp"])
+
+    def test_both_intervals_count_coarsening_on_assessed_steps_only(self):
+        solver = solver_for("ader")
+        exahype2.amr.AMR(state_scales=(1.0, 1.0), assessment_interval=3, coarsening_interval=2).install(solver)
+        base = generate(solver)["AMRHostBase.cpp"]
+        selected = base.index("if(_nativeCriterionAssessThisStep){\n_nativeCriterion.finishStep();")
+        count = base.index("++_nativeCriterionCoarseningAssessments;")
+        steps = base.index("++_nativeCriterionAcceptedSteps;")
+        self.assertLess(selected, count)
+        self.assertLess(count, steps)
 
 
 if __name__ == "__main__":

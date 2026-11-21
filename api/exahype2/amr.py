@@ -253,6 +253,13 @@ class _AMRSettings:
     sets tolerances for weighted sums of fields. With assessment_interval=N, the
     solver assesses the first accepted step and then every N steps that advance
     time. On skipped steps it votes Keep. The initial mesh is assessed separately.
+    With coarsening_interval=M, only every M-th assessed step checks whether
+    sibling cells can coarsen. The other assessed steps still request refinement.
+    Coarsening checks are the most expensive part of the CPU assessment.
+
+    With execution="cpu", FV and DG solvers without a limiter assess the
+    initial mesh with the same check as the time steps, once every cell holds
+    its initial data. Other configurations check each initial cell on its own.
 
     With resolution_indicator="legacy", the criterion measures variation in
     each cell and across its faces. quiet_time and reference_time control how
@@ -271,6 +278,7 @@ class _AMRSettings:
     sample_initial_data: bool = False
     linear_observables: tuple = ()
     assessment_interval: int = 1
+    coarsening_interval: int = 1
     resolution_components: tuple[int, ...] | None = None
     execution: str = "cpu"
 
@@ -287,6 +295,14 @@ class _AMRSettings:
             raise ValueError("assessment_interval must lie in [1, 2**31-1].")
         if self.assessment_interval != 1 and self.resolution_indicator != "prediction":
             raise ValueError("assessment_interval > 1 requires prediction mode; legacy quiet history needs every step.")
+        if isinstance(self.coarsening_interval, bool) or not isinstance(self.coarsening_interval, int):
+            raise TypeError("coarsening_interval must be an integer.")
+        if not 1 <= self.coarsening_interval <= 2**31 - 1:
+            raise ValueError("coarsening_interval must lie in [1, 2**31-1].")
+        if self.coarsening_interval != 1 and self.resolution_indicator != "prediction":
+            raise ValueError("coarsening_interval > 1 requires prediction mode.")
+        if self.coarsening_interval != 1 and self.execution != "cpu":
+            raise ValueError("coarsening_interval > 1 requires execution='cpu'.")
         if not isinstance(self.state_scales, (list, tuple)):
             raise TypeError("{} criterion state_scales must be a list or tuple.".format(type(self).__name__))
         object.__setattr__(
@@ -532,15 +548,23 @@ def _install_policy(policy, solver, adapter, declarations, *, member, header, po
         solver.add_includes("exahype2/terms/InitialCondition.h", "exahype2/terms/InitialisesPatches.h")
     solver.add_declarations(declarations)
     counter, selected = member + "AcceptedSteps", member + "AssessThisStep"
+    coarsening = member + "CoarseningAssessments"
     reset = "\n" + member + ".reset();\n"
     refresh = "" if device else _refresh_accepted_solution(member)
+    count_coarsening = ""
+    if policy.coarsening_interval > 1:
+        solver.add_declarations("inline static unsigned long long " + coarsening + "=0;\n")
+        reset += coarsening + "=0;\n"
+        begin_step += ("\n" + member + ".setCoarseningAssessment(" + coarsening + " % "
+                       + str(policy.coarsening_interval) + " == 0);\n")
+        count_coarsening = "if(getTimeStepping().getTimeStepSizeOfLastStep()>0.)++" + coarsening + ";\n"
     # The host votes share cell and family evidence. Evaluating it in parallel stages first keeps the votes
     # from waiting on each other. A device solution only reaches the host inside assessRefinement(), so those
     # builds evaluate the evidence within the votes.
     stages = "" if device else (
         "if (this->getSolution().isHostAccessible()) " + member + ".assess(getTimeStepping().getTimeStamp());\n")
     assessment = (refresh + "\n" + stages + "this->assessRefinement(cellConnectivity, requests, parameters);\n"
-                  + member + ".finishStep();\n")
+                  + member + ".finishStep();\n" + count_coarsening)
     if policy.assessment_interval > 1:
         solver.add_declarations("inline static unsigned long long " + counter + "=0;\n"
                                 "inline static bool " + selected + "=true;\n")
@@ -549,14 +573,22 @@ def _install_policy(policy, solver, adapter, declarations, *, member, header, po
                       "if(" + selected + "){\n" + begin_step + "\n}\n")
         assessment = ("if(" + selected + "){\n" + refresh + stages + "}\n"
                       "this->assessRefinement(cellConnectivity, requests, parameters, " + selected + ");\n"
-                      "if(" + selected + ")" + member + ".finishStep();\n"
+                      "if(" + selected + "){\n" + member + ".finishStep();\n" + count_coarsening + "}\n"
                       "if(getTimeStepping().getTimeStepSizeOfLastStep()>0.)++" + counter + ";\n")
     solver.on_start_simulation(reset)
     samples = ", " + _runtime_callback(member, "InitialDataPasses", snapshot=True) if policy.sample_initial_data else ""
+    # The native criteria also receive the initial mesh and the storage of its cells. The votes on the initial
+    # data then compare each cell with its neighbours, as the votes of a time step do.
+    initial_state = ""
+    if adapter is _NativeFVAdapter:
+        initial_state = member + ".bindInitialState(cellConnectivity, this->downloadSolution().getView(), nullptr);\n"
+    elif adapter is _NativeDGAdapter:
+        initial_state = (member + ".bindInitialState(cellConnectivity, this->downloadSolution().getView(), "
+                         "_amrQuadratureNodes.data());\n")
     solver._refinement_initialisation_implementation = (
         "\n" + member + ".beginInitialisation();\n" if device else _with_parameter_snapshot(
             "\n" + member + ".beginInitialisation(" + _runtime_callback(member, "Admissible", snapshot=True)
-            + samples + ");\n"
+            + samples + ");\n" + initial_state
         )
     )
     solver.on_start_time_step(begin_step)

@@ -58,9 +58,16 @@ namespace exahype2::amr {
       std::size_t conflictVetoes{0};
       std::size_t assessedLeaves{0};
       std::size_t refineEvidence{0};
+      /** Votes that kept a cell because its geometry or solution was not bound for this step. */
+      std::size_t unboundVotes{0};
     };
 
     void beginInitialisation(PhysicalAdmissibility admissible = nullptr, InitialDataCheck initialDataCheck = nullptr);
+    /** Gives the initial votes the mesh and the initial data of every cell, so that they compare neighbours as
+     * the votes of a time step do. Has no effect outside initialisation or in legacy mode. */
+    template<typename SolutionView, typename StatusView>
+    void bindInitialState(const peano4::CellConnectivity& mesh, SolutionView solution, StatusView statuses,
+                          const double* nodes);
     /** Sets up host assessment for this time step using the solver's cells, solution and optional limiter data. */
     template<typename SolutionView, typename StatusView>
     void beginStep(const peano4::CellConnectivity& mesh, SolutionView solution, StatusView statuses,
@@ -72,6 +79,8 @@ namespace exahype2::amr {
      * Call it once the accepted solution is in the storage bound by beginStep().
      * The votes are the same without this call, but concurrent command() calls then wait for each other. */
     void assess(double time);
+    /** Selects whether this step assesses coarsening. Refinement is assessed on every bound step. */
+    void setCoarseningAssessment(bool enabled);
     [[nodiscard]] exahype2::RefinementCommand command(
       const Precision* Q, const Coordinates& x, const Coordinates& h, double time) const;
     void finishStep();
@@ -182,6 +191,7 @@ namespace exahype2::amr {
     mutable std::unique_ptr<FamilyPlan[]> _familyPlans;
     /** Families with a child that leaves the decision to its siblings. */
     std::unique_ptr<std::atomic<bool>[]> _familyRequests;
+    mutable std::atomic<std::size_t> _unboundVotes{0};
     std::size_t _familyVoteCapacity{0};
     const exahype2::TimeStepping* _clock{nullptr};
     const double* _nodes{nullptr};
@@ -208,7 +218,11 @@ namespace exahype2::amr {
     bool _historyNeedsPruning{false};
     bool _stencilsBound{false};
     bool _topologyChanged{true};
+    bool _initialNeighbours{false};
     bool _assessed{false};
+    bool _assessCoarsening{true};
+    bool _warnedAboutStartTime{false};
+    bool _warnedAboutUnboundVotes{false};
     /** What a cell's own state and neighbours say before its siblings are consulted. */
     enum class OwnEvidence { Keep, Refine, Siblings };
     [[nodiscard]] OwnEvidence ownEvidence(const Cell& cell, const Coordinates& x, const Coordinates& h) const;
@@ -224,6 +238,7 @@ namespace exahype2::amr {
     [[nodiscard]] ResolutionEvidence cellDetail(const Cell& cell) const;
     [[nodiscard]] ResolutionEvidence computeCellDetail(const Cell& cell) const;
     void bindAcceptedFaces(const peano4::CellConnectivity& mesh);
+    void bindTopology(const peano4::CellConnectivity& mesh);
     [[nodiscard]] double acceptedFaceDetail(int face) const;
     [[nodiscard]] double faceDetail(
       const AcceptedCellView<Precision>& own, const AcceptedCellView<Precision>& other,

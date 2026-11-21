@@ -61,8 +61,16 @@ namespace exahype2::amr {
                    PhysicalAdmissibility admissible = nullptr, TransferAdmissibility transferAdmissible = nullptr,
                    NativeSubcells subcells = {});
 
+    /** Let the initial votes compare each cell with its neighbours once all cells hold their initial data. */
+    template<typename SolutionView>
+      requires (not Accepted::HasHybridSubcells)
+    void bindInitialState(const peano4::CellConnectivity& mesh, SolutionView solution, const double* nodes) {
+      _core.bindInitialState(mesh, solution, NoStatusView{}, nodes);
+    }
     /** Evaluate the evidence of all cells in parallel before the cells call command(). */
     void assess(double time) { _core.assess(time); }
+    /** Select whether this step checks coarsening. Refinement is checked on every bound step. */
+    void setCoarseningAssessment(bool enabled) { _core.setCoarseningAssessment(enabled); }
     /** Return Refine, Keep or Erase for this cell's accepted state. */
     [[nodiscard]] exahype2::RefinementCommand command(
       const Precision* Q, const Coordinates& x, const Coordinates& h, double time) const;
