@@ -342,9 +342,15 @@ class _AMRSettings:
             if quiet is not None and quiet != 0.0:
                 _positive("quiet_time", quiet)
                 warnings.warn(
-                    "quiet_time applies only to resolution_indicator='legacy'; "
-                    "prediction coarsening uses current accepted-state evidence without waiting.",
-                    DeprecationWarning, stacklevel=2,
+                    "quiet_time={!r} is ignored: it applies only to resolution_indicator='legacy'. "
+                    "Prediction coarsening uses the current accepted state without waiting.".format(quiet),
+                    UserWarning, stacklevel=3,
+                )
+            if self.reference_time != 1.0:
+                warnings.warn(
+                    "reference_time={!r} is ignored: it applies only to resolution_indicator='legacy'.".format(
+                        self.reference_time),
+                    UserWarning, stacklevel=3,
                 )
             quiet = 0.0
         object.__setattr__(self, "quiet_time", quiet)
@@ -365,6 +371,23 @@ def _check_refinement_callback(solver, external_callback):
         raise ValueError(
             "The solver already has a refinement criterion; use external_callback=True for an existing C++ definition."
         )
+
+
+def _protect_refinement_callback(solver):
+    """Reject a later refinement_criterion term. It would replace the installed policy's votes while the
+    solver keeps binding and assessing the policy on every step."""
+    set_pde_terms = solver.set_pde_terms
+
+    def set_pde_terms_of_solver_with_amr(**pde_terms):
+        if "refinement_criterion" in pde_terms:
+            raise ValueError(
+                "The installed AMR policy defines this solver's refinement criterion. Install the policy with "
+                "external_callback=True to combine it with your own callback, which returns amrCommand(Q, x, h, t) "
+                "wherever the policy decides."
+            )
+        return set_pde_terms(**pde_terms)
+
+    solver.set_pde_terms = set_pde_terms_of_solver_with_amr
 
 
 def _runtime_callback(member, operation, solver_template="", *, snapshot=False, device=False):
@@ -547,6 +570,22 @@ def _install_policy(policy, solver, adapter, declarations, *, member, header, po
     if policy.sample_initial_data:
         solver.add_includes("exahype2/terms/InitialCondition.h", "exahype2/terms/InitialisesPatches.h")
     solver.add_declarations(declarations)
+    if not device:
+        solver.add_declarations("""
+  /** The vote of the installed AMR policy for one cell. An application that installs the policy with
+   *  external_callback=True returns this vote from its refinementCriterion() wherever the policy decides. */
+  static ::exahype2::RefinementCommand amrCommand(
+    const %(storage)s* Q, const tarch::la::Vector<DIMENSIONS, double>& x,
+    const tarch::la::Vector<DIMENSIONS, double>& h, double t
+  ) { return %(member)s.command(Q, x, h, t); }
+""" % {"storage": solver.precision.storage, "member": member})
+    if policy.resolution_indicator == "legacy" and not solver.pde_terms.is_set("max_eigenvalue"):
+        warnings.warn(
+            "The legacy indicator counts quiet time in cell crossing times. This solver has no max_eigenvalue "
+            "term, so every cell uses reference_time instead and coarsens after quiet_time * reference_time = "
+            "{!r} time units at the earliest.".format(policy.quiet_time * policy.reference_time),
+            UserWarning, stacklevel=4,
+        )
     counter, selected = member + "AcceptedSteps", member + "AssessThisStep"
     coarsening = member + "CoarseningAssessments"
     reset = "\n" + member + ".reset();\n"
@@ -601,6 +640,8 @@ def _install_policy(policy, solver, adapter, declarations, *, member, header, po
     ))
     if not device:
         solver.pde_terms.set_host_only("refinement_criterion")
+    if not external_callback:
+        _protect_refinement_callback(solver)
     setattr(solver, policy_attribute, policy)
     return solver
 
@@ -614,7 +655,10 @@ class Limiter(_AMRSettings):
     """
 
     def install(self, solver, *, external_callback=False):
-        """Attach the criterion. For CPU assessment, external_callback=True keeps an existing C++ callback."""
+        """Attach the criterion. For CPU assessment, external_callback=True keeps the application's own
+        refinementCriterion(). That callback returns amrCommand(Q, x, h, t) wherever this policy decides,
+        for example after its own rules for the initial mesh. Without external_callback, the policy owns
+        the refinement_criterion term and later changes of it are rejected."""
         if not isinstance(external_callback, bool):
             raise TypeError("external_callback must be a boolean.")
         adapter = _solver_adapter(solver)
@@ -876,7 +920,10 @@ class Native(_AMRSettings):
         return adapter
 
     def install(self, solver, *, external_callback=False):
-        """Attach the criterion. For CPU assessment, external_callback=True keeps an existing C++ callback."""
+        """Attach the criterion. For CPU assessment, external_callback=True keeps the application's own
+        refinementCriterion(). That callback returns amrCommand(Q, x, h, t) wherever this policy decides,
+        for example after its own rules for the initial mesh. Without external_callback, the policy owns
+        the refinement_criterion term and later changes of it are rejected."""
         if not isinstance(external_callback, bool):
             raise TypeError("external_callback must be a boolean.")
         adapter = self._validate_solver(solver)
@@ -1051,9 +1098,12 @@ class AMR(_AMRSettings):
     def install(self, solver, *, external_callback=False):
         """Select the FV/DG or subcell-limiter adapter and install its callbacks."""
         policy_type = Limiter if getattr(solver, "subcell_limiter_is_enabled", False) else Native
-        policy = policy_type(**{
-            name: getattr(self, name) for name in _AMRSettings.__dataclass_fields__
-        })
+        with warnings.catch_warnings():
+            # The settings were checked, and their warnings issued, when this object was created.
+            warnings.simplefilter("ignore", UserWarning)
+            policy = policy_type(**{
+                name: getattr(self, name) for name in _AMRSettings.__dataclass_fields__
+            })
         policy.install(solver, external_callback=external_callback)
         solver._independent_amr_criterion = self
         return solver

@@ -8,6 +8,7 @@ Run from the repository root with
 
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from unittest.mock import patch
 
@@ -59,6 +60,24 @@ def generate(solver):
 
 
 class AMRHostSettingsTest(unittest.TestCase):
+    def test_prediction_mode_reports_ignored_legacy_settings(self):
+        with self.assertWarnsRegex(UserWarning, "quiet_time=5.0 is ignored"):
+            policy = exahype2.amr.AMR(state_scales=(1.0, 1.0), quiet_time=5.0)
+        self.assertEqual(policy.quiet_time, 0.0)
+        with self.assertWarnsRegex(UserWarning, "reference_time=2.0 is ignored"):
+            exahype2.amr.AMR(state_scales=(1.0, 1.0), reference_time=2.0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            exahype2.amr.AMR(state_scales=(1.0, 1.0))
+            exahype2.amr.AMR(state_scales=(1.0, 1.0), resolution_indicator="legacy", quiet_time=5.0, reference_time=2.0)
+
+    def test_ignored_settings_warn_once_per_installation(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            policy = exahype2.amr.AMR(state_scales=(1.0, 1.0), reference_time=2.0)
+            policy.install(solver_for("ader"))
+        self.assertEqual(len([warning for warning in caught if "reference_time" in str(warning.message)]), 1)
+
     def test_coarsening_interval_is_validated(self):
         for invalid in (0, -1, 2**31):
             with self.assertRaises(ValueError):
@@ -71,8 +90,42 @@ class AMRHostSettingsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "execution='cpu'"):
             exahype2.amr.AMR(state_scales=(1.0, 1.0), coarsening_interval=2, execution="gpu")
 
+    def test_legacy_mode_without_wave_speed_reports_its_quiet_time_unit(self):
+        policy = exahype2.amr.AMR(state_scales=(1.0, 1.0), resolution_indicator="legacy", quiet_time=3.0, reference_time=2.0)
+        with self.assertWarnsRegex(UserWarning, "quiet_time \\* reference_time = 6.0"):
+            policy.install(solver_for("fv", max_eigenvalue=False))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            policy.install(solver_for("fv"))
+
 
 class AMRHostGenerationTest(unittest.TestCase):
+    def test_installed_policy_rejects_a_replaced_refinement_callback(self):
+        for family in ("fv", "rk", "ader", "limited"):
+            with self.subTest(family=family):
+                solver = solver_for(family)
+                exahype2.amr.AMR(state_scales=(1.0, 1.0)).install(solver)
+                with self.assertRaisesRegex(ValueError, "external_callback=True"):
+                    solver.set_pde_terms(refinement_criterion="return ::exahype2::RefinementCommand::Keep;")
+                with self.assertRaisesRegex(ValueError, "external_callback=True"):
+                    solver.set_pde_terms(refinement_criterion=None)
+                # Other terms remain open to the application.
+                solver.set_pde_terms(flux="F[0] = Q[0];")
+
+    def test_external_callback_can_forward_to_the_documented_vote(self):
+        for family, member in (("fv", "_nativeCriterion"), ("limited", "_limiterCriterion")):
+            with self.subTest(family=family):
+                solver = solver_for(family)
+                exahype2.amr.AMR(state_scales=(1.0, 1.0)).install(solver, external_callback=True)
+                solver.set_pde_terms(refinement_criterion="""
+                  if (t <= 0.0 and x(0) < 0.5) return ::exahype2::RefinementCommand::Refine;
+                  return {{SOLVER_NAME}}Base::amrCommand(Q, x, h, t);
+                """)
+                files = generate(solver)
+                self.assertIn("static ::exahype2::RefinementCommand amrCommand(", files["AMRHostBase.h"])
+                self.assertIn("{ return " + member + ".command(Q, x, h, t); }", files["AMRHostBase.h"])
+                self.assertIn("AMRHostBase::amrCommand(Q, x, h, t)", files["AMRHost.cpph"])
+
     def test_stages_precede_the_votes_of_every_host_assessment(self):
         for family, member in (("fv", "_nativeCriterion"), ("rk", "_nativeCriterion"),
                                ("ader", "_nativeCriterion"), ("limited", "_limiterCriterion")):
