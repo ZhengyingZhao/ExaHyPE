@@ -20,9 +20,12 @@ namespace {
     static constexpr bool   UsePredictionCriterion = Prediction;
     static constexpr double TransferTolerance      = 0.01;
     static constexpr double ResolutionTolerance    = 0.01;
-    static constexpr double QuietTime              = 0.25;
-    static constexpr double ReferenceTime          = 1.0;
     static GPU_CALLABLE_METHOD double stateScale(int) { return 1.0; }
+  };
+
+  struct QuietDGConfig : CriterionConfig<false, false> {
+    static constexpr double QuietTime     = 0.25;
+    static constexpr double ReferenceTime = 1.0;
   };
 
   struct LinearDGConfig : CriterionConfig<false> {
@@ -448,7 +451,7 @@ UNIT_TEST("Device DG AMR carries quiet history across completed time steps") {
     return;
   }
   GIVEN("Degree zero DG siblings with a quiet time requirement of one quarter") {
-    Comparison<1, CriterionConfig<false, false>> comparison(getGrid());
+    Comparison<1, QuietDGConfig> comparison(getGrid());
     comparison.begin();
     comparison.clock.advanceTimeStamp(0.125);
     comparison.assess(false);
@@ -475,9 +478,9 @@ UNIT_TEST("Degree one device DG AMR certifies constant sibling transfers in doub
   if (tarch::mpi::Rank::getInstance().getNumberOfRanks() != 1) {
     return;
   }
-  const auto compare = []<typename P>() {
+  const auto compare = []<typename Precision>(Precision) {
     GIVEN("A complete family with Gauss Legendre nodes and the solver's degree one transfer matrices") {
-      Comparison<2, LinearDGConfig, P> comparison(getGrid());
+      Comparison<2, LinearDGConfig, Precision> comparison(getGrid());
       comparison.begin();
       comparison.clock.advanceTimeStamp(0.125);
 
@@ -492,17 +495,17 @@ UNIT_TEST("Degree one device DG AMR certifies constant sibling transfers in doub
       }
     }
   };
-  compare.template operator()<double>();
-  compare.template operator()<float>();
+  compare(double{});
+  compare(float{});
 }
 
 UNIT_TEST("Degree one device DG AMR refines rough accepted profiles in double and float") {
   if (tarch::mpi::Rank::getInstance().getNumberOfRanks() != 1) {
     return;
   }
-  const auto compare = []<typename P>() {
+  const auto compare = []<typename Precision>(Precision) {
     GIVEN("Degree one DG siblings bound before their accepted nodal states change") {
-      Comparison<2, LinearDGConfig, P> comparison(getGrid());
+      Comparison<2, LinearDGConfig, Precision> comparison(getGrid());
       comparison.begin();
       comparison.populate(State::Rough);
       comparison.clock.advanceTimeStamp(0.125);
@@ -514,17 +517,17 @@ UNIT_TEST("Degree one device DG AMR refines rough accepted profiles in double an
       }
     }
   };
-  compare.template operator()<double>();
-  compare.template operator()<float>();
+  compare(double{});
+  compare(float{});
 }
 
 UNIT_TEST("Degree one device DG AMR vetoes lossy transfers within the resolution budget in double and float") {
   if (tarch::mpi::Rank::getInstance().getNumberOfRanks() != 1) {
     return;
   }
-  const auto compare = []<typename P>() {
+  const auto compare = []<typename Precision>(Precision) {
     GIVEN("Resolved degree one sibling polynomials with a stricter fine to parent transfer budget") {
-      Comparison<2, StrictTransferDGConfig, P> comparison(getGrid());
+      Comparison<2, StrictTransferDGConfig, Precision> comparison(getGrid());
       comparison.populate(State::Rough);
       comparison.begin();
       comparison.clock.advanceTimeStamp(0.125);
@@ -541,8 +544,8 @@ UNIT_TEST("Degree one device DG AMR vetoes lossy transfers within the resolution
       }
     }
   };
-  compare.template operator()<double>();
-  compare.template operator()<float>();
+  compare(double{});
+  compare(float{});
 }
 
 UNIT_TEST("Device AMR retains complete sibling and neighbour checks across a coarse fine grid") {
