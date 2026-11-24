@@ -179,8 +179,9 @@ exahype2::dg::limiting::SubcellScheme<Derived, ComputePrecision>::projectSubgrid
 /**
  * Advances the subgrid by one step, projects it onto the nodes and returns the wave speeds of the
  * evolved subgrid under an adaptive time step rule. A solver with a fallback reconstruction repeats
- * the step with it when an evolved subcell fails the physical admissibility test. Bit f of
- * boundaryFaces marks face f on the domain boundary.
+ * the step with it when an evolved subcell fails the physical admissibility test. If the solver
+ * defines postprocessUpdatedPatch() with a point count, the function then calls it on the evolved
+ * subcells. Bit f of boundaryFaces marks face f on the domain boundary.
  */
 template <typename Derived, typename ComputePrecision>
 template <typename StoragePrecision>
@@ -236,6 +237,17 @@ exahype2::dg::limiting::SubcellScheme<Derived, ComputePrecision>::recompute(
         parameters
       );
     }
+  }
+  if constexpr (exahype2::terms::HasCountedPostprocessUpdatedPatch<Derived, StoragePrecision>) {
+    Derived::postprocessUpdatedPatch(
+      evolvedSubcells,
+      SubcellsPerCell,
+      cellCentre,
+      cellSize,
+      timeStamp,
+      timeStepSize,
+      parameters
+    );
   }
   for (int value = 0; value < SubcellValuesPerCell; value++) {
     subcells[value] = evolvedSubcells[value];
@@ -305,8 +317,10 @@ exahype2::dg::limiting::SubcellScheme<Derived, ComputePrecision>::recomputeInTea
 
 /**
  * Runs every phase of recompute() with the threads of team. The threads divide the subcells and the
- * nodes of the cell among themselves. The projection onto the nodes then overwrites evolvedSubcells
- * with ScratchValuesPerRecomputedCell values. Every thread returns the wave speeds of its subcells.
+ * nodes of the cell among themselves. If the solver defines postprocessUpdatedPatch() with a point
+ * count, one thread calls it on the whole subgrid. The projection onto the nodes then overwrites
+ * evolvedSubcells with ScratchValuesPerRecomputedCell values. Every thread returns the wave speeds
+ * of its subcells.
  */
 template <typename Derived, typename ComputePrecision>
 template <typename StoragePrecision>
@@ -377,6 +391,20 @@ exahype2::dg::limiting::SubcellScheme<Derived, ComputePrecision>::recomputeWithT
     }
   }
   tarch::accelerator::teamBarrier(team);
+  if constexpr (exahype2::terms::HasCountedPostprocessUpdatedPatch<Derived, StoragePrecision>) {
+    if (thread == 0) {
+      Derived::postprocessUpdatedPatch(
+        evolvedSubcells,
+        SubcellsPerCell,
+        cellCentre,
+        cellSize,
+        timeStamp,
+        timeStepSize,
+        parameters
+      );
+    }
+    tarch::accelerator::teamBarrier(team);
+  }
   for (int subcell = thread; subcell < SubcellsPerCell; subcell += threads) {
     for (int value = subcell * NumberOfData; value < (subcell + 1) * NumberOfData; value++) {
       subcells[value] = evolvedSubcells[value];

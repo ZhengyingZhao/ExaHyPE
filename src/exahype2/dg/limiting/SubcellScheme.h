@@ -11,6 +11,7 @@
 #include "exahype2/terms/Flux.h"
 #include "exahype2/terms/MaxEigenvalue.h"
 #include "exahype2/terms/NonconservativeProduct.h"
+#include "exahype2/terms/PostprocessUpdatedPatch.h"
 #include "exahype2/terms/SourceTerm.h"
 #include "exahype2/terms/SubcellRiemannSolver.h"
 #include "peano4/CellConnectivity.h"
