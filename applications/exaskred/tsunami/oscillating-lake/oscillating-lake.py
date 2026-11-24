@@ -4,6 +4,38 @@ import argparse
 
 import exahype2
 
+# The two forms of the hook that the solver runs on a cell after its update. Both turn water at or
+# below hThreshold into dry ground. The solver calls the first form on the nodes of a cell. The
+# subcell limiter calls the second form on the subcells of a cell that it recomputes.
+DRY_STATE_CLEANUP = """
+  static INLINE_METHOD GPU_CALLABLE_METHOD void postprocessUpdatedPatch(
+    double* Q,
+    const tarch::la::Vector<DIMENSIONS, double>& x,
+    const tarch::la::Vector<DIMENSIONS, double>& h,
+    double t,
+    double dt,
+    const RuntimeParameters& parameters
+  ) {
+    postprocessUpdatedPatch(Q, PointsPerCell, x, h, t, dt, parameters);
+  }
+
+  static INLINE_METHOD GPU_CALLABLE_METHOD void postprocessUpdatedPatch(
+    double* Q,
+    int numberOfPoints,
+    [[maybe_unused]] const tarch::la::Vector<DIMENSIONS, double>& x,
+    [[maybe_unused]] const tarch::la::Vector<DIMENSIONS, double>& h,
+    [[maybe_unused]] double t,
+    [[maybe_unused]] double dt,
+    [[maybe_unused]] const RuntimeParameters& parameters
+  ) {
+    applications::exahype2::exaskred::limiting::resetDryStates<
+      Shortcuts,
+      NumberOfUnknowns,
+      NumberOfAuxiliaryVariables
+    >(Q, numberOfPoints, hThreshold);
+  }
+"""
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
@@ -18,6 +50,11 @@ def parse_arguments():
     parser.add_argument("-l", "--grid-levels", type=int, default=None)
     parser.add_argument("-lmin", "--min-grid-levels", type=int, default=5)
     parser.add_argument("-lmax", "--max-grid-levels", type=int, default=5)
+    parser.add_argument(
+        "--dry-state-cleanup",
+        action="store_true",
+        help="turn water at or below the dry threshold into dry ground after every update",
+    )
     args, _ = parser.parse_known_args()
     if args.grid_levels is not None:
         args.min_grid_levels = args.grid_levels
@@ -72,6 +109,13 @@ aderdg_solver.set_pde_terms(
     physical_admissibility=True,
 )
 aderdg_solver.add_subcell_limiter(exahype2.fv.Godunov())
+
+# A retreating shoreline leaves water at or below hThreshold behind. The admissibility test
+# accepts a cell as dry only when it holds no water, so such a cell stays on the subcell limiter.
+# The cleanup removes this water and the cell returns to the ADER-DG scheme.
+if args.dry_state_cleanup:
+    aderdg_solver.add_includes("applications/exaskred/Limiting.h")
+    aderdg_solver.add_solver_declarations(DRY_STATE_CLEANUP)
 
 aderdg_solver.set_pde_terms(analytical_solution=True)
 aderdg_solver.measure_error(every=args.end_time / 100.0)

@@ -37,6 +37,22 @@ namespace applications::exahype2::exaskred::limiting {
 
   template <class Shortcuts, int NumberOfUnknowns, int NumberOfAuxiliaryVariables, typename T>
   INLINE_METHOD GPU_CALLABLE_METHOD bool isAdmissibleState(const T* const Q, const double minimumWaterHeight);
+
+  /**
+   * Turns thin water into dry ground. A state whose water height lies between zero and
+   * minimumWaterHeight gets the water height zero and the momentum zero. Its bathymetry and its
+   * auxiliary variables keep their values. A state with a negative water height or with a
+   * non-finite value stays as it is, so the admissibility test still sees it.
+   *
+   * A retreating shoreline leaves thin water behind. A solver that accepts a cell as dry only when
+   * it holds no water calls this function on the numberOfStates states in Q after every update.
+   */
+  template <class Shortcuts, int NumberOfUnknowns, int NumberOfAuxiliaryVariables, typename T>
+  INLINE_METHOD GPU_CALLABLE_METHOD void resetDryStates(
+    T* const     Q,
+    const int    numberOfStates,
+    const double minimumWaterHeight
+  );
 } // namespace applications::exahype2::exaskred::limiting
 
 #include "Limiting.cpph"
