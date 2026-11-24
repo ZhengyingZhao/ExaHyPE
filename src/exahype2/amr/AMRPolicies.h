@@ -5,14 +5,18 @@
 #include "AMRMath.h"
 #include "tarch/accelerator/ChunkedMemoryPool.h"
 
+// The parts that a criterion is put together from: how to read the solution of a cell, how to move it
+// between a parent and its children, and what a limiter adds. AMRCore takes them as template arguments.
 TARGET_DECLARE
 namespace exahype2::amr {
-  /** Tag for AMR core implementations. */
+  /** Marks a class as an AMR core. */
   struct AMRCoreTag {};
 
+  /** How the values of a cell are stored: at the DG nodes or as averages over finite volumes. */
   enum class AcceptedRepresentation { DGNodal, FVCellAverages };
 
-  /** The solution used for this time step, stored at DG nodes or as finite-volume averages. */
+  /** The accepted solution of one cell, that is its solution after a completed time step: the values, the
+   * number of nodes or volumes per axis and how the values are stored. */
   template<typename P>
   struct AcceptedCellView {
     const P* values{nullptr};
@@ -22,11 +26,12 @@ namespace exahype2::amr {
     [[nodiscard]] GPU_CALLABLE_METHOD bool isFiniteVolume() const { return representation == AcceptedRepresentation::FVCellAverages; }
   };
 
+  /** Stands in for the limiter statuses of a solver without a limiter. No cell has a status. */
   struct NoStatusView {
     [[nodiscard]] GPU_CALLABLE_METHOD const int* getChunk(int) const { return nullptr; }
   };
 
-  /** Read standalone FV means or DG nodal values. */
+  /** Reads the accepted solution of a solver without a limiter: the FV averages or DG nodal values of the cell. */
   template<int N, int V, typename C, typename P>
   struct NativeAcceptedSolutionAdapter {
     using Subcells = typename tarch::accelerator::ChunkedMemoryPool<P>::ConstView;
@@ -37,7 +42,8 @@ namespace exahype2::amr {
     }
   };
 
-  /** Use subcell averages where the limiter took over and DG nodal values elsewhere. */
+  /** Reads the accepted solution of ADER-DG with the subcell limiter: the subcell averages where the limiter
+   * took over, the DG nodal values elsewhere. */
   template<int N, int V, typename P, typename Layout>
   struct HybridAcceptedSolutionAdapter {
     using LimiterAdapter = Layout;
@@ -54,7 +60,8 @@ namespace exahype2::amr {
     }
   };
 
-  /** No limiter-specific restrictions on AMR decisions. */
+  /** The answers about the limiter for a solver that has none: every cell may coarsen and none has to
+   * refine. SubcellLimiterEvidence explains the questions. */
   struct NoLimiterEvidence {
     static GPU_CALLABLE_METHOD bool available(const int*) { return true; }
     static GPU_CALLABLE_METHOD bool known(const int*) { return true; }
@@ -62,7 +69,7 @@ namespace exahype2::amr {
     static GPU_CALLABLE_METHOD bool requiresResolution(const int*) { return false; }
   };
 
-  /** Conservative transfer for FV cell means. */
+  /** Moves FV averages between a parent and its children. Both directions keep the mean. */
   template<int N, int V, typename C, typename P>
   struct FVTransferPolicy {
     static constexpr bool IsFiniteVolume = true;
@@ -75,7 +82,8 @@ namespace exahype2::amr {
     static GPU_CALLABLE_METHOD bool polynomialPasses(const P*, const P*) { return true; }
   };
 
-  /** Move DG data between levels and check how much that round trip changes the polynomial. */
+  /** Moves a DG polynomial between a parent and its children, and checks how far a child differs from the
+   * polynomial that comes back from the parent. */
   template<int N, int V, typename C, typename P>
   struct DGTransferPolicy {
     static constexpr bool IsFiniteVolume = false;
@@ -90,6 +98,7 @@ namespace exahype2::amr {
     }
   };
 
+  /** The transfer of a solver without a limiter: for FV or for DG, as Config says. */
   template<int N, int V, typename C, typename P>
   using NativeTransferPolicy = std::conditional_t<C::IsFiniteVolume,
     FVTransferPolicy<N,V,C,P>, DGTransferPolicy<N,V,C,P>>;

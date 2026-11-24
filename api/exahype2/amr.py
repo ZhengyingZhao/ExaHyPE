@@ -1,6 +1,15 @@
 # This file is part of the ExaHyPE2 project. For conditions of distribution and
 # use, please see the copyright notice at www.peano-framework.org
-"""Adaptive mesh refinement for FV, ADER-DG and RKDG solvers."""
+"""Adaptive mesh refinement (AMR) criteria for FV, ADER-DG and RKDG solvers.
+
+Create an AMR object with the scale of every stored value and the tolerances, and install it on a
+configured solver:
+
+    exahype2.amr.AMR(state_scales=(1.0, 1.0, 1.0), transfer_tolerance=1.0e-3).install(solver)
+
+The generated solver then decides after every time step which cells refine, keep their size or
+coarsen. The C++ part of the criterion is in src/exahype2/amr.
+"""
 
 import math
 import warnings
@@ -38,12 +47,13 @@ def _finite_real(name, value):
 
 @dataclass(frozen=True, kw_only=True)
 class LinearObservable:
-    """Set an additional AMR budget for z = sum(weights[i] * Q[i]).
+    """A quantity that the criterion keeps within a tolerance of its own.
 
-    The budget is absolute_tolerance + relative_tolerance * (max(z)-min(z))
-    over the accepted local data. absolute_tolerance is positive and has the
-    units of z; relative_tolerance is nonnegative. Supply one weight per stored
-    component, using zero for components that do not contribute to z.
+    The quantity is the weighted sum z = sum(weights[i] * Q[i]) of the stored values. Its tolerance
+    is absolute_tolerance + relative_tolerance * (max(z) - min(z)), with the range of z taken over the
+    cells that a check compares. absolute_tolerance is positive and has the units of z.
+    relative_tolerance is not negative. Give one weight per stored value, and zero for a value that
+    is not part of z.
     """
 
     weights: tuple
@@ -112,12 +122,13 @@ def _solver_adapter(solver):
 
 
 def _double_quadrature_points(solver):
-    """Return the generated Quadrature<double> nodes used by AMR."""
+    """Return the DG nodes of the solver in double precision, as its generated Quadrature<double> holds them."""
     return tuple(float(point) for point in solver.basis.rounded_quadrature_points)
 
 
 def _highest_mode_weights(solver):
-    """Compute reflection-symmetric weights for the highest Legendre coefficient."""
+    """Return the weights that give the highest Legendre coefficient of a polynomial from its node values
+    along a line. Mirrored nodes get the same weight up to its sign."""
     points = tuple(Fraction.from_float(point) for point in _double_quadrature_points(solver))
     order = solver.order
     if order == 0:
@@ -139,7 +150,8 @@ def _highest_mode_weights(solver):
 
 
 def _taylor_weights(solver):
-    """Map DG nodes to every normal Taylor coefficient on either face."""
+    """Return the weights that give the Taylor coefficients of a polynomial at the lower and at the upper end
+    of a line from its node values."""
     stored = _double_quadrature_points(solver)
     points = tuple(Fraction.from_float(1.0 - stored[-1 - node] if node < len(stored) // 2 else point)
                    for node, point in enumerate(stored))
@@ -184,9 +196,11 @@ def _taylor_declarations(count, weights):
 
 
 def _transfer_weights(solver):
-    """Compute outward bounds for the nodal-to-Bernstein transform.
+    """Return lower and upper bounds of the matrix that converts node values to Bernstein coefficients, and a
+    bound of its largest row sum.
 
-    Mirrored entries share bounds to preserve reflection symmetry.
+    The C++ criterion uses them to bound a polynomial between its nodes. Mirrored entries get the same
+    bounds.
     """
     points = tuple(Fraction.from_float(point) for point in _double_quadrature_points(solver))
     count = len(points)
@@ -238,35 +252,42 @@ def _transfer_weights(solver):
 
 @dataclass(frozen=True, kw_only=True)
 class _AMRSettings:
-    """Choose how a solver decides which cells to refine, keep or coarsen.
+    """The settings of an AMR criterion: how a solver decides which cells refine, keep their size or coarsen.
 
-    Set execution to "cpu" for host assessment or "gpu" to use the configured
-    accelerator backend. Give each stored field, including auxiliaries, a
-    positive scale in state_scales. transfer_tolerance limits the error allowed
-    when coarsening. resolution_tolerance limits spatial detail after scaling
-    and defaults to transfer_tolerance.
+    A cell refines when its score exceeds resolution_tolerance. The score measures how poorly the cell
+    and its faces resolve the solution. Sibling cells coarsen when their parent reproduces them within
+    transfer_tolerance and stays within resolution_tolerance against all its neighbours, including
+    neighbouring parents that coarsen in the same step. For smooth data of polynomial degree p, a parent
+    scores about 3**(p+1) times its children, so coarsening starts that far below the refinement
+    threshold. This gap is the hysteresis of the criterion.
 
-    With resolution_indicator="prediction", the criterion checks how well
-    nearby solution profiles agree. resolution_components selects the fields
-    for this check, and None uses all fields. The checks for transfer error,
-    finite values and physical admissibility use the full state. linear_observables
-    sets tolerances for weighted sums of fields. With assessment_interval=N, the
-    solver assesses the first accepted step and then every N steps that advance
-    time. On skipped steps it votes Keep. The initial mesh is assessed separately.
-    With coarsening_interval=M, only every M-th assessed step checks whether
-    sibling cells can coarsen. The other assessed steps still request refinement.
-    Coarsening checks are the most expensive part of the CPU assessment.
+    state_scales: one positive scale per stored value, auxiliary values included. Differences are
+        divided by the scales before they are compared with the tolerances.
+    transfer_tolerance: the largest scaled change of the solution that coarsening may cause.
+    resolution_tolerance: the largest score of a resolved cell. Defaults to transfer_tolerance.
+    resolution_indicator: "prediction" scores how well one polynomial fits the solution on both sides
+        of a face. "legacy" scores the variation inside a cell and the jump across its faces.
+    resolution_components: the indices of the values that count for the prediction score. None uses
+        all values. The checks of the transfer error, of finite values and of physical admissibility
+        always use all values.
+    linear_observables: LinearObservable objects, weighted sums of values with tolerances of their own
+        (prediction only).
+    assessment_interval: with N, the solver assesses the first step and then every N-th step that
+        advances time. In the other steps every cell keeps its size. The initial mesh is always
+        assessed (prediction only).
+    coarsening_interval: with M, only every M-th assessed step checks whether siblings can coarsen.
+        The other assessed steps still refine. A larger value saves time, because the coarsening
+        checks are the costly part of an assessment (prediction on the CPU only).
+    quiet_time, reference_time: legacy only. Siblings coarsen after they have been resolved for
+        quiet_time wave crossing times. A cell in which nothing moves counts reference_time as its
+        crossing time.
+    sample_initial_data: for DG solvers, compare the initial polynomial of a cell with the initial
+        condition at the nodes of its children, and refine the cell where they differ too much.
+    execution: "cpu" assesses on the host, "gpu" on the accelerator of the build.
 
-    With execution="cpu", FV and DG solvers without a limiter assess the
-    initial mesh with the same check as the time steps, once every cell holds
-    its initial data. Other configurations check each initial cell on its own.
-
-    With resolution_indicator="legacy", the criterion measures variation in
-    each cell and across its faces. quiet_time and reference_time control how
-    long a cell must stay quiet before it can coarsen.
-
-    For DG solvers, sample_initial_data compares the initial polynomial with
-    pointwise initial values on its children.
+    With execution="cpu", FV and DG solvers without a limiter score the cells of the initial mesh with
+    their neighbours, as in a time step, once every cell holds its initial data. The other
+    configurations judge every initial cell on its own.
     """
 
     state_scales: tuple
@@ -359,7 +380,8 @@ class _AMRSettings:
 
 
 def _check_refinement_callback(solver, external_callback):
-    """Reject duplicate or conflicting policies before changing a solver."""
+    """Raise an error if the solver already has an AMR criterion, or a refinement criterion that this one
+    would replace."""
     if (getattr(solver, "_independent_native_criterion", None) is not None
             or getattr(solver, "_independent_limiter_criterion", None) is not None):
         raise ValueError("The solver already has an independent refinement criterion.")
@@ -374,8 +396,9 @@ def _check_refinement_callback(solver, external_callback):
 
 
 def _protect_refinement_callback(solver):
-    """Reject a later refinement_criterion term. It would replace the installed policy's votes while the
-    solver keeps binding and assessing the policy on every step."""
+    """Make the solver reject a refinement_criterion term that is set after the criterion was installed.
+    Such a term would replace the votes of the criterion, while the solver would still prepare and assess
+    the criterion in every step."""
     set_pde_terms = solver.set_pde_terms
 
     def set_pde_terms_of_solver_with_amr(**pde_terms):
@@ -597,9 +620,9 @@ def _install_policy(policy, solver, adapter, declarations, *, member, header, po
         begin_step += ("\n" + member + ".setCoarseningAssessment(" + coarsening + " % "
                        + str(policy.coarsening_interval) + " == 0);\n")
         count_coarsening = "if(getTimeStepping().getTimeStepSizeOfLastStep()>0.)++" + coarsening + ";\n"
-    # The host votes share cell and family evidence. Evaluating it in parallel stages first keeps the votes
-    # from waiting on each other. A device solution only reaches the host inside assessRefinement(), so those
-    # builds evaluate the evidence within the votes.
+    # The CPU criterion computes the decisions of all cells in parallel before the votes, which then only
+    # read them. This needs the solution in host memory. A solver that computes on a GPU brings its solution
+    # to the host inside assessRefinement(), so there the votes compute the decisions themselves.
     stages = "" if device else (
         "if (this->getSolution().isHostAccessible()) " + member + ".assess(getTimeStepping().getTimeStamp());\n")
     assessment = (refresh + "\n" + stages + "this->assessRefinement(cellConnectivity, requests, parameters);\n"
@@ -616,8 +639,8 @@ def _install_policy(policy, solver, adapter, declarations, *, member, header, po
                       "if(getTimeStepping().getTimeStepSizeOfLastStep()>0.)++" + counter + ";\n")
     solver.on_start_simulation(reset)
     samples = ", " + _runtime_callback(member, "InitialDataPasses", snapshot=True) if policy.sample_initial_data else ""
-    # The native criteria also receive the initial mesh and the storage of its cells. The votes on the initial
-    # data then compare each cell with its neighbours, as the votes of a time step do.
+    # A criterion for a solver without a limiter also gets the initial mesh and the solution of its cells.
+    # The votes on the initial mesh then compare each cell with its neighbours, as in a time step.
     initial_state = ""
     if adapter is _NativeFVAdapter:
         initial_state = member + ".bindInitialState(cellConnectivity, this->downloadSolution().getView(), nullptr);\n"
@@ -631,7 +654,8 @@ def _install_policy(policy, solver, adapter, declarations, *, member, header, po
         )
     )
     solver.on_start_time_step(begin_step)
-    # User hooks can still change the solution that AMR will assess.
+    # The assessment runs after the hooks of the application at the end of a step. They can still change
+    # the solution.
     solver._refinement_assessment_implementation = assessment
     solver.on_finish_simulation("\n" + member + ".reset();\n")
     solver.set_pde_terms(refinement_criterion=True if external_callback else (
@@ -648,17 +672,21 @@ def _install_policy(policy, solver, adapter, declarations, *, member, header, po
 
 @dataclass(frozen=True, kw_only=True)
 class Limiter(_AMRSettings):
-    """AMR for ADER-DG with its subcell limiter.
+    """The AMR criterion for ADER-DG with its subcell limiter.
 
-    Read the active DG or FV solution. Limiter roles add refinement requests
-    and coarsening guards to the shared AMR checks.
+    The criterion reads the DG solution of a cell, or its FV subcell values where the limiter is active.
+    A cell that the limiter computes on subcells refines, unless the solution is constant around it. The
+    cells next to it do not coarsen. All other cells go through the checks of _AMRSettings.
     """
 
     def install(self, solver, *, external_callback=False):
-        """Attach the criterion. For CPU assessment, external_callback=True keeps the application's own
-        refinementCriterion(). That callback returns amrCommand(Q, x, h, t) wherever this policy decides,
-        for example after its own rules for the initial mesh. Without external_callback, the policy owns
-        the refinement_criterion term and later changes of it are rejected."""
+        """Attach the criterion to a solver.
+
+        With external_callback=True (CPU only) the application keeps its own refinementCriterion() in C++.
+        That function returns amrCommand(Q, x, h, t) wherever it wants the decision of this criterion, for
+        example after rules of its own for the initial mesh. Without external_callback the criterion sets
+        the refinement_criterion term of the solver, and a later attempt to set that term raises an error.
+        """
         if not isinstance(external_callback, bool):
             raise TypeError("external_callback must be a boolean.")
         adapter = _solver_adapter(solver)
@@ -890,11 +918,11 @@ class _NativeDGLayout:
 
 @dataclass(frozen=True, kw_only=True)
 class Native(_AMRSettings):
-    """AMR for FV, ADER-DG or RKDG without a subcell limiter.
+    """The AMR criterion for an FV, ADER-DG or RKDG solver without a subcell limiter.
 
-    Assess the accepted solution after the completed step and application finish hooks.
-    Use one MPI rank. DG initial-data sampling requires a deterministic pointwise
-    initial condition.
+    The criterion assesses the solution at the end of a time step, after the hooks of the application.
+    It runs on one MPI rank. sample_initial_data needs the initial_condition term of the solver: a
+    function of the position that returns the same values every time.
     """
 
     def _validate_solver(self, solver):
@@ -920,10 +948,7 @@ class Native(_AMRSettings):
         return adapter
 
     def install(self, solver, *, external_callback=False):
-        """Attach the criterion. For CPU assessment, external_callback=True keeps the application's own
-        refinementCriterion(). That callback returns amrCommand(Q, x, h, t) wherever this policy decides,
-        for example after its own rules for the initial mesh. Without external_callback, the policy owns
-        the refinement_criterion term and later changes of it are rejected."""
+        """Attach the criterion to a solver. Limiter.install() explains external_callback."""
         if not isinstance(external_callback, bool):
             raise TypeError("external_callback must be a boolean.")
         adapter = self._validate_solver(solver)
@@ -1029,16 +1054,19 @@ class _NativeFVAdapter:
     """Supply FV cell averages to AMR."""
     @staticmethod
     def validate(solver):
+        """Check that the solver knows its number of volumes per axis."""
         count = getattr(solver, "_patch_size", None)
         if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             raise ValueError("The native criterion requires a complete FV patch layout.")
 
     @staticmethod
     def count(solver):
+        """Return the number of volumes per axis."""
         return solver._patch_size
 
     @staticmethod
     def begin_step():
+        """Generate the call that gives the criterion the mesh and the solution for the next step."""
         return _with_parameter_snapshot("""
 static_assert(
   not ::exahype2::terms::HasCellPredicate<::{{FULL_QUALIFIED_SOLVER_NAME}}>,
@@ -1056,6 +1084,7 @@ class _NativeDGAdapter:
     """Supply ADER-DG or RKDG nodal values to AMR."""
     @staticmethod
     def validate(solver):
+        """Check that the DG nodes of the solver are complete, ordered and symmetric."""
         order = solver.order if solver.SOLVER_FAMILY == "ader" else solver._dg_order
         points = _double_quadrature_points(solver)
         if isinstance(order, bool) or not isinstance(order, int) or order < 0 or len(points) != order + 1:
@@ -1069,10 +1098,12 @@ class _NativeDGAdapter:
 
     @staticmethod
     def count(solver):
+        """Return the number of DG nodes per axis."""
         return len(_double_quadrature_points(solver))
 
     @staticmethod
     def begin_step():
+        """Generate the call that gives the criterion the mesh, the solution and the DG tables for the next step."""
         return _with_parameter_snapshot("""
 static_assert(
   not ::exahype2::terms::HasCellPredicate<::{{FULL_QUALIFIED_SOLVER_NAME}}>,
@@ -1089,14 +1120,15 @@ _nativeCriterion.beginStep(
 
 @dataclass(frozen=True, kw_only=True)
 class AMR(_AMRSettings):
-    """Attach AMR using the adapter for the configured solver.
+    """The AMR criterion that picks its variant from the solver: Limiter if the solver has a subcell
+    limiter, Native if not.
 
-    Configure the solver and attach any subcell limiter before calling install().
-    Use Native or Limiter to select the adapter explicitly.
+    Configure the solver and attach its limiter, if it has one, before install(). _AMRSettings explains
+    the settings.
     """
 
     def install(self, solver, *, external_callback=False):
-        """Select the FV/DG or subcell-limiter adapter and install its callbacks."""
+        """Attach the criterion to a solver, as the install() of Limiter or Native does."""
         policy_type = Limiter if getattr(solver, "subcell_limiter_is_enabled", False) else Native
         with warnings.catch_warnings():
             # The settings were checked, and their warnings issued, when this object was created.

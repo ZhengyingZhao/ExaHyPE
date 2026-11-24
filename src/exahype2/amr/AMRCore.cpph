@@ -13,7 +13,8 @@
 
 namespace exahype2::amr {
   namespace amr_detail {
-    /** Publishes a fallback result if a cached computation leaves by an exception, so that no waiting thread hangs. */
+    /** Stores a fallback result if the computation of a cached value throws. Threads that wait for the value
+     * then go on. */
     template <typename Fallback>
     class PublishOnUnwind final {
       Fallback _fallback;
@@ -27,6 +28,7 @@ namespace exahype2::amr {
     };
   }
 
+  /** Packs the centre and the width of a cell into the key under which the cell is looked up. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   auto AMRCore<N, V, C, P, A, T, E, S>::geometry(const Coordinates& x, const Coordinates& h) -> Geometry {
     Geometry key{};
@@ -37,7 +39,8 @@ namespace exahype2::amr {
     return key;
   }
 
-  /** Bound intermediate values during restriction and prolongation. */
+  /** Returns a bound on how much the restriction or prolongation matrix can enlarge the values of a cell, or
+   * zero if there is none. transferPasses() uses it to keep the transfer from overflowing. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   double AMRCore<N, V, C, P, A, T, E, S>::amplification(const double* matrix, bool restriction) {
     if (matrix == nullptr) return 0.0;
@@ -69,6 +72,7 @@ namespace exahype2::amr {
     return bound > (limit - 1.0) / 2.0 ? 0.0 : 1.0 + 2.0 * bound;
   }
 
+  /** Are all values of a cell finite? */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   bool AMRCore<N, V, C, P, A, T, E, S>::finite(const P* Q) {
     if (Q == nullptr) return false;
@@ -78,7 +82,8 @@ namespace exahype2::amr {
     return true;
   }
 
-  /** Measure variation at the resolution of the accepted representation. */
+  /** Returns the variation inside one cell: the contribution of the highest polynomial degree for DG, the
+   * largest jump between neighbouring volumes for FV. Invalid data give infinity. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   double AMRCore<N, V, C, P, A, T, E, S>::localDetail(const P* Q) {
     return localDetail({Q, N, T::IsFiniteVolume ? AcceptedRepresentation::FVCellAverages
@@ -95,7 +100,9 @@ namespace exahype2::amr {
       view.values, amr_detail::resolutionTolerance<C>());
   }
 
-  /** An observable over its error budget raises the score above the refinement threshold. */
+  /** Combines the score of the values with that of the observables and returns the larger one. ratio is the
+   * largest error of an observable divided by its tolerance. A ratio above one gives a score above the
+   * resolution tolerance. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   double AMRCore<N, V, C, P, A, T, E, S>::withObservation(double detail, double ratio) {
     double scaled = 0.0;
@@ -107,6 +114,7 @@ namespace exahype2::amr {
     return std::max(detail, scaled);
   }
 
+  /** Returns the score of one cell without its faces, with the observables included. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   double AMRCore<N, V, C, P, A, T, E, S>::acceptedLocalDetail(const AcceptedCellView<P>& view, const double* nodes) {
     double detail = predictionMode() ? prediction_detail::localDetail<N, V, C>(view, nodes) : localDetail(view);
@@ -115,6 +123,7 @@ namespace exahype2::amr {
     return detail;
   }
 
+  /** Returns the score of a cell with its faces. It is computed once per step; other threads wait for it. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   auto AMRCore<N, V, C, P, A, T, E, S>::cellDetail(const Cell& cell) const -> ResolutionEvidence {
     if constexpr (not S::CheckNeighbours) {
@@ -138,12 +147,13 @@ namespace exahype2::amr {
     }
   }
 
+  /** Computes the score of a cell: the largest of its own score and the scores of its faces. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   auto AMRCore<N, V, C, P, A, T, E, S>::computeCellDetail(const Cell& cell) const -> ResolutionEvidence {
     const auto own = accepted(cell);
     ResolutionEvidence result{acceptedLocalDetail(own, _nodes), true};
     if constexpr (S::CheckNeighbours) {
-      // A local refinement request needs no further face work.
+      // The cell refines already, so its faces are not scored.
       if (result.value > amr_detail::resolutionTolerance<C>()) { result.complete = false; return result; }
       if (_mesh == nullptr) { result.complete = false; return result; }
       const auto visit = [&](int slot, int normal, int ownSide, int cachedFace) {
@@ -174,7 +184,8 @@ namespace exahype2::amr {
     return result;
   }
 
-  /** Reuse face indices while connectivity matches, including periodic and mixed-level neighbours. */
+  /** Lists the face neighbours of every leaf and gives every face between two leaves one cache entry for its
+   * score. The lists stay as long as the mesh does. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   void AMRCore<N, V, C, P, A, T, E, S>::bindAcceptedFaces(const peano4::CellConnectivity& mesh) {
     if (_stencilsBound) {
@@ -224,6 +235,7 @@ namespace exahype2::amr {
     _stencilsBound = true;
   }
 
+  /** Returns the score of a face between two leaves. It is computed once per step; other threads wait for it. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   double AMRCore<N, V, C, P, A, T, E, S>::acceptedFaceDetail(int index) const {
     auto& face = _acceptedFaces[index];
@@ -244,7 +256,7 @@ namespace exahype2::amr {
     return face.value;
   }
 
-  /** Both accepted cells and proposed parents use the same spatial observation. */
+  /** Returns the score of the face between two cells. Each side is a leaf or a proposed parent. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   double AMRCore<N, V, C, P, A, T, E, S>::faceDetail(
     const AcceptedCellView<P>& own, const AcceptedCellView<P>& other,
@@ -511,7 +523,8 @@ namespace exahype2::amr {
     _active = validStartTime;
   }
 
-  /** Link leaf and ancestor histories across mesh changes. */
+  /** Legacy mode: lists every leaf and all its ancestors as quiet regions and links each to its stored quiet
+   * time. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   void AMRCore<N, V, C, P, A, T, E, S>::bindQuietRegions() {
     _quietRegions.clear();
@@ -547,7 +560,8 @@ namespace exahype2::amr {
     for (auto entry = regions.rbegin(); entry != regions.rend(); ++entry) _quietOrder.push_back(entry->second);
   }
 
-  /** Update parent histories from their children's accepted states. */
+  /** Legacy mode: advances the quiet time of every region. An ancestor is quiet only while all its children
+   * are. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   void AMRCore<N, V, C, P, A, T, E, S>::finishQuietRegions(double time, double dt) {
     for (const int index : _quietOrder) {
@@ -568,7 +582,8 @@ namespace exahype2::amr {
         region.moving = region.moving or descendant.moving;
         region.crossing = std::min(region.crossing, descendant.crossing);
       }
-      // Scale crossing time to the parent's width; invalid regions reset quiet time.
+      // The parent is wider than its children, so a wave needs longer to cross it. A region that is not
+      // quiet starts at zero again.
       region.crossing *= peano4::SubdivisionFactor;
       const double quiet = region.history->time == _startTime ? region.history->quiet : 0.0;
       region.history->quiet = region.valid ? advanceQuiet(quiet, region.crossing, region.moving, dt) : 0.0;
@@ -576,6 +591,7 @@ namespace exahype2::amr {
     }
   }
 
+  /** Is time the end of the step that beginStep() prepared, and did that step advance the time? */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   bool AMRCore<N, V, C, P, A, T, E, S>::fresh(double time) const {
     return _active and _clock != nullptr and std::isfinite(time) and time > _startTime
@@ -583,10 +599,11 @@ namespace exahype2::amr {
       and _clock->getTimeStepSizeOfLastStep() > 0.0;
   }
 
-  /** Accumulate quiet time in local crossing times. */
+  /** Legacy mode: returns the quiet time of a cell after this step, or -1 if the cell is not quiet. The
+   * time is counted in the time a wave takes to cross the cell. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   double AMRCore<N, V, C, P, A, T, E, S>::quietProgress(const Cell& cell, double time, double dt) const {
-    // The family-vote winner fills this cache; step completion can reuse it.
+    // The thread that checks the family of this cell computes the value. finishStep() can read it again.
     if (not cell.quietReady) {
       cell.acceptedQuiet = computeQuietProgress(cell, time, dt);
       cell.quietReady = true;
@@ -594,6 +611,8 @@ namespace exahype2::amr {
     return cell.acceptedQuiet;
   }
 
+  /** Legacy mode: computes the quiet time of a cell after this step. The cell is not quiet (-1) if the limiter
+   * needs it, if it is not resolved or if its solution is invalid or not admissible. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   double AMRCore<N, V, C, P, A, T, E, S>::computeQuietProgress(const Cell& cell, double time, double dt) const {
     cell.crossing = std::numeric_limits<double>::infinity();
@@ -643,12 +662,16 @@ namespace exahype2::amr {
     return advanceQuiet(cell.quiet, crossing, moving, dt);
   }
 
+  /** Adds one step to a quiet time, with the reference time of this criterion. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   double AMRCore<N, V, C, P, A, T, E, S>::advanceQuiet(double quiet, double crossing, bool moving, double dt) const {
     return amr_detail::advanceQuiet(quiet, crossing, moving, dt, _referenceTime);
   }
 
-  /** Phase one checks accepted neighbours; phase two checks only eligible parents. */
+  /** Does the proposed parent of a family fit its neighbours? The score of every face of the parent has to
+   * stay within the resolution tolerance. The first call compares the parent with the current neighbours. The
+   * second call, with onlyProposedNeighbours, compares it with the proposed parents of neighbouring families
+   * that passed the first call. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   bool AMRCore<N, V, C, P, A, T, E, S>::parentPassesNeighbours(
     const Family& family, const P* parent, const Key& parentKey,
@@ -663,11 +686,11 @@ namespace exahype2::amr {
         const double detail = faceDetail(proposed, other, parentKey, otherKey, normal, side);
         return std::isfinite(detail) and detail <= amr_detail::resolutionTolerance<C>();
       };
-      // Deduplicate directed face checks by accepted slot or proposed family.
-      // Slot -1 identifies the parent's periodic self-neighbour.
+      // Several children can share a neighbour. Each neighbour is checked once per face direction.
+      // The entry -1 stands for the parent as its own neighbour across a periodic boundary.
       std::set<std::array<int, 3>> checked;
       const int ownFamily = static_cast<int>(&family - _families.data());
-      // The stencils bound for this step list the same neighbours as the mesh, in the same order.
+      // The neighbour lists of this step hold the same neighbours as the mesh, in the same order.
       const auto visitNeighbours = [&](int childSlot, auto&& visit) {
         if constexpr (cacheAcceptedFaces()) {
           if (_stencilsBound) {
@@ -684,7 +707,7 @@ namespace exahype2::amr {
           if (slot >= 0 and slot < static_cast<int>(_cells.size()) and _cells[slot].family == ownFamily) {
             const int position = _cells[childSlot].key[normal + 1] % peano4::SubdivisionFactor;
             const bool exterior = ownSide == 0 ? position == 0 : position == peano4::SubdivisionFactor - 1;
-            // Compare both sides of the parent when coarsening closes a periodic seam.
+            // The neighbour is a sibling across a periodic boundary: the parent is its own neighbour there.
             if (not onlyProposedNeighbours and exterior
                 and checked.insert({-1, normal, ownSide}).second
                 and not compatible(proposed, parentKey, normal, ownSide)) passes = false;
@@ -701,23 +724,27 @@ namespace exahype2::amr {
             if (not finite(otherView) or not compatible(otherView, neighbour.key, normal, ownSide)) passes = false;
             return;
           }
-          // Phase two reuses the cached accepted-neighbour checks.
+          // Second call: only neighbouring families that can coarsen as well matter.
           if (neighbour.family < 0 or not _families[neighbour.family].complete) return;
           if (not checked.insert({neighbour.family, normal, ownSide}).second) return;
-          // Compare independently eligible parents to avoid recursive family decisions.
+          // The neighbouring family counts if it passed its own checks. Its final vote is not asked for:
+          // that vote would ask for this family in turn.
           const auto& trial = familyPlan(neighbour.family, time, dt);
           if (not trial.eligible) return;
           const AcceptedCellView<P> trialView{trial.parent.data(), N, proposed.representation};
           if (not compatible(trialView, trial.key, normal, ownSide)) passes = false;
         });
-        // Missing neighbours cannot justify coarsening.
+        // A family with a missing neighbour does not coarsen.
         if (not complete or not passes) return false;
       }
       return true;
     }
   }
 
-  /** Check transfer loss and physical admissibility after restriction and prolongation. */
+  /** May the parent replace a family? Restricts the children to the parent, prolongs the parent back and
+   * checks that every child is reproduced within the transfer tolerance. Children and parent also have to be
+   * finite, resolved and physically admissible. On success, parent holds the proposed parent and parentKey
+   * its position. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   bool AMRCore<N, V, C, P, A, T, E, S>::transferPasses(
     const Family& family, double time, double dt, P* parent, Key& parentKey
@@ -731,7 +758,7 @@ namespace exahype2::amr {
       const auto& cell = _cells[family.slots[child]];
       if (not E::quietEligible(cell.status)) return false;
       if constexpr (S::CheckQuietDetail or predictionMode()) {
-        // Require every child to satisfy the resolution budget before coarsening.
+        // Every child has to be resolved.
         const auto detail = cellDetail(cell);
         if (not detail.complete or detail.value > amr_detail::resolutionTolerance<C>()) return false;
       }
@@ -745,7 +772,7 @@ namespace exahype2::amr {
             or (_admissible != nullptr
               and not _admissible(view.values, view.numberOfStates(), cell.centre, cell.width))) return false;
       }
-      // Require the accepted representation to match the transfer policy.
+      // The transfer works on the solver's main solution. A cell that the limiter holds as subcells stays.
       if (view.values != cell.state or view.pointsPerAxis != N
           or view.isFiniteVolume() != T::IsFiniteVolume) return false;
       children[child] = view.values;
@@ -764,7 +791,7 @@ namespace exahype2::amr {
       if (std::abs(static_cast<double>(parent[entry])) > limit / _prolongationBound) return false;
     }
     const auto& first = _cells[family.slots[0]];
-    // Use lattice geometry for the proposed parent's physical checks.
+    // The centre and width of the parent follow from its integer position on its level.
     Coordinates width, centre;
     parentKey = {};
     parentKey[0] = first.key[0] - 1;
@@ -777,15 +804,15 @@ namespace exahype2::amr {
       if (not std::isfinite(width(axis)) or width(axis) <= 0.0 or not std::isfinite(centre(axis))) return false;
     }
     if (_admissible != nullptr and not _admissible(parent, Nodes, centre, width)) return false;
-    // Check parent observables against the children's extrema.
+    // The solver's own check of the parent against its children, for example the limiter's maximum principle.
     if (_transferAdmissible != nullptr and not _transferAdmissible(parent, children)) return false;
-    // Apply the additional modal resolution check in legacy mode.
+    // Legacy mode: the parent has to be resolved by itself.
     if constexpr (not predictionMode()) {
       if (localDetail(parent) > amr_detail::resolutionTolerance<C>()) return false;
     }
     double rms = 0.0;
     constexpr double samples = static_cast<double>(peano4::ChildrenPerCell) * Nodes;
-    // Share a 32 KiB cache budget between state and observable parent bounds.
+    // The bounds of the parent polynomial are cached in 32 KiB. The observables take half of it if there are any.
     constexpr std::size_t cacheBytes = observation_detail::count<C>() > 0 ? 16*1024 : 32*1024;
     using Prepared = std::conditional_t<T::IsFiniteVolume, detail::retained_parent::NoGeometry,
       detail::retained_parent::PreparedParent<N, V, DIMENSIONS, peano4::SubdivisionFactor, P, cacheBytes>>;
@@ -804,22 +831,22 @@ namespace exahype2::amr {
           const double a = static_cast<double>(children[child][node * V + entry]);
           const double b = static_cast<double>(restored[node * V + entry]);
           if (not std::isfinite(scale) or scale <= 0.0) return false;
-          // Round residual bounds outwards.
+          // An upper bound of the scaled difference, rounding included.
           residuals[entry] = amr_detail::transfer_bound::magnitude(amr_detail::transfer_bound::difference(a, b, scale));
           if (not std::isfinite(residuals[entry]) or residuals[entry] > C::TransferTolerance) return false;
           if constexpr (predictionMode()) rms = amr_detail::guardedHypot(rms, residuals[entry] / std::sqrt(samples));
         }
         if (not amr_detail::transfer_bound::normPasses<V>(residuals, C::TransferTolerance)) return false;
       }
-      // DG bounds the loss against the retained parent polynomial below.
+      // DG checks the difference between the nodes further down.
       if constexpr (T::IsFiniteVolume) {
         if (not T::polynomialPasses(children[child], restored)) return false;
       }
       if constexpr (observation_detail::count<C>() > 0)
         if (not observedTransfer.template transferPasses<N>(children[child], restored, T::IsFiniteVolume)) return false;
       if constexpr (not T::IsFiniteVolume) {
-        // The nodal check above compares with the solver's prolongation. Between the nodes, the loss is
-        // bounded against the parent polynomial that coarsening retains.
+        // The check above compares child and parent at the nodes. This one bounds the difference of the two
+        // polynomials between the nodes as well.
         std::array<double, V> scales;
         for (int component = 0; component < V; component++) {
           scales[component] = C::stateScale(component);
@@ -831,7 +858,7 @@ namespace exahype2::amr {
         }
         bool certified = false;
         if constexpr (observation_detail::count<C>() == 0) {
-          // A residual far below the tolerance passes on magnitude bounds, without interval evaluation.
+          // A quick test first: a difference far below the tolerance passes without interval arithmetic.
           std::array<double, V> magnitudes;
           certified = preparedParent.magnitudes(children[child], magnitudes)
             and amr_detail::transferMagnitudesPass<N, V, C>(magnitudes);
@@ -839,7 +866,7 @@ namespace exahype2::amr {
         if (not certified and (not preparedParent.residual(children[child], child, residual)
             or not amr_detail::transferPolynomialIntervalsPasses<N, V, C>(residual))) return false;
         if constexpr (observation_detail::count<C>() > 0) {
-          // Use unscaled residuals for observables to avoid overflowing scaled weights.
+          // The observables weight the fields in their own units, so their check takes the unscaled difference.
           const bool unitScales = std::all_of(scales.begin(), scales.end(), [](double scale) { return scale == 1.; });
           if (unitScales) {
             if (not observedTransfer.template transferIntervalsPasses<N>(residual, false)) return false;
@@ -856,12 +883,15 @@ namespace exahype2::amr {
       }
     }
     if constexpr (predictionMode()) {
+      // The mean difference also has to stay within the resolution tolerance. This matters only if that
+      // tolerance is the smaller one.
       if (not std::isfinite(rms) or rms > amr_detail::resolutionTolerance<C>()) return false;
     }
     return true;
   }
 
-  /** Cache phase-one eligibility without reading another family's plan. */
+  /** Returns the proposed parent of a family and the checks that it passes on the current mesh. The plan is
+   * computed once per step; other threads wait for it. It does not look at the plans of other families. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   auto AMRCore<N, V, C, P, A, T, E, S>::familyPlan(int family, double time, double dt) const -> const FamilyPlan& {
     auto& plan = _familyPlans[family];
@@ -875,7 +905,7 @@ namespace exahype2::amr {
       plan.sizeVetoed = false;
       if (siblings.complete and _clock != nullptr) {
         const double width = tarch::la::max(_cells[siblings.slots[0]].width);
-        // Apply the engine's parent-size guard before computing transfer bounds.
+        // The mesh limits the size of a cell. A parent above the limit needs no further check.
         if (std::isfinite(width) and width >= 0.0
             and width <= std::numeric_limits<double>::max() / peano4::SubdivisionFactor
             and not (peano4::SubdivisionFactor * width <= _clock->getLimits().maxAdmissiblePatchSize)) {
@@ -896,17 +926,18 @@ namespace exahype2::amr {
           const AcceptedCellView<P> proposed{plan.parent.data(), N, T::IsFiniteVolume
             ? AcceptedRepresentation::FVCellAverages : AcceptedRepresentation::DGNodal};
           const double detail = acceptedLocalDetail(proposed, _nodes);
-          // Require the parent to pass its own local resolution test.
+          // The parent has to be resolved by itself. For a DG parent this score is zero: its faces decide,
+          // in the comparison with the neighbours below.
           parentResolved = std::isfinite(detail) and detail <= amr_detail::resolutionTolerance<C>();
         }
       }
       plan.neighboursSafe = plan.transferSafe
         and parentResolved and parentPassesNeighbours(siblings, plan.parent.data(), plan.key, time, dt, false);
       plan.safe = plan.transferSafe and plan.neighboursSafe;
-      // Combine transfer, parent-resolution and accepted-neighbour checks.
+      // Eligible: the transfer, the parent's own score and its current neighbours all pass.
       plan.eligible = plan.safe;
       if (plan.eligible) {
-        // Permit only parent sizes accepted by the engine's regridding guard.
+        // The parent must not exceed the largest cell size of the mesh.
         const auto& first = _cells[siblings.slots[0]];
         plan.eligible = _clock != nullptr
           and peano4::SubdivisionFactor * tarch::la::max(first.width)
@@ -920,7 +951,8 @@ namespace exahype2::amr {
     return plan;
   }
 
-  /** Compute each family's coarsening vote once across threads. */
+  /** Does a family coarsen? Its plan has to be eligible, and its parent has to fit the proposed parents next
+   * to it. The vote is computed once per step; other threads wait for it. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   bool AMRCore<N, V, C, P, A, T, E, S>::familyPasses(int family, double time, double dt) const {
     if (family < 0) return false;
@@ -949,7 +981,7 @@ namespace exahype2::amr {
     for (int axis = 0; axis < DIMENSIONS; axis++) {
       if (not std::isfinite(x(axis)) or not std::isfinite(h(axis)) or h(axis) <= 0.0) return Command::Keep;
     }
-    // Initialisation permits refinement or keeping the current cell.
+    // On the initial mesh a cell refines or keeps its size.
     if (_initialising) {
       const auto initialDetail = [&]() {
         if constexpr (predictionMode() and requires { C::resolutionComponent(0); }) {
@@ -961,7 +993,7 @@ namespace exahype2::amr {
       };
       bool observedUnresolved = false;
       if constexpr (observation_detail::count<C>() > 0) {
-        // Use modal detail when independent initial-data samples are unavailable.
+        // Without a check against the initial condition, the observables are judged from the values of the cell.
         if (_initialDataCheck == nullptr) {
           const AcceptedCellView<P> initial{Q, N, T::IsFiniteVolume
             ? AcceptedRepresentation::FVCellAverages : AcceptedRepresentation::DGNodal};
@@ -972,7 +1004,7 @@ namespace exahype2::amr {
         return Command::Refine;
       if (_initialDataCheck != nullptr and not _initialDataCheck(Q, x, h)) return Command::Refine;
       if (_initialNeighbours) {
-        // With the mesh bound, the initial cells face the same sensor as the cells of a time step.
+        // bindInitialState() was called: the cell is scored with its neighbours, as in a time step.
         const auto found = _lookup.find(geometry(x, h));
         if (found != _lookup.end() and _cells[found->second].state == Q) {
           return cellDetail(_cells[found->second]).value > amr_detail::resolutionTolerance<C>()
@@ -1002,14 +1034,16 @@ namespace exahype2::amr {
     return familyPasses(cell.family, time, _clock->getTimeStepSizeOfLastStep()) ? Command::Erase : Command::Keep;
   }
 
-  /** Decide from the cell and its neighbours alone. Siblings means that only the family can still coarsen it. */
+  /** Decides what a cell can decide without its siblings: Refine, Keep, or Siblings if nothing speaks against
+   * coarsening and the family has the last word. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   auto AMRCore<N, V, C, P, A, T, E, S>::ownEvidence(
     const Cell& cell, const Coordinates& x, const Coordinates& h
   ) const -> OwnEvidence {
     if (E::requiresResolution(cell.status)) {
       if constexpr (predictionMode() and requires { E::requestsRefinement(cell.status); }) {
-        // Active limiter cells request refinement; halo cells use the spatial sensor.
+        // A cell that the limiter runs on subcells refines, unless the solution is constant around it. The
+        // cells next to it are scored like any other cell.
         if (E::requestsRefinement(cell.status))
           return locallyConstant(cell) ? OwnEvidence::Keep : OwnEvidence::Refine;
       } else {
@@ -1026,13 +1060,13 @@ namespace exahype2::amr {
       // Keep the cell when accepted solution data are unavailable.
       if (view.values == nullptr or view.pointsPerAxis <= 0) return OwnEvidence::Keep;
     }
-    // Give resolution violations priority over coarsening requests.
+    // An unresolved cell refines, whatever else holds.
     const auto detail = cellDetail(cell);
     if (detail.value > amr_detail::resolutionTolerance<C>()) return OwnEvidence::Refine;
     if constexpr (S::CheckCommandPhysical) {
       if (_admissible != nullptr and not _admissible(view.values, view.numberOfStates(), x, h)) return OwnEvidence::Refine;
     }
-    // Preserve cells required by the limiter stencil.
+    // The limiter needs this cell at its size.
     if (not E::quietEligible(cell.status)) return OwnEvidence::Keep;
     // Require complete neighbour data before coarsening.
     if (not detail.complete) return OwnEvidence::Keep;
@@ -1040,8 +1074,9 @@ namespace exahype2::amr {
   }
 
   /**
-   * The stages follow the dependencies of command(): cells first, then one proposed parent per family, then the
-   * comparison of neighbouring proposed parents. Each stage evaluates what the votes would request anyway.
+   * Computes in parallel what command() needs, in three stages: what every cell decides on its own, then the
+   * proposed parent of every family that could coarsen, then the comparison of neighbouring proposed parents.
+   * command() then only reads the results.
    */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   void AMRCore<N, V, C, P, A, T, E, S>::assess(double time) {
@@ -1101,7 +1136,7 @@ namespace exahype2::amr {
           _historyNeedsPruning = false;
         }
       } else {
-        // Discard legacy quiet history when no valid step completed.
+        // No step was completed: all quiet times start again.
         _history.clear();
         _topologyCached = false;
         _historyNeedsPruning = false;
@@ -1183,6 +1218,7 @@ namespace exahype2::amr {
     _unboundVotes.store(0, std::memory_order_relaxed);
   }
 
+  /** Does the view hold values, and are all of them finite? */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   bool AMRCore<N,V,C,P,A,T,E,S>::finite(const AcceptedCellView<P>& view) {
     if (view.values == nullptr or view.pointsPerAxis <= 0) return false;
@@ -1192,13 +1228,14 @@ namespace exahype2::amr {
     return true;
   }
 
+  /** Returns the accepted solution of a cell: its DG or FV values, or the subcell values of the limiter. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   auto AMRCore<N,V,C,P,A,T,E,S>::accepted(const Cell& cell) const -> AcceptedCellView<P> {
     return A::accepted(cell.slot, cell.state, cell.status, _subcells);
   }
 
-  /** Check admissibility and constancy of monitored fields in the cell and its
-   * face neighbours before suppressing limiter-driven refinement. */
+  /** Is the solution constant in a cell and its face neighbours, up to rounding, and physically admissible?
+   * A cell that the limiter marks then keeps its size instead of refining. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S>
   bool AMRCore<N,V,C,P,A,T,E,S>::locallyConstant(const Cell& cell) const {
     if constexpr (not S::UseLocalConstancy) return false;
@@ -1210,7 +1247,7 @@ namespace exahype2::amr {
       static_assert(SubcellsPerAxis > 0);
       constexpr int Subcells = peano4::power(SubcellsPerAxis, DIMENSIONS);
       if (_subcells.paddedChunkSize < Subcells * V) return false;
-      // Allow only projection roundoff when testing constancy.
+      // Values count as equal if they differ by no more than the rounding of the projection onto the subcells.
       constexpr double operations = 2.0 * SubcellsPerAxis * DIMENSIONS;
       constexpr double product = operations * (std::numeric_limits<P>::epsilon() / 2.0);
       if constexpr (product >= 1.0) return false;

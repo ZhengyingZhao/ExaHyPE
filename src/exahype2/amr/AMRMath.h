@@ -14,23 +14,29 @@
 #include <type_traits>
 #include <utility>
 
+// Numerical helpers of the AMR criterion: the transfer of a cell between a parent and its children, the test
+// of the transfer error, the score of the highest polynomial degree, and the check of a DG cell against the
+// initial condition. A helper returns infinity or false for input that is not finite or would overflow.
 namespace exahype2::amr {
   namespace amr_detail {
     namespace transfer_bound = ::exahype2::amr::detail::transfer_bound;
     TARGET_DECLARE
-    /** Return the resolution tolerance, defaulting to the transfer tolerance. */
+    /** Returns the resolution tolerance of Config, or its transfer tolerance if it sets none. */
     template <typename C>
     GPU_CALLABLE_METHOD constexpr double resolutionTolerance() {
       if constexpr (requires { C::ResolutionTolerance; }) return C::ResolutionTolerance;
       return C::TransferTolerance;
     }
-    /** Does this field count toward the prediction sensor's resolution error? */
+    /** Does this value count for the score in prediction mode? Config can select values. Without a selection
+     * all of them count. */
     template <typename C>
     GPU_CALLABLE_METHOD bool resolutionComponent(int component) {
       if constexpr (requires { C::resolutionComponent(component); }) return C::resolutionComponent(component);
       return true;
     }
-    /** Add one step to a cell's quiet time, measured in the time a wave takes to cross the cell. */
+    /** Adds one step to the quiet time of a cell, measured in the time a wave takes to cross the cell.
+     * crossing is that time. A cell in which nothing moves uses referenceTime instead. Returns -1 for an
+     * invalid crossing time. */
     GPU_CALLABLE_METHOD inline double advanceQuiet(double quiet, double crossing, bool moving, double dt, double referenceTime) {
       if (not moving) crossing = referenceTime;
       if (crossing <= 0.0 or std::isnan(crossing)) return -1.0;
@@ -39,7 +45,7 @@ namespace exahype2::amr {
       return quiet > limit - increment ? limit : quiet + increment;
     }
 
-    /** Return infinity if the Euclidean norm would overflow. */
+    /** Returns sqrt(left^2 + right^2), or infinity if that overflows or an argument is not finite. */
     GPU_CALLABLE_METHOD inline double guardedHypot(double left, double right) {
       const double limit = std::numeric_limits<double>::max();
       const double invalid = std::numeric_limits<double>::infinity();
@@ -52,7 +58,7 @@ namespace exahype2::amr {
       const double ratio = smallest / largest;
       const double factor = std::sqrt(1.0 + ratio * ratio);
       if (largest > std::nextafter(limit / factor, 0.0)) return invalid;
-      // Prevent speculative multiplication before the overflow check.
+      // volatile keeps the compiler from computing the product before the overflow test above.
       volatile double boundedLargest = largest;
       return boundedLargest * factor;
     }
@@ -122,7 +128,8 @@ namespace exahype2::amr {
       }
     }
 
-    /** Check that tensor-product projection intermediates fit the storage type. */
+    /** Can a cell be projected with this matrix, axis by axis, without leaving the range of its storage
+     * type? The test bounds the intermediate values by the largest input and the largest row sum. */
     template <bool NativeArithmetic, int Inputs, int Samples, int V, typename P, typename MatrixPrecision>
     GPU_CALLABLE_METHOD bool projectionIsSafe(const P* Q, const MatrixPrecision* matrix) {
       if (Q == nullptr or matrix == nullptr) return false;
@@ -143,9 +150,9 @@ namespace exahype2::amr {
         }
         rowBound = std::max(rowBound, sum);
       }
-      // Allow a factor of two for rounding in each contraction.
+      // Each axis can enlarge the bound by the row sum. A factor of two covers the rounding.
       for (int axis = 0; axis < DIMENSIONS; axis++) {
-        // Butterfly projection forms mirror sums before applying the weights.
+        // The projection first adds mirrored entries, so twice the bound has to fit as well.
         if constexpr (Inputs > 1) if (bound > limit / 2.0) return false;
         if constexpr (NativeArithmetic) {
           if (not native_neighbour_detail::product(bound, rowBound, bound)) return false;
@@ -161,7 +168,8 @@ namespace exahype2::amr {
       return true;
     }
 
-    /** Compute (a-b)/scale without overflowing representable differences. */
+    /** Returns (a-b)/scale. If a-b overflows, it divides first. Returns infinity if the result has no
+     * finite value. */
     template <bool NativeArithmetic>
     GPU_CALLABLE_METHOD inline double scaledDifference(double a, double b, double scale) {
       if constexpr (NativeArithmetic) {
@@ -185,7 +193,8 @@ namespace exahype2::amr {
       }
     }
 
-    /** Certify the scaled residual polynomial against the transfer tolerance. */
+    /** Does a polynomial stay within the transfer tolerance everywhere in the cell? input bounds the scaled
+     * difference between a child and its parent at every node. */
     template <int N, int V, typename C>
     GPU_CALLABLE_METHOD bool transferPolynomialIntervalsPasses(const transfer_bound::Field<N, V, DIMENSIONS>& input) {
       if (not transfer_bound::arithmeticSupported()) return false;
@@ -201,15 +210,15 @@ namespace exahype2::amr {
       } else return false;
     }
 
-    /** Certify the transfer tolerance from upper bounds on the nodal residual magnitudes alone.
-     * A true result implies that transferPolynomialIntervalsPasses() accepts every residual within these bounds.
+    /** A quick form of transferPolynomialIntervalsPasses(). It only knows an upper bound of the difference
+     * per value. If it returns true, the full test passes as well. If it returns false, the full test decides.
      */
     template <int N, int V, typename C>
     GPU_CALLABLE_METHOD bool transferMagnitudesPass(const std::array<double, V>& magnitudes) {
       if (not transfer_bound::arithmeticSupported()) return false;
       const double budget = C::TransferTolerance;
       if (not std::isfinite(budget) or budget <= 0.0) return false;
-      // The interval test rejects any nodal magnitude above the budget before it bounds the polynomial.
+      // A difference above the tolerance at a node fails the full test too.
       for (const double magnitude : magnitudes) if (not std::isfinite(magnitude) or magnitude > budget) return false;
       if constexpr (requires { C::transferWeightLower(0, 0); C::transferWeightUpper(0, 0); }) {
         std::array<transfer_bound::Interval, N * N> weights;
@@ -223,7 +232,8 @@ namespace exahype2::amr {
       } else return false;
     }
 
-    /** Certify the DG fine-minus-restored polynomial over the whole cell. */
+    /** Does a child differ from the polynomial that comes back from its parent by at most the transfer
+     * tolerance, everywhere in the cell? */
     template <int N, int V, typename C, typename P>
     GPU_CALLABLE_METHOD bool transferPolynomialPasses(const P* fine, const P* restored) {
       if (fine == nullptr or restored == nullptr or not transfer_bound::arithmeticSupported()) return false;
@@ -238,7 +248,7 @@ namespace exahype2::amr {
         for (int entry = 0; entry < V; entry++) scales[entry] = C::stateScale(entry);
         return transfer_bound::passes<N, V, DIMENSIONS>(fine, restored, scales, C::TransferTolerance, weights);
       } else if constexpr (N == 1) {
-        // A degree-zero polynomial has no unobserved interior extrema.
+        // A constant has one value, so its one node decides.
         std::array<double, V> residuals;
         for (int entry = 0; entry < V; entry++) {
           residuals[entry] = transfer_bound::magnitude(transfer_bound::difference(
@@ -246,11 +256,13 @@ namespace exahype2::amr {
         }
         return transfer_bound::normPasses<V>(residuals, C::TransferTolerance);
       } else {
-        // Higher-degree polynomials require bounds between nodes.
+        // Without the weights of Config there is no bound between the nodes.
         return false;
       }
     }
-  /** Measure the contribution of the highest polynomial degree along the cell's coordinate axes. */
+  /** Returns the largest scaled coefficient of the highest polynomial degree over all lines of nodes along
+   * the axes. A large value means that the polynomial of the cell barely resolves the solution. With
+   * StopAtBudget the search ends at the first value above budget. */
   template <bool NativeArithmetic, bool StopAtBudget, int N, int V, typename C, typename P>
   GPU_CALLABLE_METHOD double highestOrderDetailImpl(const P* Q, double budget) {
     static_assert(N > 0 and V > 0);
@@ -271,7 +283,7 @@ namespace exahype2::amr {
         scales[component] = C::stateScale(component);
         if (not std::isfinite(scales[component]) or scales[component] <= 0.0) return invalid;
       }
-      // Share symmetric weights across all fibres and components.
+      // Mirrored nodes have the same weight up to its sign. One weight per pair serves every line and value.
       std::array<double, N / 2> pairWeights;
       for (int node = 0; node < N / 2; node++) {
         const int mirror = N - 1 - node;
@@ -344,14 +356,14 @@ namespace exahype2::amr {
     }
   }
 
-  /** Default observer that accepts all initial samples. */
+  /** Stands in for the check of the observables where Config has none. Every sample passes. */
   struct NoInitialObservation {
     template <typename P>
     GPU_CALLABLE_METHOD bool add(const P*, const P*) { return true; }
     GPU_CALLABLE_METHOD bool passes() const { return true; }
   };
 
-  /** Check the DG nodes and interpolation data and set the width of a child cell for sampling. */
+  /** Checks the input of initialDataPasses() and returns the width of a child cell in childWidth. */
   template <bool NativeArithmetic, int N, int V, typename C, typename P>
   GPU_CALLABLE_METHOD bool prepareInitialSampling(
     const P* Q, const double* nodes, const double* prolongation,
@@ -375,7 +387,8 @@ namespace exahype2::amr {
     return true;
   }
 
-  /** Does the parent's prediction agree with the initial condition at this child node within tolerance? */
+  /** Does the polynomial of a cell agree with the initial condition at one point, within the resolution
+   * tolerance? fresh is the initial condition there, represented the value of the polynomial. */
   template <int V, typename C, typename P>
   GPU_CALLABLE_METHOD bool initialSampleResidualPasses(const P* fresh, const P* represented) {
     std::array<double, V> residuals;
@@ -394,7 +407,9 @@ namespace exahype2::amr {
 
   TARGET_DECLARE_END
 
-  /** Check whether the parent DG solution represents the initial condition sampled on each child. */
+  /** Does a DG cell represent the initial condition well enough? The initial condition is evaluated at the
+   * nodes of the cells that a refinement would create and compared with the polynomial of the cell there. A
+   * cell that fails refines. */
   template <bool NativeArithmetic, int N, int V, typename C, typename P,
             typename Observer = NoInitialObservation>
   bool initialDataPasses(
@@ -438,13 +453,14 @@ namespace exahype2::amr {
   }
 
   TARGET_DECLARE
+  /** Is the callback set? A callback that cannot be compared with nullptr always is. */
   template <typename Callback>
   GPU_CALLABLE_METHOD bool callbackAvailable(const Callback& callback) {
     if constexpr (requires { callback != nullptr; }) return callback != nullptr;
     else return true;
   }
 
-  /** Check whether the parent DG solution represents the initial condition sampled on each child. */
+  /** The check of initialDataPasses() with callbacks that a GPU kernel can call. */
   template <bool NativeArithmetic, int N, int V, typename C, typename P,
             typename InitialCondition, typename Admissible, typename Observer = NoInitialObservation>
   GPU_CALLABLE_METHOD bool deviceInitialDataPasses(
@@ -493,6 +509,8 @@ namespace exahype2::amr {
 
   } // namespace amr_detail
 
+  // The helpers above under the names that the two criteria use: native_detail for a solver without a
+  // limiter (NativeArithmetic set), detail for ADER-DG with the limiter (NativeArithmetic not set).
   TARGET_DECLARE
   namespace native_detail {
     namespace transfer_bound = ::exahype2::amr::detail::transfer_bound;
@@ -526,10 +544,12 @@ namespace exahype2::amr {
       return amr_detail::highestOrderDetailImpl<false, Stop, N, V, C>(Q, budget);
     }
   }
+  /** The score of the highest polynomial degree of one cell, for a solver without a limiter. */
   template <int N, int V, typename C, typename P>
   GPU_CALLABLE_METHOD double nativeHighestOrderDetail(const P* Q) {
     return amr_detail::highestOrderDetailImpl<true, false, N, V, C>(Q, std::numeric_limits<double>::infinity());
   }
+  /** The score of the highest polynomial degree of one cell, for ADER-DG with the limiter. */
   template <int N, int V, typename C, typename P>
   GPU_CALLABLE_METHOD double highestOrderDetail(const P* Q) {
     return amr_detail::highestOrderDetailImpl<false, false, N, V, C>(Q, std::numeric_limits<double>::infinity());
@@ -537,6 +557,7 @@ namespace exahype2::amr {
 
   TARGET_DECLARE_END
 
+  /** The check of a DG cell against the initial condition, for a solver without a limiter on the CPU. */
   template <int N, int V, typename C, typename P,
             typename Observer = amr_detail::NoInitialObservation>
   bool nativeInitialDataPasses(
@@ -550,6 +571,7 @@ namespace exahype2::amr {
       Q, x, h, nodes, prolongation, initialCondition, admissible, std::move(observer));
   }
 
+  /** The check of a DG cell against the initial condition, for ADER-DG with the limiter on the CPU. */
   template <int N, int V, typename C, typename P,
             typename Observer = amr_detail::NoInitialObservation>
   bool initialDataPasses(
@@ -563,6 +585,7 @@ namespace exahype2::amr {
       Q, x, h, nodes, prolongation, initialCondition, admissible, std::move(observer));
   }
   TARGET_DECLARE
+  /** The check of a DG cell against the initial condition, for a solver without a limiter in a GPU kernel. */
   template <int N, int V, typename C, typename P,
             typename InitialCondition, typename Admissible, typename Observer = amr_detail::NoInitialObservation>
   GPU_CALLABLE_METHOD bool nativeDeviceInitialDataPasses(
@@ -574,6 +597,7 @@ namespace exahype2::amr {
       Q, x, h, nodes, prolongation, initialCondition, admissible, observer);
   }
 
+  /** The check of a DG cell against the initial condition, for ADER-DG with the limiter in a GPU kernel. */
   template <int N, int V, typename C, typename P,
             typename InitialCondition, typename Admissible, typename Observer = amr_detail::NoInitialObservation>
   GPU_CALLABLE_METHOD bool deviceInitialDataPasses(

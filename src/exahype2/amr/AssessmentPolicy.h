@@ -5,7 +5,16 @@
 #include <type_traits>
 
 namespace exahype2::amr {
-  /** Choose numerical checks independently of limiter status. */
+  /**
+   * The checks of the criterion for a solver without a limiter. The flags mean:
+   *  - NativeArithmetic: sums, products and norms use the overflow-checked helpers of NativeNeighbours.h.
+   *  - RequireSingleRank: the criterion refuses to run on more than one MPI rank.
+   *  - CheckNeighbours: the score of a cell includes its faces.
+   *  - CheckQuietDetail: in legacy mode only a resolved cell collects quiet time.
+   *  - CheckCommandPhysical: a cell whose solution is not physically admissible refines.
+   *  - UseLocalConstancy: a cell that the limiter marks keeps its size where the solution is constant.
+   * The texts are the messages of the exceptions that the criterion throws.
+   */
   struct NativeAssessmentPolicy {
     static constexpr bool NativeArithmetic = true;
     static constexpr bool RequireSingleRank = true;
@@ -20,7 +29,7 @@ namespace exahype2::amr {
     static constexpr const char* InvalidReferenceTime = "Independent AMR criterion reference time must be finite and positive.";
   };
 
-  /** Assess accepted DG/FV states while retaining limiter-specific protections. */
+  /** The checks of the criterion for ADER-DG with the subcell limiter. NativeAssessmentPolicy explains the flags. */
   struct LimiterCompatibilityPolicy {
     static constexpr bool NativeArithmetic = false;
     static constexpr bool RequireSingleRank = false;
@@ -35,7 +44,7 @@ namespace exahype2::amr {
     static constexpr const char* InvalidReferenceTime = "Limiter criterion reference time must be finite and positive.";
   };
 
-  /** Select the assessment policy from the accepted-state layout. */
+  /** The checks that fit the Accepted type: those for the limiter if the solver has subcells, the others if not. */
   template<typename Accepted>
   using DefaultAssessmentPolicy = std::conditional_t<Accepted::HasHybridSubcells,
     LimiterCompatibilityPolicy, NativeAssessmentPolicy>;

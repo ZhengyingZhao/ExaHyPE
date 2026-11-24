@@ -14,9 +14,14 @@
 #if defined(__FAST_MATH__)
 #error "Continuous transfer certificates require IEEE arithmetic without fast-math."
 #endif
+// Does a polynomial stay below a bound everywhere in a cell? The criterion asks this for the difference
+// between a child and its parent, which it knows at the nodes only. This file answers with interval
+// arithmetic: every number is a pair of bounds that contains the exact value, rounding included. The
+// polynomial is converted to Bernstein form, whose coefficients bound it over the whole cell. Where these
+// bounds are too coarse, the cell is halved and the halves are tested again.
 TARGET_DECLARE
 namespace exahype2::amr::detail::transfer_bound {
-  /** A fixed-capacity list. Appending an entry returns false when the list is full. */
+  /** A list with a fixed capacity. Appending an entry returns false when the list is full. */
   template <typename T, int Capacity>
   class FixedVector {
     static_assert(Capacity >= 0);
@@ -47,6 +52,7 @@ namespace exahype2::amr::detail::transfer_bound {
     }
   };
 
+  /** Sorts a range in ascending order. A GPU kernel can call it, unlike std::sort. */
   template <typename Iterator>
   GPU_CALLABLE_METHOD constexpr void sort(Iterator first, Iterator last) {
     if (first == last) return;
@@ -61,6 +67,7 @@ namespace exahype2::amr::detail::transfer_bound {
     }
   }
 
+  /** Removes repeated entries from a sorted range, like std::unique. */
   template <typename Iterator>
   GPU_CALLABLE_METHOD constexpr Iterator unique(Iterator first, Iterator last) {
     if (first == last) return last;
@@ -71,6 +78,7 @@ namespace exahype2::amr::detail::transfer_bound {
     return output + 1;
   }
 
+  /** Moves a range to its next permutation, like std::next_permutation. Returns false after the last one. */
   template <typename Iterator>
   GPU_CALLABLE_METHOD constexpr bool nextPermutation(Iterator first, Iterator last) {
     if (first == last or first + 1 == last) return false;
@@ -94,7 +102,8 @@ namespace exahype2::amr::detail::transfer_bound {
     return found;
   }
 
-  /** Each operation rounds to double before its result is used to form an interval endpoint. */
+  /** The four basic operations, each rounded once to the nearest double. The compiler must not merge them
+   * with other operations, because the interval bounds rely on this rounding. */
   GPU_CALLABLE_METHOD inline double roundedAdd(double left, double right) {
 #if defined(__CUDA_ARCH__)
     return __dadd_rn(left, right);
@@ -128,14 +137,19 @@ namespace exahype2::amr::detail::transfer_bound {
 #endif
   }
 
-  // Outward-rounded scalar bounds.
+  /** A lower and an upper bound of a number. The operations below round the lower bound down and the upper
+   * bound up, so that the exact result lies between them. */
   struct Interval {
     double lo, hi;
   };
+  /** The interval that stands for "no bound". */
   GPU_CALLABLE_METHOD inline Interval bad() { return {-INFINITY, INFINITY}; }
+  /** Does the interval have finite bounds in the right order? */
   GPU_CALLABLE_METHOD inline bool valid(Interval x) { return std::isfinite(x.lo) && std::isfinite(x.hi) && x.lo <= x.hi; }
+  /** Is the interval exactly zero? */
   GPU_CALLABLE_METHOD inline bool zero(Interval x) { return x.lo == 0. && x.hi == 0.; }
-  // The neighbouring doubles. These return the same bits as std::nextafter without a library call.
+  // The next double below x, above x and towards zero. They return the bits of std::nextafter without a
+  // library call.
   GPU_CALLABLE_METHOD inline double down(double x) {
     if (std::isnan(x) || x == -INFINITY) return x;
     if (x == 0.) return -std::numeric_limits<double>::denorm_min();
@@ -153,15 +167,16 @@ namespace exahype2::amr::detail::transfer_bound {
     if (x == 0.) return 0.;
     return std::bit_cast<double>(std::bit_cast<std::uint64_t>(x) - 1);
   }
-  // Check for overflow before evaluating interval endpoints.
+  /** Can a + b be computed without overflow? */
   GPU_CALLABLE_METHOD inline bool sumSafe(double a, double b) {
     const double limit = std::numeric_limits<double>::max();
     return std::signbit(a) != std::signbit(b) || std::abs(a) <= roundedSubtract(limit, std::abs(b));
   }
+  /** Can a * b be computed without overflow? */
   GPU_CALLABLE_METHOD inline bool productSafe(double a, double b) {
     const double aa = std::abs(a), bb = std::abs(b), limit = std::numeric_limits<double>::max();
     if (aa > 1.) {
-      // Prevent speculative division by a zero or tiny operand.
+      // volatile keeps the compiler from dividing before the test above.
       volatile double divisor = aa;
       if (bb > towardsZero(roundedDivide(limit, divisor))) return false;
     }
@@ -171,7 +186,7 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     return true;
   }
-  // The result encloses the exact sum, including roundoff at both endpoints.
+  /** Returns bounds of a + b. */
   GPU_CALLABLE_METHOD inline Interval add(Interval a, Interval b) {
     if (!valid(a) || !valid(b)) {
       return bad();
@@ -188,7 +203,9 @@ namespace exahype2::amr::detail::transfer_bound {
     const double lo = roundedAdd(a.lo, b.lo), hi = roundedAdd(a.hi, b.hi);
     return std::isfinite(lo) && std::isfinite(hi) ? Interval{down(lo), up(hi)} : bad();
   }
+  /** Returns bounds of a - b. */
   GPU_CALLABLE_METHOD inline Interval sub(Interval a, Interval b) { return add(a, {-b.hi, -b.lo}); }
+  /** Returns bounds of a * b. */
   GPU_CALLABLE_METHOD inline Interval mul(Interval a, Interval b) {
     if (!valid(a) || !valid(b)) {
       return bad();
@@ -196,15 +213,15 @@ namespace exahype2::amr::detail::transfer_bound {
     if (zero(a) || zero(b)) {
       return {0., 0.};
     }
-    // Operands of one sign take their bounds from two known corners. Rounding keeps the order of the
-    // four products, so these are the bounds of the general case below.
+    // An interval that does not change its sign has its smallest and its largest product at known ends. Two
+    // products then give the same bounds as the four of the general case below.
     const bool positiveA = a.lo >= 0., negativeA = a.hi <= 0., positiveB = b.lo >= 0., negativeB = b.hi <= 0.;
     if ((positiveA || negativeA) && (positiveB || negativeB)) {
       const double lowerA = positiveA == positiveB ? (positiveA ? a.lo : a.hi) : (positiveA ? a.hi : a.lo);
       const double lowerB = positiveA == positiveB ? (positiveA ? b.lo : b.hi) : (positiveA ? b.lo : b.hi);
       const double upperA = positiveA == positiveB ? (positiveA ? a.hi : a.lo) : (positiveA ? a.lo : a.hi);
       const double upperB = positiveA == positiveB ? (positiveA ? b.hi : b.lo) : (positiveA ? b.hi : b.lo);
-      // The corner of the largest magnitudes decides whether any product overflows.
+      // If the product of the two largest magnitudes does not overflow, no product does.
       const double largestA = positiveA ? a.hi : a.lo, largestB = positiveB ? b.hi : b.lo;
       if (!productSafe(largestA, largestB)) {
         return bad();
@@ -233,6 +250,7 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     return {down(lower), up(upper)};
   }
+  /** Returns bounds of a / s for a positive number s. */
   GPU_CALLABLE_METHOD inline Interval div(Interval a, double s) {
     if (!valid(a) || !std::isfinite(s) || s <= 0.) {
       return bad();
@@ -247,7 +265,7 @@ namespace exahype2::amr::detail::transfer_bound {
     const double lo = roundedDivide(a.lo, s), hi = roundedDivide(a.hi, s);
     return std::isfinite(lo) && std::isfinite(hi) ? Interval{down(lo), up(hi)} : bad();
   }
-  // Bound (a-b)/s, dividing first if a-b would overflow.
+  /** Returns bounds of (a-b)/s. It divides first if a-b would overflow. */
   GPU_CALLABLE_METHOD inline Interval difference(double a, double b, double s) {
     if (!std::isfinite(a) || !std::isfinite(b) || !std::isfinite(s) || s <= 0.) {
       return bad();
@@ -261,9 +279,10 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     return div(sub({a, a}, {b, b}), s);
   }
-  // Convert an interval to an upper bound on its absolute value.
+  /** Returns the largest absolute value in an interval. */
   GPU_CALLABLE_METHOD inline double magnitude(Interval a) { return valid(a) ? std::max(std::abs(a.lo), std::abs(a.hi)) : INFINITY; }
-  // Bound the vector norm with outward rounding; scale by budget to avoid overflow.
+  /** Is the norm of the vector m at most budget? The entries of m are upper bounds of magnitudes. The test
+   * rounds up, so a true result holds for the exact numbers. */
   template <int V> GPU_CALLABLE_METHOD bool normPasses(std::array<double, V> m, double budget) {
     if (!std::isfinite(budget) || budget <= 0.) {
       return false;
@@ -285,7 +304,8 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     return sum == 0. || up(std::sqrt(sum)) <= 1.;
   }
-  // Sort terms for an order-independent interval sum.
+  /** Returns bounds of the sum of the terms. The terms are sorted first, so the result does not depend on
+   * their order. */
   template <int N> GPU_CALLABLE_METHOD Interval canonicalSum(std::array<Interval, N> terms) {
     std::array<double, N> lo, hi;
     for (int i = 0; i < N; i++) {
@@ -295,7 +315,7 @@ namespace exahype2::amr::detail::transfer_bound {
       lo[i] = terms[i].lo;
       hi[i] = terms[i].hi;
     }
-    // Negate the lower sum so sign reversal swaps the bounds exactly.
+    // The lower bounds are added as negatives. Terms of the opposite sign then give exactly the mirrored interval.
     for (double &x : lo) {
       x = -x;
     }
@@ -318,7 +338,7 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     return {-l, h};
   }
-  // Require round-to-nearest and gradual underflow for interval bounds.
+  /** Does the processor round to nearest and keep subnormal numbers? The interval bounds need both. */
   GPU_CALLABLE_METHOD inline bool arithmeticSupported() {
     static_assert(sizeof(double) == sizeof(std::uint64_t) && std::numeric_limits<double>::digits == 53);
     COMPILE_IF_ON_HOST(if (std::fegetround() != FE_TONEAREST) return false;)
@@ -327,6 +347,7 @@ namespace exahype2::amr::detail::transfer_bound {
     const double a = normal * half, b = tiny * two;
     return std::bit_cast<std::uint64_t>(a) == 0x0008000000000000ULL && std::bit_cast<std::uint64_t>(b) == 2ULL;
   }
+  /** Returns n to the power d. */
   GPU_CALLABLE_METHOD constexpr int power(int n, int d) {
     int v = 1;
     while (d--) {
@@ -334,8 +355,9 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     return v;
   }
+  /** One interval per node and value of a cell with N nodes per axis, V values per node and D dimensions. */
   template <int N, int V, int D> using Field = std::array<Interval, power(N, D) * V>;
-  // Apply an interval matrix along one tensor axis.
+  /** Multiplies a field with a matrix along one axis. */
   template <int N, int V, int D>
   GPU_CALLABLE_METHOD Field<N, V, D> contract(const Field<N, V, D> &q, const std::array<Interval, N * N> &matrix, int axis) {
     Field<N, V, D> out;
@@ -354,7 +376,8 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     return out;
   }
-  // Certify the polynomial from the convex hull of its Bernstein control vectors.
+  /** Are all Bernstein coefficients within budget? If so, the polynomial is within budget everywhere in the
+   * cell, because it lies in the convex hull of its coefficients. */
   template <int N, int V, int D> GPU_CALLABLE_METHOD bool hullPasses(const Field<N, V, D> &q, double budget) {
     for (int n = 0; n < power(N, D); n++) {
       std::array<double, V> m;
@@ -367,7 +390,8 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     return true;
   }
-  // Bisect one tensor axis at its midpoint using de Casteljau averaging.
+  /** Returns the Bernstein coefficients of the polynomial on the lower or upper half of the cell along one
+   * axis, by de Casteljau's algorithm. */
   template <int N, int V, int D> GPU_CALLABLE_METHOD Field<N, V, D> half(const Field<N, V, D> &q, int axis, bool right) {
     Field<N, V, D> out;
     const int stride = power(N, axis), nodes = power(N, D);
@@ -394,7 +418,8 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     return out;
   }
-  /** Bisect all axes until every box passes or the round limit is reached. */
+  /** hullPasses() with bisection: a cell that fails is halved along every axis and its parts are tested
+   * again, at most Remaining times. */
   template <int N, int V, int D, int Remaining>
   GPU_CALLABLE_METHOD bool refinedHullPasses(const Field<N, V, D> &q, double budget, const std::array<int, D> &order) {
     if (hullPasses<N, V, D>(q, budget)) {
@@ -414,7 +439,8 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     return false;
   }
-  // Detect points whose norm lower bound exceeds the budget.
+  /** Is the norm of this point above budget for certain? The test rounds down, so a true result holds for
+   * the exact numbers. */
   template <int V> GPU_CALLABLE_METHOD bool pointAbove(const std::array<Interval, V> &point, double budget) {
     std::array<double, V> lower;
     for (int c = 0; c < V; c++) {
@@ -440,7 +466,7 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     return sum > 1.;
   }
-  // Look for an over-budget value at the corners or centre.
+  /** Is the polynomial above budget at a corner or at the centre of the cell? It then fails for certain. */
   template <int N, int V, int D>
   GPU_CALLABLE_METHOD bool pointWitness(const Field<N, V, D> &q, double budget, const std::array<int, D> &order) {
     for (int corner = 0; corner < (1 << D); corner++) {
@@ -458,7 +484,7 @@ namespace exahype2::amr::detail::transfer_bound {
         return true;
       }
     }
-    // The far corner of the left halves is the original centre.
+    // Take the lower half along every axis. Its last coefficient is the value at the centre of the cell.
     auto centre = q;
     for (int a : order) {
       centre = half<N, V, D>(centre, a, false);
@@ -469,7 +495,8 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     return pointAbove<V>(value, budget);
   }
-  // Split the axis with the largest adjacent-control variation; use order to break ties.
+  /** Returns the axis to halve next: the one along which neighbouring coefficients differ most. Among equals
+   * the first in order wins. */
   template <int N, int V, int D> GPU_CALLABLE_METHOD int splitAxis(const Field<N, V, D> &q, const std::array<int, D> &order) {
     int selected = order[0];
     double largest = -1.;
@@ -492,9 +519,11 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     return selected;
   }
+  /** The outcome of a test: the polynomial is within budget everywhere (Proved), it is above budget somewhere
+   * (Unsafe), or the test cannot tell (Unknown). */
   enum class HullResult { Proved, Unsafe, Unknown };
-  /** Test the error bound on smaller parts of the cell. Unknown means the available bounds or work limit
-   * did not settle the test.
+  /** adaptiveHull() for a GPU kernel, with lists of fixed size. A part of the cell is stored as the sequence
+   * of halvings that leads to it.
    */
   template <int N, int V, int D>
   GPU_CALLABLE_METHOD HullResult adaptiveHullOnDevice(
@@ -534,8 +563,9 @@ namespace exahype2::amr::detail::transfer_bound {
     }
   }
 
-  /** Check whether the error stays within budget throughout the cell. Subdivide boxes whose bounds are
-   * inconclusive.
+  /** Tests whether a polynomial stays within budget everywhere in the cell. Parts on which the bounds cannot
+   * tell are halved and tested again, until all parts pass, one part fails for certain or the work limit is
+   * reached.
    */
   template <int N, int V, int D>
   GPU_CALLABLE_METHOD HullResult adaptiveHull(const Field<N, V, D> &q, double budget, const std::array<int, D> &order) {
@@ -571,7 +601,7 @@ namespace exahype2::amr::detail::transfer_bound {
       if (unresolved.empty()) {
         return HullResult::Proved;
       }
-      // Stop if the whole next frontier would exceed either budget.
+      // Stop if halving every open part would exceed the limit on parts or on memory.
       if (depth >= std::numeric_limits<double>::digits || unresolved.size() > (boxes - visited) / 2 ||
           active.size() > coefficients / q.size() ||
           unresolved.size() > (coefficients / q.size() - active.size()) / 2) {
@@ -590,8 +620,9 @@ namespace exahype2::amr::detail::transfer_bound {
     })();)
     return HullResult::Unknown;
   }
-  /** Bound the growth of nodal magnitudes under the nodal-to-Bernstein transform of one axis by the
-   * largest absolute row sum. Returns false for an invalid weight.
+  /** Returns in amplification by how much the conversion from node values to Bernstein coefficients can
+   * enlarge a value along one axis: the largest row sum of the magnitudes of the matrix. Returns false if the
+   * matrix holds an invalid weight.
    */
   template <int N>
   GPU_CALLABLE_METHOD bool transformAmplification(const std::array<Interval, N * N> &matrix, double &amplification) {
@@ -619,8 +650,8 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     return true;
   }
-  /** Return true if nodal magnitudes of at most maxima keep every Bernstein coefficient within budget.
-   * Larger maxima never pass where smaller ones fail.
+  /** Do node values of at most maxima keep every Bernstein coefficient within budget? This quick test needs
+   * no coefficients. A larger bound never passes where a smaller one fails.
    */
   template <int V, int D>
   GPU_CALLABLE_METHOD bool amplifiedMaximaPass(std::array<double, V> maxima, double budget, double amplification) {
@@ -633,8 +664,9 @@ namespace exahype2::amr::detail::transfer_bound {
     }
     return normPasses<V>(maxima, budget);
   }
-  /** Return true if the error intervals at the nodes imply that the polynomial stays within budget
-   * everywhere in the cell.
+  /** Does a polynomial stay within budget everywhere in the cell? input bounds it at the nodes and matrix
+   * converts node values to Bernstein coefficients along one axis. The test tries the quick bound first, then
+   * the coefficients, then bisection. False means that the bound could not be shown.
    */
   template <int N, int V, int D>
   GPU_CALLABLE_METHOD bool passesIntervals(const Field<N, V, D> &input, double budget,
@@ -654,12 +686,12 @@ namespace exahype2::amr::detail::transfer_bound {
         if (!valid(value)) {
           return false;
         }
-        // An over-budget nodal interval prevents certification of the whole box.
+        // A node above budget settles the test.
         if (magnitude(value) > budget) return false;
         maxima[c] = std::max(maxima[c], magnitude(value));
       }
     }
-    // Bound transform amplification by its largest absolute row sum.
+    // The quick test: bound the coefficients by the largest node values times the row sums.
     double amplification = 0.;
     if (!transformAmplification<N>(matrix, amplification)) {
       return false;
@@ -667,7 +699,8 @@ namespace exahype2::amr::detail::transfer_bound {
     if (amplifiedMaximaPass<V, D>(maxima, budget, amplification)) {
       return true;
     }
-    // Any contraction order with a passing enclosing hull certifies the bound.
+    // The axes can be converted in any order. The rounding differs between the orders, and one order that
+    // passes is enough.
     std::array<int, D> order;
     for (int a = 0; a < D; a++) {
       order[a] = a;
@@ -677,8 +710,8 @@ namespace exahype2::amr::detail::transfer_bound {
       for (int a : order) {
         coefficients = contract<N, V, D>(coefficients, matrix, a);
       }
-      // For constant and multilinear fields every control vector is a corner.
-      // Bisection preserves those corners, so a failing hull cannot improve.
+      // With one or two nodes per axis the coefficients are the values at the corners. Halving keeps the
+      // corners, so it cannot turn a failure into a pass.
       constexpr int UniformRounds = N <= 2 ? 0 : 3;
       const bool proved = split ? refinedHullPasses<N, V, D, UniformRounds>(coefficients, budget, order)
                                 : hullPasses<N, V, D>(coefficients, budget);
@@ -686,7 +719,7 @@ namespace exahype2::amr::detail::transfer_bound {
         return true;
       }
     } while (nextPermutation(order.begin(), order.end()));
-    // Refine unresolved hulls and reject over-budget point witnesses.
+    // Last step: halve the parts that are still open, and stop at a point that is above budget for certain.
     if constexpr (N <= 2) {
       return false;
     } else if (split) {
@@ -710,8 +743,8 @@ namespace exahype2::amr::detail::transfer_bound {
     return false;
   }
 
-  /** Check that the scaled difference between the original and restored DG polynomials stays within budget
-   * across the cell.
+  /** Does the scaled difference between a child (fine) and the values that come back from its parent
+   * (restored) stay within budget everywhere in the cell?
    */
   template <int N, int V, int D, typename P>
   GPU_CALLABLE_METHOD bool passes(const P *fine, const P *restored, const std::array<double, V> &scales, double budget,

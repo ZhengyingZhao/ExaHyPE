@@ -1,19 +1,22 @@
 // This file is part of the ExaHyPE2 project. For conditions of distribution and
 // use, please see the copyright notice at www.peano-framework.org
-// Bound the loss between fine DG polynomials and the stored parent polynomial.
 #pragma once
 #include "TransferBounds.h"
 #include <algorithm>
 #include <type_traits>
 #include <cstddef>
 
+// When siblings coarsen, their parent keeps one DG polynomial. This file bounds how far the polynomial of a
+// child lies from that parent polynomial at the nodes of the child. The bounds are intervals that contain
+// the exact difference, rounding included.
 namespace exahype2::amr::detail::retained_parent {
   namespace bound = ::exahype2::amr::detail::transfer_bound;
   using Interval = bound::Interval;
+  /** Stands in for Geometry and PreparedParent in a criterion for FV, which needs neither. */
   struct NoGeometry {};
 
   TARGET_DECLARE
-  // Bound a quotient of two intervals. A denominator that includes zero has no finite bound.
+  /** Returns bounds of a/b for two intervals. A denominator that contains zero gives no bound. */
   GPU_CALLABLE_METHOD inline Interval quotient(Interval a, Interval b) {
     if (not bound::valid(a) or not bound::valid(b) or (b.lo <= 0. and b.hi >= 0.)) return bound::bad();
     if (bound::zero(a)) return {0., 0.};
@@ -23,7 +26,7 @@ namespace exahype2::amr::detail::retained_parent {
     for (double x : numerator) for (double y : denominator) {
       const double divisor = std::abs(y);
       if (divisor < 1.) {
-        // Round the safe range towards zero before attempting x/y.
+        // x/y overflows if |x| exceeds the largest double times |y|. This limit is rounded towards zero.
         const double safe = std::nextafter(bound::roundedMultiply(std::numeric_limits<double>::max(), divisor), 0.);
         if (std::abs(x) > safe) return bound::bad();
       }
@@ -39,8 +42,9 @@ namespace exahype2::amr::detail::retained_parent {
   }
   TARGET_DECLARE_END
 
-  /** Interpolation weights for evaluating the parent DG polynomial at each child's nodes.
-   * Entry (row, col) bounds the value of parent basis function col at child node row.
+  /** The weights that evaluate the DG polynomial of a parent at the nodes of its children, along one axis.
+   * For every child position, entry (row, col) bounds the value of the parent's basis function col at the
+   * child's node row.
    */
   template<int N, int R>
   class Geometry {
@@ -50,6 +54,8 @@ namespace exahype2::amr::detail::retained_parent {
     double _largestRowSum = 0.;
     bool _bound = false, _valid = false;
   public:
+    /** Computes the weights for these nodes. Returns false if the nodes are not valid. A second call with the
+     * same nodes changes nothing. */
     bool bind(const double* nodes) {
       if (nodes == nullptr or not bound::arithmeticSupported()) { _bound = false; return _valid = false; }
       if (_bound and std::equal(_nodes.begin(), _nodes.end(), nodes)) return _valid;
@@ -81,16 +87,19 @@ namespace exahype2::amr::detail::retained_parent {
       return _valid = std::isfinite(_largestRowSum);
     }
     TARGET_DECLARE
+    /** Have the weights been computed? */
     [[nodiscard]] GPU_CALLABLE_METHOD bool valid() const { return _valid; }
+    /** The weights for the child at this position along an axis. */
     [[nodiscard]] GPU_CALLABLE_METHOD const std::array<Interval, N*N>& matrix(int child) const { return _matrix[child]; }
-    /** The largest sum of weight magnitudes over the parent nodes that one child node reads along an axis. */
+    /** The largest sum of the magnitudes of the weights of one child node. Interpolation along one axis
+     * enlarges a value by at most this factor. */
     [[nodiscard]] GPU_CALLABLE_METHOD double largestRowSum() const { return _largestRowSum; }
     TARGET_DECLARE_END
   };
 
   TARGET_DECLARE
-  /** Bound the difference between the child's values and the stored parent's polynomial
-   * at each child node, in units of each component's scale.
+  /** Bounds the difference between the values of a child and the parent polynomial at every node of the
+   * child, each divided by the scale of its value.
    */
   template<int N, int V, int D, int R, typename P>
   GPU_CALLABLE_METHOD bool residual(const P* fine, const P* parent, const Geometry<N, R>& geometry,
@@ -123,10 +132,13 @@ namespace exahype2::amr::detail::retained_parent {
     }
     return true;
   }
-  /** A parent DG polynomial and its component scales for comparing several children with the same parent. */
+  /** A parent polynomial that is prepared once and then compared with each of its children. residual()
+   * gives the bounds of the function residual() above. magnitudes() gives a coarser bound at less cost. */
   template<int N, int V, int D, int R, typename P, std::size_t CacheBytes = 32*1024>
   class PreparedParent {
     using Field = bound::Field<N, V, D>;
+    /** The parent interpolated along the first axis, for each of the R child positions on that axis. Children
+     * with the same position share the result. */
     struct Axis0Cache {
       std::array<Field, R> values;
       std::array<bool, R> ready{};
@@ -141,6 +153,8 @@ namespace exahype2::amr::detail::retained_parent {
     const Geometry<N, R>* _geometry{nullptr};
     bool _valid{false};
   public:
+    /** Stores the parent, measured from its first node and divided by the scales, and a bound of the largest
+     * value that interpolation can give for each value. */
     GPU_CALLABLE_METHOD bool prepare(const P* parent, const Geometry<N, R>& geometry, const std::array<double, V>& scales) {
       static_assert(std::is_same_v<P, float> or std::is_same_v<P, double>);
       static_assert(N > 0 and V > 0 and D > 0 and D <= 3);
@@ -158,8 +172,8 @@ namespace exahype2::amr::detail::retained_parent {
         value = bound::difference(static_cast<double>(parent[node*V+component]), _reference[component], scales[component]);
         if (not bound::valid(value)) return false;
       }
-      // Each axis multiplies the parent's largest magnitude by at most the largest row sum.
-      // The factor above one covers the outward rounding of the interval contractions.
+      // Interpolation along one axis enlarges the largest value by at most the largest row sum. The last
+      // factor, slightly above one, covers the rounding of the interpolation.
       for (int component = 0; component < V; component++) {
         double largest = 0.;
         for (int node = 0; node < bound::power(N, D); node++)
@@ -169,16 +183,16 @@ namespace exahype2::amr::detail::retained_parent {
           largest = std::isfinite(largest) and bound::productSafe(largest, factor)
             ? bound::up(bound::roundedMultiply(largest, factor)) : INFINITY;
         }
-        // The smallest normal number exceeds every rounding step of subnormal intermediates.
+        // Adding the smallest normal number covers the rounding of subnormal intermediate values.
         if (largest != 0. and std::isfinite(largest))
           largest = bound::up(bound::roundedAdd(largest, std::numeric_limits<double>::min()));
         _represented[component] = largest;
       }
       return _valid = true;
     }
-    /** Bound each component of this child's scaled difference from the parent at every child node without
-     * evaluating the parent. The bounds are at least the magnitudes that residual() returns.
-     * Returns false if no finite bound exists.
+    /** Bounds, for each value, the largest scaled difference between a child and the parent over the nodes of
+     * the child. It does not interpolate the parent, so its bound is coarser than that of residual() and
+     * never smaller. Returns false if there is no finite bound.
      */
     GPU_CALLABLE_METHOD bool magnitudes(const P* fine, std::array<double, V>& output) const {
       if (fine == nullptr or not _valid) return false;
@@ -190,13 +204,14 @@ namespace exahype2::amr::detail::retained_parent {
           largest = std::max(largest, bound::magnitude(centred));
         }
         if (not std::isfinite(_represented[component]) or not bound::sumSafe(largest, _represented[component])) return false;
-        // The second rounding step covers the outward rounding of the final interval subtraction.
+        // The second step up covers the rounding of the subtraction in residual().
         output[component] = bound::up(bound::up(bound::roundedAdd(largest, _represented[component])));
         if (not std::isfinite(output[component])) return false;
       }
       return true;
     }
-    /** Write bounds on this child's scaled difference from the parent at each child node. */
+    /** Writes bounds of the scaled difference between a child and the parent at every node of the child.
+     * child is the position of the child in its parent. */
     GPU_CALLABLE_METHOD bool residual(const P* fine, int child, Field& output) {
       if (fine == nullptr or not _valid or not _geometry->valid()
           or child < 0 or child >= bound::power(R, D) or not bound::arithmeticSupported()) return false;

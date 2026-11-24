@@ -4,14 +4,20 @@
 
 #include "PredictionSensor.h"
 
+// Linear observables: weighted sums of the values of a cell with tolerances of their own (LinearObservable
+// in amr.py). This file turns the values of a cell into its observables, divides each by its tolerance, and
+// runs the scores and the transfer check on the result. A result above one means that an observable exceeds
+// its tolerance.
 namespace exahype2::amr::observation_detail {
-  /** Return the number of optional linear observation channels. */
+  /** Returns the number of observables of Config, zero if it has none. */
   template <typename C>
   GPU_CALLABLE_METHOD constexpr int count() {
     if constexpr (requires { C::NumberOfObservables; }) return C::NumberOfObservables;
     return 0;
   }
 
+  /** Can the observables of Config be used? Each needs finite weights, at least one of them not zero, a
+   * positive absolute tolerance and a relative tolerance that is not negative. */
   template <int V, typename C>
   GPU_CALLABLE_METHOD bool valid() {
     if constexpr (count<C>() == 0) return true;
@@ -38,7 +44,8 @@ namespace exahype2::amr::observation_detail {
     }
   }
 
-  /** Unit tolerances for observations normalized by their physical budgets. */
+  /** The Config for the scores of observables. Observables are divided by their tolerances first, so every
+   * scale and tolerance here is one. */
   template <typename C>
   struct UnitConfig {
     static GPU_CALLABLE_METHOD double stateScale(int) { return 1.0; }
@@ -49,8 +56,9 @@ namespace exahype2::amr::observation_detail {
     }
   };
 
-  /** Track each observable's range across the accepted cells.
-   * Its error budget is the absolute tolerance plus the relative tolerance times this range.
+  /** Collects the range of every observable over a group of cells: a cell and its neighbour, or the children
+   * of one parent. The tolerance of an observable, its budget, is the absolute tolerance plus the relative
+   * tolerance times this range.
    */
   template <int V, typename C>
   class Stencil {
@@ -58,11 +66,12 @@ namespace exahype2::amr::observation_detail {
     static_assert(V > 0 and Observations >= 0);
     using Interval = detail::transfer_bound::Interval;
     std::array<double, V> _lower{}, _upper{};
-    // A lower bound on the nodal range prevents rounding from enlarging budgets.
+    // The range is bounded from below, so that rounding cannot enlarge a tolerance.
     std::array<double, Observations> _minimumUpper{}, _maximumLower{};
     bool _valid = observation_detail::valid<V, C>();
     bool _empty = true;
 
+    /** Returns bounds of one observable of one state. */
     template <typename P>
     GPU_CALLABLE_METHOD Interval observationInterval(const P* state, int observation) const {
       namespace bound = detail::transfer_bound;
@@ -75,8 +84,8 @@ namespace exahype2::amr::observation_detail {
       return bound::canonicalSum<V>(terms);
     }
 
-    /** Fill in the error budget for each observable and return the number of states to project, or zero on
-     * failure.
+    /** Fills in the tolerance of every observable and returns the number of nodes or volumes of the cell, or
+     * zero if something is not valid.
      */
     template <typename P>
     GPU_CALLABLE_METHOD int prepareProjection(AcceptedCellView<P> view, std::array<double, Observations>& budgets) const {
@@ -94,7 +103,8 @@ namespace exahype2::amr::observation_detail {
       return states;
     }
 
-    /** Write each observable relative to the stencil midpoint, in units of its error budget. */
+    /** Writes every observable of every node, measured from the middle of the collected range and divided by
+     * its tolerance. */
     template <typename P>
     GPU_CALLABLE_METHOD bool projectValues(
       const P* values, int states, const std::array<double, Observations>& budgets, double* output
@@ -130,7 +140,7 @@ namespace exahype2::amr::observation_detail {
       _maximumLower.fill(-INFINITY);
     }
 
-    /** Include this cell's values in the ranges used to set the observable error budgets. */
+    /** Adds the values of a cell to the ranges. */
     template <typename P>
     GPU_CALLABLE_METHOD bool add(AcceptedCellView<P> view) {
       if constexpr (Observations == 0) return true;
@@ -163,7 +173,7 @@ namespace exahype2::amr::observation_detail {
       }
     }
 
-    /** Return a positive budget, or zero when its bound is invalid. */
+    /** Returns the tolerance of an observable for the collected cells, or zero if it cannot be bounded. */
     GPU_CALLABLE_METHOD double budget(int observation) const {
       if constexpr (Observations == 0) return INFINITY;
       else {
@@ -182,7 +192,7 @@ namespace exahype2::amr::observation_detail {
       }
     }
 
-    /** Write one normalized value per state and observable into the caller's buffer. */
+    /** Writes the observables of a cell, divided by their tolerances, to output. capacity is the size of output. */
     template <typename P>
     GPU_CALLABLE_METHOD bool project(AcceptedCellView<P> view, double* output, int capacity) const {
       if constexpr (Observations == 0) return true;
@@ -194,6 +204,7 @@ namespace exahype2::amr::observation_detail {
       }
     }
 
+    /** The same into a vector. */
     template <typename P>
     bool project(AcceptedCellView<P> view, std::vector<double>& output) const {
       if constexpr (Observations == 0) { output.clear(); return true; }
@@ -206,8 +217,9 @@ namespace exahype2::amr::observation_detail {
       }
     }
 
-    /** Check whether the error in each observable fits the children's budget.
-     * The input bounds are in the original field units. For DG, the check covers the whole cell.
+    /** Do the observables stay within their tolerances when a parent replaces a child? residual bounds the
+     * difference between child and parent at every node, in the units of the values. For DG the check holds
+     * everywhere in the cell, not only at the nodes.
      */
     template <int N>
     GPU_CALLABLE_METHOD bool transferIntervalsPasses(const detail::transfer_bound::Field<N, V, DIMENSIONS>& residual, bool finiteVolume) const {
@@ -241,8 +253,8 @@ namespace exahype2::amr::observation_detail {
       }
     }
 
-    /** Check how much each observable changes when the parent is mapped back to a child.
-     * Use cell averages for FV and a bound over the whole cell for DG.
+    /** The same check for a child (fine) and the values that come back from its parent (restored). FV compares
+     * the averages. DG bounds the difference everywhere in the cell.
      */
     template <int N, typename P>
     GPU_CALLABLE_METHOD bool transferPasses(const P* fine, const P* restored, bool finiteVolume) const {
@@ -284,8 +296,9 @@ namespace exahype2::amr::observation_detail {
     }
   };
 
-  /** Compare initial data on all children with the parent's prediction, using one observable budget for
-   * the family.
+  /** Checks the observables when a DG cell is compared with the initial condition (initialDataPasses()). It
+   * collects the initial condition and the polynomial of the cell on every child that a refinement would
+   * create, and tests them with one tolerance per observable for all children.
    */
   template <int N, int V, typename C, typename P>
   class InitialDataMonitor {
@@ -296,6 +309,7 @@ namespace exahype2::amr::observation_detail {
     bool _valid = true;
 
   public:
+    /** Adds one child: the initial condition at its nodes and the values of the cell's polynomial there. */
     bool add(const P* fresh, const P* represented) {
       if constexpr (count<C>() == 0) return true;
       else {
@@ -314,6 +328,7 @@ namespace exahype2::amr::observation_detail {
       }
     }
 
+    /** Do the observables stay within their tolerances on all children? */
     bool passes() const {
       if constexpr (count<C>() == 0) return true;
       else {
@@ -328,7 +343,7 @@ namespace exahype2::amr::observation_detail {
   };
 
   TARGET_DECLARE
-  /** Check the initial observations on all children against what the parent DG polynomial predicts. */
+  /** InitialDataMonitor for a GPU kernel, with arrays of fixed size. */
   template <int N, int V, typename C, typename P>
   class DeviceInitialDataMonitor {
     static constexpr int Values = peano4::power(N, DIMENSIONS) * V;
@@ -370,6 +385,8 @@ namespace exahype2::amr::observation_detail {
 
   TARGET_DECLARE_END
 
+  /** Returns the prediction score of a face for the observables, in units of their tolerances. A result above
+   * one means that an observable exceeds its tolerance. */
   template <int N, int V, typename C, typename P>
   double faceRatio(AcceptedCellView<P> own, AcceptedCellView<P> other,
                    const NativeCellKey& ownKey, const NativeCellKey& otherKey,
@@ -387,11 +404,13 @@ namespace exahype2::amr::observation_detail {
     }
   }
 
+  /** Returns the score of one cell for the observables, in units of their tolerances. With initial set, the
+   * cell is judged from its own values alone, as on the initial mesh. */
   template <int N, int V, typename C, typename P>
   double localRatio(AcceptedCellView<P> view, const double* nodes, bool initial) {
     if constexpr (count<C>() == 0) return 0.0;
     else {
-      // The prediction error for DG comes from comparing the cell with its neighbours.
+      // A DG cell has no score of its own in prediction mode. Its faces carry it.
       if (not initial and not view.isFiniteVolume()) {
         return valid<V, C>() ? prediction_detail::localDetail<N, V, UnitConfig<C>>(view, nodes) : INFINITY;
       }
@@ -407,7 +426,7 @@ namespace exahype2::amr::observation_detail {
     }
   }
   TARGET_DECLARE
-  /** Measure how closely the observables on both sides of a face fit one profile, in units of their budgets. */
+  /** faceRatio() for a GPU kernel. */
   template <int N, int V, typename C, int MaxPoints, typename P>
   GPU_CALLABLE_METHOD double deviceFaceRatio(
     AcceptedCellView<P> own, AcceptedCellView<P> other,
@@ -429,9 +448,7 @@ namespace exahype2::amr::observation_detail {
     }
   }
 
-  /** Measure variation in one cell's observables in units of their error budgets. A score above one
-   * exceeds the budget.
-   */
+  /** localRatio() for a GPU kernel. */
   template <int N, int V, typename C, int MaxPoints, typename P>
   GPU_CALLABLE_METHOD double deviceLocalRatio(AcceptedCellView<P> view, const double* nodes, bool initial) {
     if constexpr (count<C>() == 0) return 0.0;

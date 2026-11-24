@@ -13,9 +13,13 @@
 #include <type_traits>
 #include <utility>
 
+// The score of prediction mode. For the face between two cells, the solution is sampled along lines that
+// cross the face at right angles. One polynomial is fitted to the values of both cells on such a line. What
+// the polynomial cannot reproduce, averaged over the face, is the score of the face: a solution that both
+// cells resolve leaves almost nothing. An FV cell also has a score of its own.
 namespace exahype2::amr::prediction_detail {
   TARGET_DECLARE
-  /** Positive Gauss rule on [0,1], used only to integrate sensor polynomials. */
+  /** The Gauss-Legendre quadrature rule with Count points on [0,1]. The sensor integrates with it. */
   template <int Count>
   struct GaussRule {
     std::array<double, Count> nodes{}, weights{};
@@ -55,6 +59,7 @@ namespace exahype2::amr::prediction_detail {
 
   TARGET_DECLARE_END
 
+  /** Returns the rule with Count points. It is computed once. */
   template <int Count>
   const GaussRule<Count>& gaussRule() {
     static const GaussRule<Count> rule;
@@ -62,6 +67,7 @@ namespace exahype2::amr::prediction_detail {
   }
 
   TARGET_DECLARE
+  /** Returns the Legendre polynomials of the degrees 0 to N-1 at a point of [-1,1]. */
   template <int N>
   GPU_CALLABLE_METHOD std::array<double, N> legendre(double point) {
     std::array<double, N> result{};
@@ -74,12 +80,13 @@ namespace exahype2::amr::prediction_detail {
     return result;
   }
 
+  /** Returns the argument of smaller magnitude if both have the same sign, and zero if not. */
   inline GPU_CALLABLE_METHOD double minmod(double left, double right) {
     if (left == 0.0 or right == 0.0 or std::signbit(left) != std::signbit(right)) return 0.0;
     return std::copysign(std::min(std::abs(left), std::abs(right)), left);
   }
 
-  /** Scale a component difference; unselected resolution components contribute zero. */
+  /** Returns (a-b) divided by the scale of the value. A value that Config leaves out of the score gives zero. */
   template <typename C>
   GPU_CALLABLE_METHOD double resolutionDifference(double a, double b, int component) {
     if constexpr (requires { C::resolutionComponent(component); })
@@ -88,9 +95,10 @@ namespace exahype2::amr::prediction_detail {
   }
 
   /**
-   * Scaled change across one volume in a mean-preserving affine reconstruction.
-   * Limit one-sided slopes at patch edges, use a secant for two volumes,
-   * and use zero slope when only one volume is available.
+   * Returns the limited slope of one value in one volume of an FV cell along one axis, as the change across
+   * the volume divided by the scale. An inner volume takes the minmod of the differences to its two
+   * neighbours. A volume at the edge of the cell takes the minmod of the two nearest differences. With two
+   * volumes per axis the slope is their difference, with one volume it is zero.
    */
   template <int V, typename C, typename P>
   GPU_CALLABLE_METHOD double fvSlope(const AcceptedCellView<P>& view, int volume, int axis, int component) {
@@ -109,7 +117,8 @@ namespace exahype2::amr::prediction_detail {
     return minmod(difference(volume, volume - stride), difference(volume + stride, volume));
   }
 
-  /** Slopes and centred means for one FV patch, filled as the sensor requests them. */
+  /** The slopes of an FV cell and its values relative to a reference state. Each one is computed when it is
+   * first asked for. */
   template <int V, typename C, typename P>
   struct CachedFVData {
     struct Entry {
@@ -146,7 +155,7 @@ namespace exahype2::amr::prediction_detail {
 
   TARGET_DECLARE_END
 
-  /** Owns the cached entries for one FV patch on the host. */
+  /** Holds the memory of CachedFVData for one FV cell on the CPU. */
   template <int V, typename C, typename P>
   class FVDataCache {
     using View = CachedFVData<V, C, P>;
@@ -162,8 +171,9 @@ namespace exahype2::amr::prediction_detail {
     View getView() { return {_view, _reference, _entries.data()}; }
   };
 
-  /** Estimate the variation a patch's FV averages miss, both within a volume and across its faces.
-   * A valid DG patch scores zero here. Its prediction error comes from comparisons with its neighbours.
+  /** Returns the score of one cell without its neighbours. For an FV cell it estimates what the averages do
+   * not show: the slope inside the volumes and the mismatch of the linear reconstructions of neighbouring
+   * volumes. A DG cell scores zero here. Its score comes from its faces.
    */
   template <int N, int V, typename C, typename P>
   double localDetail(AcceptedCellView<P> view, const double*) {
@@ -187,7 +197,7 @@ namespace exahype2::amr::prediction_detail {
         if (not std::isfinite(slope)) return std::numeric_limits<double>::infinity();
         representationTerms.push_back(std::abs(slope) / std::sqrt(12.0 * volumes));
       }
-    // The norm uses the same term order when axes are reflected or components are reordered.
+    // Sorting makes the norm independent of the order of the axes and values.
     std::sort(representationTerms.begin(), representationTerms.end());
     for (const double term : representationTerms) result = amr_detail::guardedHypot(result, term);
     int stride = 1;
@@ -228,7 +238,8 @@ namespace exahype2::amr::prediction_detail {
   }
 
   TARGET_DECLARE
-  /** Compute the QR factors used to fit one polynomial through the profiles on both sides of a face. */
+  /** Computes the QR factorisation of the matrix of a least-squares fit, in place. tau receives the
+   * Householder factors. Returns false if the matrix does not have full rank. */
   GPU_CALLABLE_METHOD inline bool factorNormalFit(int rows, int columns, double* qr, double* tau) {
     for (int column = 0; column < columns; column++) {
       double norm = 0.0;
@@ -251,7 +262,8 @@ namespace exahype2::amr::prediction_detail {
     return true;
   }
 
-  /** Return the weighted error left after the fit. The input samples are used as scratch space. */
+  /** Returns what a least-squares fit leaves of the samples: the weighted norm of the part that the polynomial
+   * cannot reproduce. values holds the samples and is overwritten. */
   template <int V>
   GPU_CALLABLE_METHOD double normalFitResidual(
     int rows, int columns, const double* qr, const double* tau, const double* rootWeights, std::span<double> values
@@ -289,7 +301,9 @@ namespace exahype2::amr::prediction_detail {
   }
   TARGET_DECLARE_END
 
-  /** A weighted polynomial fit along the line perpendicular to a shared face. */
+  /** The least-squares fit of one polynomial to the samples of two cells along a line that crosses their shared
+   * face at right angles. A sample is a DG node value or an FV average. The polynomial has as many
+   * coefficients as the cell with the fewest samples, at most N. */
   template <int N>
   struct NormalFit {
     int rows = 0, columns = 0;
@@ -353,6 +367,7 @@ namespace exahype2::amr::prediction_detail {
       valid = factorNormalFit(rows, columns, qr.data(), tau.data());
     }
 
+    /** Returns the part of the samples that the fitted polynomial cannot reproduce. */
     template <int V>
     double residual(std::span<double> values) const {
       if (not valid) return std::numeric_limits<double>::infinity();
@@ -360,6 +375,8 @@ namespace exahype2::amr::prediction_detail {
     }
   };
 
+  /** Returns the fit for a pair of cells: their numbers of samples per axis, whether they are FV cells, and
+   * their levels. A thread computes each fit once and keeps it. */
   template <int N>
   const NormalFit<N>& normalFit(int leftCount, int rightCount, bool leftFV, bool rightFV,
                                int leftLevel, int rightLevel, const double* originalNodes) {
@@ -370,7 +387,7 @@ namespace exahype2::amr::prediction_detail {
         : originalNodes[node];
     }
     using Key = std::tuple<int, int, bool, bool, int, std::array<double, N>>;
-    // Reject nonfinite node keys before accessing the ordered cache.
+    // Nodes that are not finite cannot be a key of the cache.
     static thread_local const NormalFit<N> invalid(0, 0, true, true, 1.0, 1.0, {});
     for (double node : nodes) if (not std::isfinite(node)) return invalid;
     static thread_local std::map<Key, NormalFit<N>> cache;
@@ -384,7 +401,8 @@ namespace exahype2::amr::prediction_detail {
   }
 
   TARGET_DECLARE
-  /** Tangential Lagrange weights for a DG normal profile. */
+  /** The weights that interpolate a DG cell from its nodes to a point of a face. They give the polynomial on
+   * the line through that point at right angles to the face. */
   template <int N>
   struct DGProfileGeometry {
     std::array<double, peano4::power(N, DIMENSIONS - 1)> weights{};
@@ -398,7 +416,7 @@ namespace exahype2::amr::prediction_detail {
   GPU_CALLABLE_METHOD DGProfileGeometry<N>::DGProfileGeometry(const double* originalNodes, int normal,
                                          const std::array<double, DIMENSIONS>& point) {
     constexpr int FaceNodes = peano4::power(N, DIMENSIONS - 1);
-    // A sample of a conforming face meets a node up to the roundoff of the face mapping.
+    // Between two cells of the same level the sample points are the nodes, up to the rounding of the face mapping.
     constexpr double NodeDistance = 16.0 * std::numeric_limits<double>::epsilon();
     const int stride = peano4::power(N, normal);
     std::array<std::array<double, N>, DIMENSIONS> basis{};
@@ -443,6 +461,7 @@ namespace exahype2::amr::prediction_detail {
 
   TARGET_DECLARE_END
 
+  /** Are the weights of DGProfileGeometry cached? Config can switch the cache off. */
   template <typename C>
   constexpr bool cacheProfileGeometry() {
     if constexpr (requires { C::CacheProfileGeometry; }) return C::CacheProfileGeometry;
@@ -450,9 +469,10 @@ namespace exahype2::amr::prediction_detail {
   }
 
   /**
-   * Cache finite tangential geometry using bit keys that distinguish signed zero.
-   * The normal point coordinate is irrelevant. Bound per-thread storage and
-   * leave invalid geometry uncached.
+   * Returns the weights of DGProfileGeometry for a point from the cache of the thread and computes them if
+   * the cache does not hold them. The key is the bit pattern of the nodes and of the point, without the
+   * coordinate along the normal. The cache has a fixed size. Weights that are not valid are returned in local
+   * and not cached.
    */
   template <int N>
   const DGProfileGeometry<N>* cachedDGProfileGeometry(
@@ -469,7 +489,7 @@ namespace exahype2::amr::prediction_detail {
       if (not std::isfinite(point[axis])) return nullptr;
       positions[tangent++] = std::bit_cast<std::uint64_t>(point[axis]);
     }
-    // A face repeats few sample points, so a hashed table answers most lookups with one comparison.
+    // A small hash table. The same few sample points are asked for again and again.
     struct Entry {
       int normal{-1};
       std::array<std::uint64_t, N> nodes{};
@@ -491,7 +511,7 @@ namespace exahype2::amr::prediction_detail {
       local.emplace(std::move(geometry));
       return &*local;
     }
-    // Fill a free slot; a full neighbourhood drops its first entry.
+    // Take a free place. If there is none, the new entry replaces the first one.
     std::size_t target = first;
     for (std::size_t probe = 0; probe < Probes; probe++) {
       if (not cache[(first + probe) % Capacity].geometry) { target = (first + probe) % Capacity; break; }
@@ -504,25 +524,27 @@ namespace exahype2::amr::prediction_detail {
     return &*entry.geometry;
   }
 
-  /** Interpolate a DG normal profile at one tangential point. */
+  /** Samples the DG polynomial along the line through a face point at right angles to the face. Defined below. */
   template <int N, int V, typename C, typename P>
   bool dgProfile(AcceptedCellView<P> view, const double* originalNodes, int normal,
                  const std::array<double, DIMENSIONS>& point, const std::array<double, V>& reference,
                  std::span<double> values, int first);
 
-  /** Reuse centred source values across the tangential samples of one face. */
+  /** Does the work of dgProfile() for the many sample points of one face. The values of the cell relative to
+   * the reference state are computed once and used for every point. */
   template <int N, int V, typename C, typename P>
   class DGSourceProfileCache {
     static constexpr int FaceNodes = peano4::power(N, DIMENSIONS - 1);
     struct Group {
-      // Initialize centred differences lazily; the flags guard unread entries.
+      // The values of one layer of nodes and one value, relative to the reference state. They are filled at
+      // the first use, which the flags record.
       std::array<double, FaceNodes> data;
       double largest;
       int normalizedCount;
       bool known, valid, constant;
       Group() : largest(0.0), normalizedCount(0), known(false), valid(false), constant(false) {}
     };
-    // Limit per-face storage; larger layouts interpolate each profile directly.
+    // The cache takes at most 32 KiB. A cell that needs more is interpolated without it.
     static constexpr bool Enabled = sizeof(Group) * static_cast<std::size_t>(N) * V <= 32 * 1024;
     AcceptedCellView<P> _view;
     const std::array<double, V>& _reference;
@@ -557,6 +579,7 @@ namespace exahype2::amr::prediction_detail {
     DGSourceProfileCache(AcceptedCellView<P> view, int normal, const std::array<double, V>& reference) :
       _view(view), _reference(reference), _normal(normal), _stride(peano4::power(N, normal)) {}
 
+    /** Does what dgProfile() does, with the stored values. */
     bool profile(const double* originalNodes, const std::array<double, DIMENSIONS>& point,
                  std::span<double> values, int first) {
       if constexpr (not Enabled) {
@@ -569,7 +592,7 @@ namespace exahype2::amr::prediction_detail {
           local.emplace(originalNodes, _normal, point);
           geometry = &*local;
         }
-        // Validate interpolation geometry before loading source values.
+        // Without valid weights there is nothing to interpolate.
         if (not geometry->valid) return false;
         for (int node = 0; node < N; ++node) for (int component = 0; component < V; ++component) {
           auto& group = _groups[node * V + component];
@@ -579,7 +602,7 @@ namespace exahype2::amr::prediction_detail {
             continue;
           }
           if (geometry->single >= 0) {
-            // On a node the weighted sum has one term. Its sum is that term, and a zero sum is positive.
+            // The point is a node, so the sum has one term. A zero is stored as positive zero, as a sum gives it.
             normalise(group, geometry->single);
             const double value = group.data[geometry->single];
             if (not native_neighbour_detail::product(value == 0.0 ? 0.0 : value, group.largest,
@@ -600,7 +623,9 @@ namespace exahype2::amr::prediction_detail {
     }
   };
 
-  /** Sample the DG polynomial along a line through the given face point, at each node in the normal direction. */
+  /** Samples the DG polynomial of a cell along the line through a face point at right angles to the face, at
+   * the N node positions along that line. values receives the samples from the index first on, relative to
+   * the reference state and divided by the scales. */
   template <int N, int V, typename C, typename P>
   bool dgProfile(AcceptedCellView<P> view, const double* originalNodes, int normal,
                  const std::array<double, DIMENSIONS>& point, const std::array<double, V>& reference,
@@ -632,7 +657,7 @@ namespace exahype2::amr::prediction_detail {
         continue;
       }
       if (geometry->single >= 0) {
-        // On a node the weighted sum has one term. Its sum is that term, and a zero sum is positive.
+        // The point is a node, so the sum has one term. A zero is stored as positive zero, as a sum gives it.
         const double value = largest == 0.0 ? 0.0 : differences[geometry->single] / largest;
         if (not native_neighbour_detail::product(value == 0.0 ? 0.0 : value, largest,
             values[(first + node) * V + component])) return false;
@@ -650,7 +675,8 @@ namespace exahype2::amr::prediction_detail {
   }
 
   TARGET_DECLARE
-  /** Reconstruct the FV averages along a line through the given face point. */
+  /** Samples an FV cell along the line through a face point at right angles to the face: one value per volume
+   * on the line, moved to the point with the slopes across the line. */
   template <int V, typename FVData>
   GPU_CALLABLE_METHOD bool reconstructFVProfile(
     int count, int normal, const std::array<double, DIMENSIONS>& point,
@@ -683,12 +709,14 @@ namespace exahype2::amr::prediction_detail {
 
   TARGET_DECLARE_END
 
+  /** reconstructFVProfile() for an FV cell whose slopes are cached. */
   template <int V, typename C, typename P>
   bool fvProfile(AcceptedCellView<P> view, int normal, const std::array<double, DIMENSIONS>& point,
                  FVDataCache<V, C, P>& cache, std::span<double> values, int first) {
     return reconstructFVProfile<V>(view.pointsPerAxis, normal, point, cache.getView(), values, first);
   }
 
+  /** reconstructFVProfile() for an FV cell without a cache. */
   template <int V, typename C, typename P>
   bool fvProfile(AcceptedCellView<P> view, int normal, const std::array<double, DIMENSIONS>& point,
                  const std::array<double, V>& reference, std::span<double> values, int first) {
@@ -696,8 +724,9 @@ namespace exahype2::amr::prediction_detail {
     return fvProfile<V, C>(view, normal, point, data, values, first);
   }
 
-  /** Measure how well one polynomial fits the solution on both sides of a face.
-   * Return the weighted RMS error across the shared face, using DG node values or FV averages on each side.
+  /** Returns the score of the face between two cells in prediction mode. At sample points of the face it takes
+   * the values of both cells along the line that crosses the face at right angles, and fits one polynomial to
+   * them. The score is the root mean square over the face of what the fits leave.
    */
   template <int N, int V, typename C, typename P>
   double faceDetail(AcceptedCellView<P> own, AcceptedCellView<P> other,
@@ -811,7 +840,7 @@ namespace exahype2::amr::prediction_detail {
 
 TARGET_DECLARE
 namespace exahype2::amr::prediction_detail {
-  /** A polynomial fit for DG node values and FV averages on either side of a face. */
+  /** NormalFit for a GPU kernel, with arrays of fixed size. MaxPoints is the largest number of samples of a cell. */
   template <int N, int MaxPoints>
   struct DeviceNormalFit {
     int rows = 0, columns = 0;
@@ -882,7 +911,7 @@ namespace exahype2::amr::prediction_detail {
     }
   };
 
-  /** Sample the DG polynomial along a line through the given face point, at each node in the normal direction. */
+  /** dgProfile() for a GPU kernel. */
   template <int N, int V, typename C, typename P>
   GPU_CALLABLE_METHOD bool deviceDGProfile(AcceptedCellView<P> view, const double* originalNodes, int normal,
                  const std::array<double, DIMENSIONS>& point, const std::array<double, V>& reference,
@@ -920,7 +949,8 @@ namespace exahype2::amr::prediction_detail {
     return true;
   }
 
-  /** Cell averages relative to a reference state and the limited slopes used to reconstruct the FV profile. */
+  /** The slopes of an FV cell and its values relative to a reference state, for a GPU kernel. Nothing is
+   * stored: every call computes its result. */
   template <int V, typename C, typename P>
   struct DeviceFVData {
     AcceptedCellView<P> view;
@@ -935,8 +965,8 @@ namespace exahype2::amr::prediction_detail {
     }
   };
 
-  /** Estimate the variation a patch's FV averages miss, both within a volume and across its faces.
-   * A valid DG patch scores zero here. Its prediction error comes from comparisons with its neighbours.
+  /** The score of localDetail() for a GPU kernel. MaxPoints is the largest number of nodes or volumes per
+   * axis that a cell may have.
    */
   template <int N, int V, typename C, int MaxPoints, typename P>
   GPU_CALLABLE_METHOD double deviceLocalDetail(AcceptedCellView<P> view, const double*) {
@@ -961,7 +991,7 @@ namespace exahype2::amr::prediction_detail {
         if (not representationTerms.push_back(std::abs(slope) / std::sqrt(12.0 * volumes)))
           return std::numeric_limits<double>::infinity();
       }
-    // The norm uses the same term order when axes are reflected or components are reordered.
+    // Sorting makes the norm independent of the order of the axes and values.
     detail::transfer_bound::sort(representationTerms.begin(), representationTerms.end());
     for (const double term : representationTerms) result = amr_detail::guardedHypot(result, term);
     int stride = 1;
@@ -1001,8 +1031,8 @@ namespace exahype2::amr::prediction_detail {
     return result;
   }
 
-  /** Measure how well one polynomial fits the solution on both sides of a face.
-   * Return the weighted RMS error across the shared face, using DG node values or FV averages on each side.
+  /** The score of faceDetail() for a GPU kernel. MaxPoints is the largest number of nodes or volumes per axis
+   * that a cell may have.
    */
   template <int N, int V, typename C, int MaxPoints, typename P>
   GPU_CALLABLE_METHOD double deviceFaceDetail(AcceptedCellView<P> own, AcceptedCellView<P> other,

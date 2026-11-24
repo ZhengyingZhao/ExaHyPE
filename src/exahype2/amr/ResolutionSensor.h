@@ -7,9 +7,13 @@
 
 #include <vector>
 
+// The score of legacy mode. Across a face it is the jump of the solution, measured in the value and in every
+// derivative perpendicular to the face. Inside an FV cell it is the jump between neighbouring volumes.
 namespace exahype2::amr::resolution_detail {
   TARGET_DECLARE
-  /** Validate the accepted layout, all stored values, and component scales. */
+  /** Are the values of a cell and the scales of Config valid and finite? count receives the number of nodes
+   * or volumes. On request, constant tells whether all of them hold the same values, and lower and upper
+   * receive the range of every value. */
   template <int V, typename C, typename P>
   GPU_CALLABLE_METHOD bool finitePatch(const P* Q, int pointsPerAxis, int& count, bool* constant = nullptr,
                    std::array<double, V>* lower = nullptr, std::array<double, V>* upper = nullptr) {
@@ -39,7 +43,8 @@ namespace exahype2::amr::resolution_detail {
     return true;
   }
 
-  /** Component-scaled Euclidean distance, independent of component ordering. */
+  /** Returns the distance of two states: the norm of the differences of their values, each divided by its
+   * scale. */
   template <int V, typename C, typename Left, typename Right>
   GPU_CALLABLE_METHOD double stateDifference(const Left* left, const Right* right) {
     std::array<double, V> magnitudes{};
@@ -54,7 +59,8 @@ namespace exahype2::amr::resolution_detail {
     return norm;
   }
 
-  /** Return the largest adjacent FV jump, or infinity for invalid or over-budget data. */
+  /** Returns the largest distance between two neighbouring volumes of an FV cell. Returns infinity for invalid
+   * data or if a distance exceeds budget. */
   template <int V, typename C, typename P>
   GPU_CALLABLE_METHOD double fvDetail(const P* Q, int pointsPerAxis, double budget = std::numeric_limits<double>::infinity()) {
     static_assert(V > 0);
@@ -65,12 +71,13 @@ namespace exahype2::amr::resolution_detail {
     if (constant) return 0.0;
     std::array<double, V> scales{};
     for (int component = 0; component < V; component++) scales[component] = C::stateScale(component);
-    // Accumulate safe squared magnitudes; use hypot for extreme values.
+    // Squares are added directly where they neither overflow nor underflow. Other values go through
+    // guardedHypot().
     const double smallestSquareRoot = std::sqrt(std::numeric_limits<double>::min());
     const double largestSquareRoot = 0.5 * std::sqrt(std::numeric_limits<double>::max() / V);
     double squaredBudget = invalid;
     if (std::isfinite(budget) and budget < 0.5 * std::sqrt(std::numeric_limits<double>::max())) {
-      // Keep the squared gate below budget^2; confirm excess after sqrt.
+      // A sum of squares above this limit can exceed the budget. The square root then decides.
       squaredBudget = budget <= 2.0 * smallestSquareRoot ? 0.0 : std::nextafter(budget * budget, 0.0);
     }
     double largestSquared = 0.0, largestExtreme = 0.0;
@@ -109,8 +116,8 @@ namespace exahype2::amr::resolution_detail {
     return result > budget ? invalid : result;
   }
 
-  /** Test the jump between neighbouring volume averages. When the patch's range fits the budget,
-   * the score can be the budget itself.
+  /** Returns a bound of the largest distance between neighbouring volumes of an FV cell. If the range of the
+   * values in the cell fits the budget, the result is the budget and no pair of volumes is compared.
    */
   template <int V, typename C, typename P>
   GPU_CALLABLE_METHOD double fvResolutionDetail(const P* Q, int pointsPerAxis, double budget) {
@@ -122,7 +129,7 @@ namespace exahype2::amr::resolution_detail {
     if (std::isnan(budget) or budget < 0.0
         or not finitePatch<V, C>(Q, pointsPerAxis, count, &constant, &lower, &upper)) return invalid;
     if (constant) return 0.0;
-    // Every adjacent component difference lies within the patch's component range.
+    // Two neighbouring volumes differ by at most the range of the values in the cell.
     if (amr_detail::transfer_bound::arithmeticSupported()) {
       for (int component = 0; component < V; component++) {
         ranges[component] = amr_detail::transfer_bound::magnitude(amr_detail::transfer_bound::difference(
@@ -134,7 +141,8 @@ namespace exahype2::amr::resolution_detail {
     return fvDetail<V, C>(Q, pointsPerAxis, budget);
   }
 
-  /** Read the FV value at a face point. At a subcell boundary, use the mean of the touching values. */
+  /** Returns the FV value at a point of a cell face. A point on the boundary between volumes receives the
+   * mean of the volumes that touch it. */
   template <int V, typename P>
   GPU_CALLABLE_METHOD bool sampleFVFace(const P* Q, int pointsPerAxis, const std::array<double, DIMENSIONS>& point,
                     int normal, int side, std::array<double, V>& value) {
@@ -169,7 +177,7 @@ namespace exahype2::amr::resolution_detail {
       for (int sample = 1; sample < Samples; sample++) same = same and samples[sample] == samples[0];
       if (same) value[component] = samples[0];
       else {
-        // Reserve headroom for the fixed-point accumulator.
+        // The mean must not overflow while it is summed.
         for (const double sample : samples) if (std::abs(sample) > std::numeric_limits<double>::max() / 2.0) return false;
         value[component] = tarch::la::meanInFixedPoint(samples);
       }
@@ -180,7 +188,9 @@ namespace exahype2::amr::resolution_detail {
 
   TARGET_DECLARE_END
 
-  /** Add FV boundaries on the common finer face, using lattice arithmetic. */
+  /** Adds the positions at which the volume boundaries of an FV cell cross the shared face along one axis.
+   * The positions run from -0.5 to 0.5 over the face of the finer cell. They follow from the integer positions
+   * of the cells. */
   inline void addFVBoundaries(std::vector<double>& boundaries, int pointsPerAxis,
                               const NativeCellKey& key, const NativeCellKey& fineKey, int axis) {
     long long factor = 1;
@@ -191,13 +201,14 @@ namespace exahype2::amr::resolution_detail {
     for (long long volume = first; volume < pointsPerAxis; volume++) {
       const long long numerator = volume * factor - offset;
       if (numerator >= pointsPerAxis) break;
-      // Centred coordinates make reflected boundaries exact negatives.
+      // With the origin at the centre of the face, a mirrored boundary has exactly the negative position.
       boundaries.push_back(static_cast<double>(2 * numerator - pointsPerAxis) / (2.0 * pointsPerAxis));
     }
   }
 
   TARGET_DECLARE
-  /** Add the subcell boundaries that cross the finer face along this axis. */
+  /** The same as addFVBoundaries() for a GPU kernel, with a list of fixed size. Returns false if the list
+   * is full. */
   template <typename Container>
   GPU_CALLABLE_METHOD bool deviceAddFVBoundaries(Container& boundaries, int pointsPerAxis,
       const NativeCellKey& key, const NativeCellKey& fineKey, int axis) {
@@ -214,7 +225,7 @@ namespace exahype2::amr::resolution_detail {
     return true;
   }
 
-  /** Sample one side of the face at a point, using the FV value or the DG Taylor coefficients there. */
+  /** Returns one side of a face at a point: the Taylor coefficients of a DG cell, or the value of an FV cell. */
   template <int N, int V, typename C, typename P>
   GPU_CALLABLE_METHOD bool sampleFace(
     AcceptedCellView<P> view, const DGFaceExpansion<N, V, C, P>& expansion,
@@ -231,7 +242,9 @@ namespace exahype2::amr::resolution_detail {
   }
   TARGET_DECLARE_END
 
-  /** Measure the largest scaled jump across a shared face, using the accepted DG or FV data on each side. */
+  /** Returns the legacy score of the face between two cells: the largest distance between the two sides over
+   * all sample points, in the value and in every derivative perpendicular to the face. An FV side has a value
+   * only. The sample points are the DG nodes on the face and the centres between FV volume boundaries. */
   template <int N, int V, typename C, typename P>
   double faceDetail(AcceptedCellView<P> own, AcceptedCellView<P> other,
                     const NativeCellKey& ownKey, const NativeCellKey& otherKey,
@@ -306,7 +319,8 @@ namespace exahype2::amr::resolution_detail {
   }
 
   TARGET_DECLARE
-  /** Measure the largest scaled jump across a shared face, using the accepted DG or FV data on each side. */
+  /** The same score as faceDetail() for a GPU kernel. MaxPoints is the largest number of nodes or volumes per
+   * axis that a cell may have. */
   template <int N, int V, typename C, int MaxPoints, typename P>
   GPU_CALLABLE_METHOD double deviceFaceDetail(AcceptedCellView<P> own, AcceptedCellView<P> other,
                     const NativeCellKey& ownKey, const NativeCellKey& otherKey,

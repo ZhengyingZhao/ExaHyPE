@@ -3,13 +3,17 @@
 #pragma once
 #include "AMRCore.h"
 
+// The checks of AMRCore in a form that a GPU kernel can run: plain records for cells, faces and families, and
+// the struct Assessment with the tests. DeviceCriterion.h starts the kernels.
 namespace exahype2::amr::device_detail {
-  /** Mesh records and refinement decisions used by the device kernels. */
+  /** The records that the GPU kernels read and write: cells, faces, families and their results. */
   template <int N, int V, typename P>
   struct Storage {
     using Coordinates           = tarch::la::Vector<DIMENSIONS, double>;
+    /** The level of a cell and its integer position on that level. */
     using Key                   = std::array<int, DIMENSIONS + 1>;
     static constexpr int Values = peano4::power(N, DIMENSIONS) * V;
+    /** One leaf: where it is, where its solution and limiter status are stored, its faces and its quiet time. */
     struct Cell {
       Key         key{};
       int         slot{-1}, family{-1}, firstFace{0}, faceCount{0};
@@ -19,6 +23,7 @@ namespace exahype2::amr::device_detail {
       double      quiet{0.}, acceptedQuiet{-1.}, crossing{0.};
       bool        moving{false}, complete{false};
     };
+    /** One face of a leaf: the leaf, its neighbour, the axis and the side of the face, and the score of the face. */
     struct Face {
       int    own{-1}, other{-1}, normal{-1}, side{-1};
       double value{0.};
@@ -28,6 +33,7 @@ namespace exahype2::amr::device_detail {
       std::array<int, peano4::ChildrenPerCell> slots{};
       bool                                     complete{false};
     };
+    /** The score of a cell. complete is false if a neighbour was missing or the score was cut short. */
     struct ResolutionEvidence {
       double value{0.};
       bool   complete{true};
@@ -43,13 +49,15 @@ namespace exahype2::amr::device_detail {
       double quiet{-1.}, crossing{0.};
       bool   moving{false};
     };
+    /** The checks that a family passed. passed is its vote to coarsen. */
     struct FamilyResult {
       bool sizeVetoed{false}, transferSafe{false}, neighboursSafe{false}, eligible{false}, passed{false};
     };
   };
 
   TARGET_DECLARE
-  /** The refinement and coarsening tests for one solver's accepted solution. */
+  /** The tests of the criterion on the accepted solution of one solver, for a GPU kernel. The functions do
+   * what the functions of the same name do in AMRCore. */
   template <int N, int V, typename C, typename P, typename A, typename T, typename E, typename S, typename Callbacks>
   struct Assessment {
     using Data               = Storage<N, V, P>;
@@ -84,18 +92,21 @@ namespace exahype2::amr::device_detail {
     double    _time{0.}, _dt{0.}, _maxPatchSize{0.};
     Callbacks _callbacks;
 
+    /** Does Config select prediction mode? */
     GPU_CALLABLE_METHOD static constexpr bool predictionMode() {
       if constexpr (requires { C::UsePredictionCriterion; }) {
         return C::UsePredictionCriterion;
       }
       return false;
     }
+    /** Is the score of a face between two leaves computed once and used by both? */
     GPU_CALLABLE_METHOD static constexpr bool cacheAcceptedFaces() {
       if constexpr (requires { C::CacheAcceptedFaces; }) {
         return predictionMode() and C::CacheAcceptedFaces;
       }
       return predictionMode();
     }
+    /** Are all values of a cell finite? */
     GPU_CALLABLE_METHOD static bool finite(const P* Q) {
       if (Q == nullptr) {
         return false;
@@ -107,6 +118,7 @@ namespace exahype2::amr::device_detail {
       }
       return true;
     }
+    /** Does the view hold values, and are all of them finite? */
     GPU_CALLABLE_METHOD static bool finite(const AcceptedCellView<P>& view) {
       if (view.values == nullptr or view.pointsPerAxis <= 0) {
         return false;
@@ -122,6 +134,8 @@ namespace exahype2::amr::device_detail {
     GPU_CALLABLE_METHOD AcceptedCellView<P> accepted(const Cell& cell) const {
       return A::accepted(cell.slot, cell.state, cell.status, _subcells);
     }
+    /** Returns the variation inside one cell: the contribution of the highest polynomial degree for DG, the
+     * largest jump between neighbouring volumes for FV. Invalid data give infinity. */
     GPU_CALLABLE_METHOD static double localDetail(const P* Q) {
       return localDetail(
         {Q, N, T::IsFiniteVolume ? AcceptedRepresentation::FVCellAverages : AcceptedRepresentation::DGNodal}
@@ -146,7 +160,9 @@ namespace exahype2::amr::device_detail {
         amr_detail::resolutionTolerance<C>()
       );
     }
-    /** An observable over its error budget raises the score above the refinement threshold. */
+    /** Combines the score of the values with that of the observables and returns the larger one. ratio is
+     * the largest error of an observable divided by its tolerance. A ratio above one gives a score above the
+     * resolution tolerance. */
     GPU_CALLABLE_METHOD static double withObservation(double detail, double ratio) {
       double scaled = 0.0;
       if (not std::isfinite(ratio) or ratio < 0.0
@@ -161,6 +177,7 @@ namespace exahype2::amr::device_detail {
       }
       return std::max(detail, scaled);
     }
+    /** Returns the score of one cell without its faces, with the observables included. */
     GPU_CALLABLE_METHOD double acceptedLocalDetail(const AcceptedCellView<P>& view) const {
       double result =
         predictionMode() ? prediction_detail::deviceLocalDetail<N, V, C, MaxPoints>(view, _nodes) : localDetail(view);
@@ -200,6 +217,7 @@ namespace exahype2::amr::device_detail {
         );
       }
     }
+    /** Returns the stored score of a cell with its faces. */
     GPU_CALLABLE_METHOD ResolutionEvidence cellDetail(const Cell& cell) const { return _details[cell.slot]; }
     /** Rates how well the cell is resolved and records whether all required face neighbours were checked. */
     GPU_CALLABLE_METHOD ResolutionEvidence computeCellDetail(const Cell& cell) const {
@@ -416,7 +434,7 @@ namespace exahype2::amr::device_detail {
             return false;
           }
         }
-        // DG bounds the loss against the retained parent polynomial below.
+        // DG checks the difference between the nodes further down.
         if constexpr (T::IsFiniteVolume) {
           if (not T::polynomialPasses(children[child], restored)) {
             return false;

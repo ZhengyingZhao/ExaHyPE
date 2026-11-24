@@ -5,7 +5,8 @@
 #include "LimiterEvidence.h"
 
 namespace exahype2::amr {
-  /** Hybrid DG/FV criterion with limiter evidence. */
+  /** The criterion for ADER-DG with the subcell limiter. It reads the subcell values where the limiter is
+   * active and takes the limiter status of every cell into account. */
   template<int NodesPerAxis, int NumberOfData, typename Config, typename Precision = double>
   using LimiterCriterion = Criterion<NodesPerAxis, NumberOfData, Config, Precision,
     HybridAcceptedSolutionAdapter<NodesPerAxis, NumberOfData, Precision,

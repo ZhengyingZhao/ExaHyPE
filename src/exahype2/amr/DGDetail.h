@@ -5,9 +5,12 @@
 #include "NativeNeighbours.h"
 #include "TransferBounds.h"
 
+// The Taylor expansion of a DG polynomial at a cell face. The legacy score of ResolutionSensor.h compares
+// the expansions of the two cells that meet at a face.
 TARGET_DECLARE
 namespace exahype2::amr::resolution_detail {
-  /** Sum finite terms with order-independent fixed-point accumulation. */
+  /** Adds the terms. The result does not depend on their order. Returns false if a term is not finite or
+   * the sum overflows. */
   template <int Count>
   GPU_CALLABLE_METHOD bool sumTerms(const std::array<double, Count>& terms, double& result) {
     double largest = 0.0;
@@ -28,7 +31,9 @@ namespace exahype2::amr::resolution_detail {
     }
   }
 
-  /** The Taylor coefficients of a DG polynomial in the direction perpendicular to a cell face. */
+  /** The Taylor expansion of a DG polynomial at a cell face, in the direction perpendicular to the face: the
+   * value, the first derivative and so on up to the degree of the polynomial. prepare() computes the
+   * coefficients for a face, sample() evaluates them at a point of the face. */
   template <int N, int V, typename C, typename P>
   class DGFaceExpansion {
     static_assert(N > 0 and V > 0);
@@ -38,7 +43,8 @@ namespace exahype2::amr::resolution_detail {
     std::array<double, N> _positions{};
     int _normal = -1;
 
-    /** Build left-face Taylor weights when generated tables are unavailable. */
+    /** Computes the weights that turn the node values along a line into Taylor coefficients at the lower face.
+     * Used if Config brings no table of these weights. */
     GPU_CALLABLE_METHOD bool makeWeights(std::array<double, N * N>& weights) const {
       using namespace native_neighbour_detail;
       for (int node = 0; node < N; node++) {
@@ -66,7 +72,9 @@ namespace exahype2::amr::resolution_detail {
     }
 
   public:
-    /** Prepare normal Taylor coefficients scaled by normalRatio^order. */
+    /** Computes the coefficients of the cell Q at its lower (side 0) or upper (side 1) face along the axis
+     * normal. The coefficient of order k is multiplied by normalRatio^k. With the right ratio, the two cells
+     * at a face measure their derivatives over the same length. */
     GPU_CALLABLE_METHOD bool prepare(const P* Q, const double* nodes, int normal, int side, double normalRatio) {
       using namespace native_neighbour_detail;
       _normal = -1;
@@ -133,7 +141,8 @@ namespace exahype2::amr::resolution_detail {
       return true;
     }
 
-    /** Evaluate the Taylor coefficients at a point on the face, in local coordinates from 0 to 1. */
+    /** Evaluates the coefficients at a point of the face. The point has coordinates from 0 to 1 in the cell.
+     * jet receives one coefficient per value, order by order. */
     GPU_CALLABLE_METHOD bool sample(const std::array<double, DIMENSIONS>& point, std::array<double, N * V>& jet) const {
       if (_normal < 0) return false;
       std::array<double, DIMENSIONS> centred{};
@@ -145,7 +154,7 @@ namespace exahype2::amr::resolution_detail {
       return sampleCentered(centred, jet);
     }
 
-    /** Evaluate the same coefficients in face coordinates from -0.5 to 0.5. */
+    /** The same for a point with coordinates from -0.5 to 0.5. */
     GPU_CALLABLE_METHOD bool sampleCentered(const std::array<double, DIMENSIONS>& point, std::array<double, N * V>& jet) const {
       using namespace native_neighbour_detail;
       if (_normal < 0) return false;

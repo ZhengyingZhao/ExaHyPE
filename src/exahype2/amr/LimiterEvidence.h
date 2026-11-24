@@ -8,7 +8,14 @@
 
 TARGET_DECLARE
 namespace exahype2::amr {
-  /** Tell AMR which cells the limiter marked for finer resolution and which may coarsen. */
+  /**
+   * Tells the criterion what the subcell limiter knows about a cell:
+   *  - available: a status is stored for the cell.
+   *  - known: the status is valid.
+   *  - quietEligible: the cell may coarsen.
+   *  - requiresResolution: the cell belongs to a limited region.
+   *  - requestsRefinement: the cell computes on subcells and should refine.
+   */
   template<typename Layout>
   struct SubcellLimiterEvidence {
     static_assert(LimiterAdapterProtocol<Layout>);
@@ -22,8 +29,8 @@ namespace exahype2::amr {
     }
   };
 
-  /** Check that the parent DG values are finite. If the solver sets physical bounds,
-   * check them at DG nodes, subcell averages and Lobatto points.
+  /** Is a DG cell physically admissible? Its values have to be finite. If the solver has an admissibility
+   * check, the cell has to pass it at its DG nodes, as subcell averages and at the Lobatto points.
    */
   template <typename Solver, typename P>
   GPU_CALLABLE_METHOD bool parentPhysicallyAdmissible(
@@ -68,7 +75,8 @@ namespace exahype2::amr {
     }
   }
 
-  /** Check the parent's observables against the range of the child values, allowing for the limiter tolerance. */
+  /** Does a proposed parent respect the discrete maximum principle of the limiter? The quantities that the
+   * limiter watches have to stay within their range over the children, widened by the limiter's tolerance. */
   template <typename Solver, typename P>
   GPU_CALLABLE_METHOD bool parentRespectsMaximumPrinciple(
     const P* parent, const P* const* children, double relaxation, double differencesScaling,

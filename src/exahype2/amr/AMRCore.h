@@ -18,7 +18,32 @@
 #include <vector>
 
 namespace exahype2::amr {
-  /** Assess refinement and coarsening using accepted solution data. */
+  /**
+   * Decides for every leaf cell of one solver whether it refines, keeps its size or coarsens.
+   *
+   * The solver calls beginStep() before a time step and command() for every cell after it. The
+   * decision uses the solution of the completed step. The comments call it the accepted solution.
+   *
+   * A cell refines if its score exceeds the resolution tolerance. The score measures how poorly
+   * the cell and its faces resolve the solution. The code calls it the detail. A cell also
+   * refines if its solution is not physically admissible or if the limiter asks for it.
+   *
+   * A cell coarsens only together with its siblings. The comments call the siblings a family and
+   * the coarse cell that would replace them the proposed parent. A family coarsens if
+   *  - the parent reproduces the children within the transfer tolerance,
+   *  - the score of the parent stays within the resolution tolerance against its neighbours, and
+   *  - the same holds against neighbouring parents that are proposed in the same step.
+   *
+   * The score comes from PredictionSensor.h in prediction mode and from ResolutionSensor.h in
+   * legacy mode. In legacy mode a family also has to stay resolved for a while before it
+   * coarsens. This quiet time is counted in the time a wave takes to cross a cell.
+   *
+   * NodesPerAxis is the number of DG nodes or FV volumes per axis and NumberOfData the number of
+   * values per node. Config holds the tolerances and the scale of every value. Accepted reads the
+   * accepted solution of a cell, Transfer moves data between a parent and its children, Evidence
+   * tells what a limiter knows about a cell and Assessment selects the checks. AMRPolicies.h and
+   * AssessmentPolicy.h hold the choices.
+   */
   template<int NodesPerAxis, int NumberOfData, typename Config, typename Precision,
            typename Accepted, typename Transfer, typename Evidence = NoLimiterEvidence,
            typename Assessment = DefaultAssessmentPolicy<Accepted>>
@@ -33,35 +58,51 @@ namespace exahype2::amr {
     using LimiterEvidence = Evidence;
     using AssessmentPolicy = Assessment;
     using Coordinates = tarch::la::Vector<DIMENSIONS, double>;
-    // Own the callbacks and their captured solver parameters.
+    // The callbacks into the solver. Each one keeps the solver parameters that it captured.
+    /** The largest wave speed of one state along one axis: (state, position, cell width, time, step size, axis). */
     using WaveSpeed = std::function<double(const Precision*, const Coordinates&, const Coordinates&, double, double, int)>;
+    /** Are these states physically admissible? (states, their number, cell centre, cell width) */
     using PhysicalAdmissibility = std::function<bool(const Precision*, int, const Coordinates&, const Coordinates&)>;
+    /** Does this cell represent the initial condition well enough? (cell values, cell centre, cell width) */
     using InitialDataCheck = std::function<bool(const Precision*, const Coordinates&, const Coordinates&)>;
+    /** May this parent replace these children? (parent values, values of every child) */
     using TransferAdmissibility = std::function<bool(const Precision*, const Precision* const*)>;
+    /** The FV subcell values that a subcell limiter stores. */
     using NativeSubcells = typename tarch::accelerator::ChunkedMemoryPool<Precision>::ConstView;
 
-    /** Counters for cached assessments and refinement votes. */
+    /** What the criterion counted in the current step. */
     struct Statistics {
+      /** Families in the mesh. */
       std::size_t totalFamilies{0};
+      /** Families whose cells are all leaves. Only these can coarsen. */
       std::size_t completeFamilies{0};
+      /** Families that were checked for coarsening. */
       std::size_t assessedFamilies{0};
-      /** Families exceeding the maximum allowed parent size. */
+      /** Checked families whose parent would be larger than the mesh allows. */
       std::size_t sizeVetoedFamilies{0};
+      /** Checked families whose parent reproduces the children within the transfer tolerance. */
       std::size_t transferPassed{0};
+      /** Checked families whose parent also fits its current neighbours. */
       std::size_t currentNeighboursPassed{0};
+      /** Checked families that passed every check of their own. */
       std::size_t eligibleFamilies{0};
-      /** Alias for eligibleFamilies. */
+      /** The same number as eligibleFamilies. */
       std::size_t quietReady{0};
-      /** Reserved for statistics compatibility. */
+      /** Not used. Always zero. */
       std::size_t budgetReady{0};
+      /** Families that voted to coarsen. */
       std::size_t eraseVotes{0};
+      /** Families that passed their own checks but do not fit a neighbouring family that coarsens too. */
       std::size_t conflictVetoes{0};
+      /** Leaves whose score was computed. */
       std::size_t assessedLeaves{0};
+      /** Leaves whose score exceeds the resolution tolerance. */
       std::size_t refineEvidence{0};
-      /** Votes that kept a cell because its geometry or solution was not bound for this step. */
+      /** Votes that kept a cell because its position or solution was not the one given to beginStep(). */
       std::size_t unboundVotes{0};
     };
 
+    /** Starts the votes on the initial mesh. During initialisation a cell refines or keeps its size. */
     void beginInitialisation(PhysicalAdmissibility admissible = nullptr, InitialDataCheck initialDataCheck = nullptr);
     /** Gives the initial votes the mesh and the initial data of every cell, so that they compare neighbours as
      * the votes of a time step do. Has no effect outside initialisation or in legacy mode. */
@@ -81,13 +122,18 @@ namespace exahype2::amr {
     void assess(double time);
     /** Selects whether this step assesses coarsening. Refinement is assessed on every bound step. */
     void setCoarseningAssessment(bool enabled);
+    /** Returns the vote of the cell at x with width h: Refine, Keep or Erase. Q is the solution of the cell
+     * that beginStep() received and time the end of the step. Erase means that the whole family can coarsen. */
     [[nodiscard]] exahype2::RefinementCommand command(
       const Precision* Q, const Coordinates& x, const Coordinates& h, double time) const;
+    /** Ends the step. In legacy mode it stores the quiet time of every cell for the next step. */
     void finishStep();
     /** Counts assessed leaves and sibling groups. Call after voting has finished.
      * One erase vote represents a whole group of siblings that can coarsen together. */
     [[nodiscard]] Statistics statistics() const;
+    /** Sets the crossing time that legacy mode uses for a cell in which nothing moves. */
     void setReferenceTime(double time);
+    /** Forgets the mesh, the solver callbacks and the quiet times. */
     void reset();
 
   private:
@@ -104,16 +150,23 @@ namespace exahype2::amr {
         return predictionMode() and Config::CacheAcceptedFaces;
       return predictionMode();
     }
-    /** Convert an observable's budget ratio to resolution-score units. */
+    /** Combines the score of the values with that of the observables and returns the larger one. ratio is
+     * the largest error of an observable divided by its tolerance. A ratio above one gives a score above the
+     * resolution tolerance. */
     [[nodiscard]] static double withObservation(double detail, double ratio);
+    /** Returns the score of one cell without its faces. */
     [[nodiscard]] static double acceptedLocalDetail(const AcceptedCellView<Precision>& view, const double* nodes);
+    /** The level of a cell and its integer position on that level. */
     using Key = std::array<int, DIMENSIONS + 1>;
+    /** The centre and the width of a cell. */
     using Geometry = std::array<double, 2 * DIMENSIONS>;
+    /** The quiet time of a cell or region (legacy mode) and the time at which it was stored. */
     struct History {
       double time{0.0};
       double quiet{0.0};
       bool live{false};
     };
+    /** One leaf: where it is, where its solution and limiter status are stored, and its quiet time. */
     struct Cell {
       Key key{};
       int slot{-1};
@@ -128,33 +181,38 @@ namespace exahype2::amr {
       mutable bool quietReady{false};
       int family{-1};
     };
-    /** Resolution score and completeness of the neighbour data. */
+    /** The score of a cell. complete is false if a neighbour was missing or the score was cut short. */
     struct ResolutionEvidence {
       double value{0.0};
       bool complete{true};
     };
+    /** The score of a cell, computed once per step. state is 0 (empty), 1 (a thread computes it) or 2 (done). */
     struct DetailCache {
       std::atomic<int> state{0};
       ResolutionEvidence evidence{};
     };
+    /** One face neighbour of a cell: its slot, the axis and side of the shared face, and the index of the
+     * score of that face in _acceptedFaces. */
     struct NativeFace {
       int slot{-1}, normal{-1}, side{-1}, cache{-1};
     };
+    /** The face neighbours of a cell. complete is false if one of them is missing. */
     struct NativeStencil {
       std::vector<NativeFace> faces;
       bool complete{false};
     };
-    /** Share each accepted face score across adjacent cells within one step. */
+    /** The score of the face between two leaves. Both cells use it, so it is computed once per step. */
     struct AcceptedFaceCache {
       std::atomic<int> state{0};
       int left{-1}, right{-1}, normal{-1};
       double value{0.0};
     };
+    /** The slots of the children of one parent. complete is true if all of them are leaves. */
     struct Family {
       std::array<int, peano4::ChildrenPerCell> slots{};
       bool complete{false};
     };
-    /** Store transfer and accepted-neighbour checks for a proposed parent. */
+    /** The proposed parent of a family and the checks that it has passed. */
     struct FamilyPlan {
       std::atomic<int> state{0};
       std::array<Precision, Values> parent{};
@@ -165,7 +223,8 @@ namespace exahype2::amr {
       bool safe{false};
       bool eligible{false};
     };
-    /** Keep a region's quiet history when its children coarsen. */
+    /** A leaf or one of its ancestors in legacy mode. An ancestor counts its own quiet time while all cells
+     * below it are quiet. A parent then has a quiet time when its children coarsen. */
     struct QuietRegion {
       History* history{nullptr};
       std::array<int, peano4::ChildrenPerCell> children{};
@@ -189,7 +248,7 @@ namespace exahype2::amr {
     std::vector<int> _quietOrder;
     mutable std::unique_ptr<std::atomic<int>[]> _familyVotes;
     mutable std::unique_ptr<FamilyPlan[]> _familyPlans;
-    /** Families with a child that leaves the decision to its siblings. */
+    /** Families with a child that could coarsen. assess() checks only these. */
     std::unique_ptr<std::atomic<bool>[]> _familyRequests;
     mutable std::atomic<std::size_t> _unboundVotes{0};
     std::size_t _familyVoteCapacity{0};
@@ -223,10 +282,11 @@ namespace exahype2::amr {
     bool _assessCoarsening{true};
     bool _warnedAboutStartTime{false};
     bool _warnedAboutUnboundVotes{false};
-    /** What a cell's own state and neighbours say before its siblings are consulted. */
+    /** What a cell decides on its own: it keeps its size, it refines, or it could coarsen if its siblings agree. */
     enum class OwnEvidence { Keep, Refine, Siblings };
     [[nodiscard]] OwnEvidence ownEvidence(const Cell& cell, const Coordinates& x, const Coordinates& h) const;
 
+    // The private functions are described at their definitions in AMRCore.cpph.
     [[nodiscard]] static Geometry geometry(const Coordinates& x, const Coordinates& h);
     [[nodiscard]] static double amplification(const double* matrix, bool restriction);
     [[nodiscard]] static bool finite(const Precision* Q);
@@ -248,6 +308,7 @@ namespace exahype2::amr {
      * Returns true if the step starts at a finite, nonnegative time. */
     [[nodiscard]] bool prepareStep(const peano4::CellConnectivity& mesh, const exahype2::TimeStepping& clock,
                                    const double* nodes, const double* restriction, const double* prolongation);
+    /** Adds the checks that one family passed to the statistics. */
     static void countAssessedFamily(Statistics& result, const auto& plan) {
       ++result.assessedFamilies;
       result.sizeVetoedFamilies += plan.sizeVetoed;

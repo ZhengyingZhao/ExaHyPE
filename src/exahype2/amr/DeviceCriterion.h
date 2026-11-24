@@ -9,9 +9,14 @@
 
 #include <optional>
 
+// The AMR criterion that runs on a GPU. It keeps the mesh records in device memory and starts one kernel per
+// stage of the assessment. The tests themselves are in DeviceAssessment.h.
 namespace exahype2::amr::device_detail {
   TARGET_DECLARE
-  /** Handles one cell, face or sibling group in an AMR kernel. */
+  /** The body of one GPU kernel. It handles one cell, face or family per call. Stage selects the work:
+   * 7 clears the votes and scores, 0 points every cell to its solution, 1 scores the faces, 2 scores the
+   * cells, 3 advances the quiet times (legacy mode), 4 checks every family on its own, 5 compares the
+   * proposed parents of neighbouring families, 6 writes the vote of every cell. */
   template <int Stage, typename View, typename SolutionView, typename StatusView>
   struct Evaluate {
     View                               view;
@@ -40,7 +45,7 @@ namespace exahype2::amr::device_detail {
         }
         const auto& own   = view._cells[face.own];
         const auto& other = view._cells[face.other];
-        // A shared face score uses the cell on the left as its first argument.
+        // A score that both cells use is computed with the lower cell first, whichever cell asks.
         if (view.cacheAcceptedFaces() and face.side == 0) {
           face.value = view.faceDetail(view.accepted(other), view.accepted(own), other.key, own.key, face.normal, 1);
         } else {
@@ -89,7 +94,8 @@ namespace exahype2::amr::device_detail {
 } // namespace exahype2::amr::device_detail
 
 namespace exahype2::amr {
-  /** Device pointers to the DG nodes and transfer matrices. The tables must stay valid during assessment. */
+  /** Pointers in device memory to the DG nodes and to the restriction and prolongation matrices. The tables
+   * have to stay in place while the criterion assesses. */
   struct DeviceDGOperators {
     const double* nodes;
     const double* restriction;
@@ -97,8 +103,9 @@ namespace exahype2::amr {
   };
 
   /**
-   * Uses the solver's accepted solution on the configured accelerator to decide which leaves
-   * need refinement and which groups of siblings can be replaced by their parent.
+   * The AMR criterion that runs on a GPU. It reads the accepted solution of the solver in device memory and
+   * decides which leaves refine and which families coarsen, with the checks that AMRCore explains. The
+   * template arguments are those of AMRCore.
    */
   template <
     int NodesPerAxis,
@@ -345,6 +352,7 @@ namespace exahype2::amr {
       }
       _core._active = false;
     }
+    /** Forgets the mesh and releases the device memory. */
     void reset() {
       _core.reset();
       _assessed = false;
@@ -378,17 +386,20 @@ namespace exahype2::amr {
     Buffer<Geometry>                          _geometry{Device};
     std::vector<exahype2::RefinementCommand>  _commandsOnHost;
 
+    /** Gives a device buffer this size. */
     template <typename Value>
     static void ensure(Buffer<Value>& buffer, std::size_t size) {
       if (buffer.getSize() != size) {
         buffer.allocate(size);
       }
     }
+    /** Copies the values to a device buffer. */
     template <typename Value>
     static void upload(Buffer<Value>& buffer, const std::vector<Value>& values) {
       ensure(buffer, values.size());
       buffer.copyFromHost(values.data(), values.size());
     }
+    /** Returns a device buffer as a span. */
     template <typename Value>
     static tarch::Span<Value> span(Buffer<Value>& buffer) {
       return {buffer.getData(), static_cast<int>(buffer.getSize())};

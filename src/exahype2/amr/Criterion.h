@@ -7,6 +7,7 @@
 
 namespace exahype2::amr {
   namespace detail {
+    /** The limiter adapter of an Accepted type, or void if it has none. */
     template<typename Accepted, typename = void>
     struct AcceptedLimiterLayout { using type = void; };
     template<typename Accepted>
@@ -15,9 +16,13 @@ namespace exahype2::amr {
     };
   }
 
-  /** Host AMR decisions for FV, DG and DG/FV hybrid solvers, including GPU solvers.
-   * Views passed to beginStep() and command() must refer to host-accessible storage.
-   * Refresh those same host pools after the accepted step, before casting votes.
+  /**
+   * The AMR criterion that runs on the CPU, for FV and DG solvers and for ADER-DG with the subcell limiter.
+   * A generated solver uses this class. AMRCore does the work and explains the decisions.
+   *
+   * In every time step the solver calls beginStep() before the step and, once the step is complete, assess(),
+   * command() for every cell and finishStep(). The solution given to beginStep() and to command() has to be
+   * in host memory. A solver that computes on a GPU copies its solution there after the step, before the votes.
    */
   template<int NodesPerAxis, int NumberOfData, typename Config, typename Precision = double,
            typename Accepted = NativeAcceptedSolutionAdapter<NodesPerAxis, NumberOfData, Config, Precision>,
@@ -41,10 +46,11 @@ namespace exahype2::amr {
     using NativeSubcells = typename Core::NativeSubcells;
     using Statistics = typename Core::Statistics;
 
-    /** Reset history and enable checks on the initial solution. */
+    /** Starts the votes on the initial mesh and forgets what earlier steps stored. */
     void beginInitialisation(PhysicalAdmissibility admissible = nullptr, InitialDataCheck check = nullptr);
 
-    /** Bind the live solution before stepping; command() reads it after the step. */
+    /** Prepares a time step of a solver without a limiter. The criterion keeps the pointers to the solution
+     * and reads the solution after the step, in command(). */
     template<typename SolutionView>
       requires (not Accepted::HasHybridSubcells)
     void beginStep(const peano4::CellConnectivity& mesh, SolutionView solution,
@@ -52,7 +58,8 @@ namespace exahype2::amr {
                    const double* restriction, const double* prolongation, WaveSpeed waveSpeed = nullptr,
                    PhysicalAdmissibility admissible = nullptr, TransferAdmissibility transferAdmissible = nullptr);
 
-    /** Bind the DG/FV pools and limiter roles before stepping. */
+    /** Prepares a time step of ADER-DG with the subcell limiter: the DG solution, the limiter statuses and
+     * the subcell values. */
     template<typename SolutionView, typename StatusView>
       requires (Accepted::HasHybridSubcells)
     void beginStep(const peano4::CellConnectivity& mesh, SolutionView solution, StatusView statuses,
@@ -67,20 +74,20 @@ namespace exahype2::amr {
     void bindInitialState(const peano4::CellConnectivity& mesh, SolutionView solution, const double* nodes) {
       _core.bindInitialState(mesh, solution, NoStatusView{}, nodes);
     }
-    /** Evaluate the evidence of all cells in parallel before the cells call command(). */
+    /** Computes the decisions of all cells in parallel. command() then only reads them. */
     void assess(double time) { _core.assess(time); }
-    /** Select whether this step checks coarsening. Refinement is checked on every bound step. */
+    /** Switches the coarsening checks of this step on or off. Refinement is checked in every prepared step. */
     void setCoarseningAssessment(bool enabled) { _core.setCoarseningAssessment(enabled); }
-    /** Return Refine, Keep or Erase for this cell's accepted state. */
+    /** Returns the vote of the cell at x with width h: Refine, Keep or Erase. Q is its solution after the step. */
     [[nodiscard]] exahype2::RefinementCommand command(
       const Precision* Q, const Coordinates& x, const Coordinates& h, double time) const;
-    /** Finish assessment and update quiet-time history in legacy mode. */
+    /** Ends the step. Legacy mode stores the quiet time of every cell for the next step. */
     void finishStep();
-    /** Read cached assessment and vote counters. */
+    /** Returns what the criterion counted in this step. */
     [[nodiscard]] Statistics statistics() const { return _core.statistics(); }
-    /** Set the fallback crossing time used when the wave speed is zero. */
+    /** Sets the crossing time that legacy mode uses for a cell in which nothing moves. */
     void setReferenceTime(double time);
-    /** Clear cached mesh data and quiet history. */
+    /** Forgets the mesh, the solver callbacks and the quiet times. */
     void reset();
 
   private:

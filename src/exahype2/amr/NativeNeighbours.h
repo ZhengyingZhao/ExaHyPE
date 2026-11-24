@@ -12,35 +12,42 @@
 #include <limits>
 #include <type_traits>
 
+// The face neighbours of a leaf cell and the jump of the solution across a face, also where the two cells
+// have different refinement levels. The file also holds the sum, product and ratio with overflow checks
+// that the criterion computes with.
 namespace exahype2::amr {
   TARGET_DECLARE
-  /** Cell level and domain-relative lattice indices. */
+  /** The level of a cell and its integer position on that level, counted from the lower corner of the domain. */
   using NativeCellKey = std::array<int, DIMENSIONS + 1>;
   TARGET_DECLARE_END
 
   namespace native_neighbour_detail {
     TARGET_DECLARE
+    /** Where the shared part of a face lies in a cell: per axis the offset of its centre from the cell centre
+     * and its width, both in units of the cell width. */
     struct FaceProjection {
       std::array<double, DIMENSIONS> offset{}, ratio{};
     };
 
+    /** Computes left * right. Returns false if an argument is not finite or the product overflows. */
     inline GPU_CALLABLE_METHOD bool product(double left, double right, double& result) {
       const double largest = std::numeric_limits<double>::max();
       if (not std::isfinite(left) or not std::isfinite(right)) return false;
       if (std::abs(right) > 1.0) {
-        // Prevent speculative division from overflowing.
+        // volatile keeps the compiler from evaluating the division early, where it could overflow.
         volatile double divisor = std::abs(right);
         if (std::abs(left) > detail::transfer_bound::towardsZero(largest / divisor)) return false;
       }
       if (std::abs(left) <= 1.e150 and std::abs(right) <= 1.e150) result = left * right;
       else {
-        // Prevent speculative multiplication before the overflow check.
+        // volatile keeps the compiler from multiplying before the overflow test above.
         volatile double bounded = left;
         result = bounded * right;
       }
       return std::isfinite(result);
     }
 
+    /** Computes left + right. Returns false if an argument is not finite or the sum overflows. */
     inline GPU_CALLABLE_METHOD bool sum(double left, double right, double& result) {
       const double largest = std::numeric_limits<double>::max();
       if (not std::isfinite(left) or not std::isfinite(right)
@@ -53,6 +60,8 @@ namespace exahype2::amr {
       return std::isfinite(result);
     }
 
+    /** Computes numerator / denominator. Returns false if an argument is not finite, the denominator is zero
+     * or the ratio overflows. */
     inline GPU_CALLABLE_METHOD bool ratio(double numerator, double denominator, double& result) {
       const double largest = std::numeric_limits<double>::max();
       if (not std::isfinite(numerator) or not std::isfinite(denominator) or denominator == 0.0) return false;
@@ -70,7 +79,8 @@ namespace exahype2::amr {
 
     TARGET_DECLARE_END
 
-    /** Find leaf cells on the requested side of a face. */
+    /** Calls callback for every leaf on one side of a face. Where the mesh changes its level at the face, it
+     * follows the level jump to the finer or coarser faces. Returns false if a leaf is missing. */
     template <typename Callback>
     bool visitFaceSide(
       const peano4::CellConnectivity& mesh, int face, int side, int remaining,
@@ -97,11 +107,12 @@ namespace exahype2::amr {
           }
         }
       }
-      // Report missing or remote leaf data as an incomplete neighbourhood.
+      // No leaf was found on this side: it is missing or belongs to another rank.
       return false;
     }
 
     TARGET_DECLARE
+    /** Returns (left - right) / scale, or infinity if that has no finite value. */
     inline GPU_CALLABLE_METHOD double scaledDifference(double left, double right, double scale) {
       const double invalid = std::numeric_limits<double>::infinity();
       const double largest = std::numeric_limits<double>::max();
@@ -121,14 +132,15 @@ namespace exahype2::amr {
 
     TARGET_DECLARE_END
 
-    /** Evaluate a tensor-product DG polynomial in reference coordinates. */
+    /** Evaluates the DG polynomial of a cell at a point. The point has coordinates from 0 to 1 in the cell. */
     template <int N, int V, typename P>
     bool samplePolynomial(const P* Q, const double* nodes, const std::array<double, DIMENSIONS>& point,
                           std::array<double, V>& output) {
       if (Q == nullptr or nodes == nullptr) return false;
       constexpr int Count = peano4::power(N, DIMENSIONS);
       std::array<std::array<double, N>, DIMENSIONS> basis{};
-      // Use symmetric node positions on reflected cells.
+      // The lower nodes are taken as the mirror images of the upper ones. A mirrored point then gives
+      // exactly the mirrored result.
       std::array<double, N> positions{};
       for (int node = 0; node < N; node++) {
         positions[node] = node < N / 2 ? 1.0 - nodes[N - 1 - node] : nodes[node];
@@ -164,7 +176,7 @@ namespace exahype2::amr {
           output[component] = lower;
           continue;
         }
-        // Centre nodal values before interpolation to limit cancellation and overflow.
+        // Interpolate the differences from the middle of the value range. This limits cancellation and overflow.
         const double centre = 0.5 * lower + 0.5 * upper;
         std::array<double, Count> terms{};
         double largestTerm = 0.0;
@@ -184,7 +196,7 @@ namespace exahype2::amr {
           terms[node] = term;
           largestTerm = std::max(largestTerm, std::abs(term));
         }
-        // Bound the sum independently of node order before fixed-point rounding.
+        // The sum of all terms must not overflow.
         if (largestTerm > detail::transfer_bound::towardsZero(std::numeric_limits<double>::max() / Count)) return false;
         tarch::la::FixedPointSum<Count> accumulator;
         accumulator.clear(largestTerm);
@@ -194,6 +206,8 @@ namespace exahype2::amr {
       return true;
     }
 
+    /** Returns the FV average of the volume that holds a point. The point has coordinates from 0 to 1 in the
+     * cell. */
     template <int N, int V, typename P>
     bool sampleVolumes(const P* Q, const std::array<double, DIMENSIONS>& point,
                        std::array<double, V>& output) {
@@ -211,7 +225,9 @@ namespace exahype2::amr {
       return true;
     }
 
-    /** Map a physical interval into a cell, allowing for coordinate roundoff. */
+    /** Expresses an interval (centre, width) in the coordinates of a cell along one axis: offset is the
+     * distance of the two centres and fraction the width of the interval, both in units of the cell width.
+     * Returns false if the interval lies outside the cell by more than rounding. */
     inline bool projectPhysicalInterval(
       double centre, double width, double targetCentre, double targetWidth,
       double& offset, double& fraction
@@ -241,7 +257,8 @@ namespace exahype2::amr {
       return true;
     }
 
-    /** Map points on the shared part of a face into the local coordinates of both cells. */
+    /** Computes for two cells that meet at a face where the shared part of the face lies in each of them. It
+     * uses the integer positions of the cells, so that no rounding occurs. */
     inline GPU_CALLABLE_METHOD bool projectLatticeFace(
       const NativeCellKey& own, const NativeCellKey& other, int normal,
       FaceProjection& ownMap, FaceProjection& otherMap
@@ -252,7 +269,7 @@ namespace exahype2::amr {
       const auto& coarse = ownIsFine ? other : own;
       auto& fineMap = ownIsFine ? ownMap : otherMap;
       auto& coarseMap = ownIsFine ? otherMap : ownMap;
-      // validKey bounds factor and the signed numerator by INT_MAX.
+      // After validKey(), factor and the numerator below fit into an int.
       long long factor = 1;
       for (int level = coarse[0]; level < fine[0]; level++) factor *= peano4::SubdivisionFactor;
       for (int axis = 0; axis < DIMENSIONS; axis++) {
@@ -261,7 +278,7 @@ namespace exahype2::amr {
         const long long child = fine[axis + 1] % factor;
         fineMap.ratio[axis] = 1.0;
         coarseMap.ratio[axis] = 1.0 / static_cast<double>(factor);
-        // Reflecting child to factor-1-child negates the offset exactly.
+        // The mirrored child, factor-1-child, gets exactly the negative offset.
         coarseMap.offset[axis] = 0.5 * static_cast<double>(child - (factor - 1 - child))
           / static_cast<double>(factor);
       }
@@ -270,7 +287,8 @@ namespace exahype2::amr {
 
     TARGET_DECLARE_END
 
-    /** Return the maximum scaled vector jump over samples on the common subface. */
+    /** Returns the largest jump between two cells over the sample points of their shared face. The jump at a
+     * point is the norm of the differences of all values, each divided by its scale. */
     template <int N, int V, typename C, typename P>
     double sampleFaceJump(
       const P* own, const P* other, const FaceProjection& ownMap, const FaceProjection& otherMap,
@@ -322,10 +340,10 @@ namespace exahype2::amr {
   } // namespace native_neighbour_detail
 
   /**
-   * Visit local leaf neighbours across faces and level jumps.
-   * callback(neighbour, normal, ownSide) identifies this cell's lower (0) or upper (1) face.
-   * Callbacks may also accept only the neighbour slot.
-   * Physical boundaries are skipped; missing interior data returns false.
+   * Calls callback for every leaf that shares a face with the cell in slot, also where the level changes at
+   * the face. callback(neighbour, normal, ownSide) receives the slot of the neighbour, the axis of the face
+   * and whether it is the lower (0) or upper (1) face of the cell. A callback can also take the slot alone.
+   * A face on the domain boundary has no neighbour. Returns false if a neighbour is missing.
    */
   template <typename Callback>
   bool forEachNativeNeighbour(const peano4::CellConnectivity& mesh, int slot, Callback callback) {
@@ -337,7 +355,7 @@ namespace exahype2::amr {
       if (mesh.getFaceKind(face) == peano4::FaceKind::Boundary) continue;
       const int normal = faceNumber % DIMENSIONS;
       const int ownSide = faceNumber < DIMENSIONS ? 0 : 1;
-      // ownSide is the neighbour's side in the face-to-cell adjacency.
+      // The mesh stores the neighbour across the lower face of a cell as side 0 of that face.
       const int neighbourSide = ownSide;
       auto visit = [&](int neighbour) {
         if constexpr (std::is_invocable_v<Callback&, int, int, int>) callback(neighbour, normal, ownSide);
@@ -351,8 +369,9 @@ namespace exahype2::amr {
   }
 
   /**
-   * Measure jumps at the finer face's DG nodes or FV volume centres.
-   * normal/ownSide identify the face, including periodic faces.
+   * Returns the largest jump of the solution between two cells across their shared face. The sample points are
+   * the DG nodes or FV volume centres of the finer cell on that face. normal and ownSide name the face of
+   * the first cell. This also works for a neighbour across a periodic boundary.
    */
   template <int N, int V, typename C, typename P>
   double nativeFaceJump(
@@ -385,8 +404,8 @@ namespace exahype2::amr {
   }
 
   /**
-   * Use lattice indices to locate the common face without coordinate roundoff.
-   * normal/ownSide also handle periodic faces.
+   * The same jump for two cells given by their level and integer position. The shared face is then found
+   * without rounding.
    */
   template <int N, int V, typename C, typename P>
   double nativeFaceJump(
