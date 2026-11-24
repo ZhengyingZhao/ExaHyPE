@@ -51,10 +51,8 @@ namespace exahype2::amr {
     template<int, int, typename, typename, typename, typename, typename, typename>
     friend class DeviceCriterion;
   public:
-    using EngineTag = AMRCoreTag;
     using AcceptedAdapter = Accepted;
     using TransferPolicy = Transfer;
-    using StabilityEvidence = Evidence;
     using LimiterEvidence = Evidence;
     using AssessmentPolicy = Assessment;
     using Coordinates = tarch::la::Vector<DIMENSIONS, double>;
@@ -88,8 +86,6 @@ namespace exahype2::amr {
       std::size_t eligibleFamilies{0};
       /** The same number as eligibleFamilies. */
       std::size_t quietReady{0};
-      /** Not used. Always zero. */
-      std::size_t budgetReady{0};
       /** Families that voted to coarsen. */
       std::size_t eraseVotes{0};
       /** Families that passed their own checks but do not fit a neighbouring family that coarsens too. */

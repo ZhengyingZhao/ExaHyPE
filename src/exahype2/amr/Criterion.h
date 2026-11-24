@@ -33,7 +33,6 @@ namespace exahype2::amr {
   public:
     using AcceptedAdapter = Accepted;
     using TransferPolicy = Transfer;
-    using StabilityEvidence = Evidence;
     using LimiterEvidence = Evidence;
     using AssessmentPolicy = Assessment;
     using LimiterAdapter = typename detail::AcceptedLimiterLayout<Accepted>::type;

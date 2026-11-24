@@ -9,9 +9,6 @@
 // between a parent and its children, and what a limiter adds. AMRCore takes them as template arguments.
 TARGET_DECLARE
 namespace exahype2::amr {
-  /** Marks a class as an AMR core. */
-  struct AMRCoreTag {};
-
   /** How the values of a cell are stored: at the DG nodes or as averages over finite volumes. */
   enum class AcceptedRepresentation { DGNodal, FVCellAverages };
 
