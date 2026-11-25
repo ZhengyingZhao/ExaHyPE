@@ -637,14 +637,16 @@ namespace applications::exahype2::exaskred::riemann {
       }
     }
 
+    /**
+     * Limits the momentum that flows into a dry side. The water that arrives is at most as fast as
+     * velocityScale, the speed of the side it comes from. dryReceiver tells whether the side holds
+     * at most the dry threshold. A wet side takes the momentum as it is.
+     */
     template <typename T>
     INLINE_METHOD GPU_CALLABLE_METHOD void capDryReceiverMomentum(
       const bool dryReceiver,
-      const T    receiverHeightBeforeUpdate,
       const T    incomingWater,
       const T    velocityScale,
-      const T    cfl,
-      const T    minimumWaterHeight,
       T&         incomingMomentumNormal,
       T&         incomingMomentumTransverse
     ) {
@@ -652,13 +654,8 @@ namespace applications::exahype2::exaskred::riemann {
         return;
       }
 
-      const auto admissibleWater      = std::fmax(incomingWater, T{});
-      const auto receiverDepthDeficit = std::fmax(minimumWaterHeight - std::fmax(receiverHeightBeforeUpdate, T{}), T{});
-      const auto waterAboveDryThreshold = std::isfinite(cfl) and cfl > T{}
-        ? std::fmax(cfl * admissibleWater - receiverDepthDeficit, T{}) / cfl
-        : admissibleWater;
-      const auto admissibleMomentum     = waterAboveDryThreshold * std::fmax(velocityScale, T{});
-      const auto momentumNorm           = std::sqrt(
+      const auto admissibleMomentum = std::fmax(incomingWater, T{}) * std::fmax(velocityScale, T{});
+      const auto momentumNorm       = std::sqrt(
         incomingMomentumNormal * incomingMomentumNormal + incomingMomentumTransverse * incomingMomentumTransverse
       );
 
@@ -1037,11 +1034,8 @@ namespace applications::exahype2::exaskred::riemann {
     auto leftIncomingMomentumTransverse = -FL[Shortcuts::hu + 1 - normal];
     capDryReceiverMomentum(
       originalHLeft <= hThreshold,
-      originalHLeft,
       -FL[Shortcuts::h],
       rightVelocityScale,
-      cfl,
-      hThreshold,
       leftIncomingMomentumNormal,
       leftIncomingMomentumTransverse
     );
@@ -1052,11 +1046,8 @@ namespace applications::exahype2::exaskred::riemann {
     auto rightIncomingMomentumTransverse = FR[Shortcuts::hu + 1 - normal];
     capDryReceiverMomentum(
       originalHRight <= hThreshold,
-      originalHRight,
       FR[Shortcuts::h],
       leftVelocityScale,
-      cfl,
-      hThreshold,
       rightIncomingMomentumNormal,
       rightIncomingMomentumTransverse
     );
