@@ -75,29 +75,3 @@ applications::exahype2::exaskred::limiting::isAdmissibleState(const T* const Q, 
   }
   return Q[Shortcuts::h] >= static_cast<T>(minimumWaterHeight);
 }
-
-template <class Shortcuts, int NumberOfUnknowns, int NumberOfAuxiliaryVariables, typename T>
-INLINE_METHOD GPU_CALLABLE_METHOD void
-applications::exahype2::exaskred::limiting::resetDryStates(
-  T* const     Q,
-  const int    numberOfStates,
-  const double minimumWaterHeight
-) {
-  constexpr int NumberOfData = NumberOfUnknowns + NumberOfAuxiliaryVariables;
-  const auto    dryHeight    = static_cast<T>(std::max(minimumWaterHeight, 0.0));
-  for (int state = 0; state < numberOfStates; state++) {
-    auto* const values = Q + state * NumberOfData;
-    if (values[Shortcuts::h] >= T{} and values[Shortcuts::h] <= dryHeight) {
-      bool finite = true;
-      for (int entry = 0; entry < NumberOfData; entry++) {
-        finite = finite and std::isfinite(values[entry]);
-      }
-      if (finite) {
-        values[Shortcuts::h] = T{};
-        for (int dimension = 0; dimension < DIMENSIONS; dimension++) {
-          values[Shortcuts::hu + dimension] = T{};
-        }
-      }
-    }
-  }
-}
