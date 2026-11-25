@@ -675,12 +675,165 @@ namespace applications::exahype2::exaskred::riemann {
       incomingMomentumNormal *= factor;
       incomingMomentumTransverse *= factor;
     }
+
+    /**
+     * Tells how the water of a side that holds at most the dry threshold moves through one face.
+     * The wave solver treats such a side as dry ground at rest, so this water would stay where it
+     * is. Here it flows like a thin layer on a slope:
+     *
+     * - It moves with its own velocity into a neighbour whose water surface is not higher.
+     * - It does not climb. A higher surface stops the motion towards it.
+     * - It speeds up towards a surface that lies lower than the middle of its own depth, like
+     *   water on a slope.
+     * - The last small rest of a side leaves within one step, so that the side becomes empty.
+     * - A side without water keeps no momentum.
+     *
+     * momentumTowards is the momentum towards the other side of the face and momentumAcross the
+     * momentum along the face. bed is the bed below the side and otherSurface the water surface of
+     * the other side. spacing is the distance between the two sides and cfl the time step size
+     * divided by it. transfer receives what flows into the other side: water, momentumTowards and
+     * momentumAcross. gain receives the change of momentumTowards that stays on this side. Both are
+     * fluctuations, which the update multiplies with cfl. When both momentum components of the last
+     * rest are equal, takesEqualComponents decides whether it leaves through this face.
+     */
+    template <typename T>
+    INLINE_METHOD GPU_CALLABLE_METHOD void computeResidualWaterMotion(
+      const T    height,
+      const T    momentumTowards,
+      const T    momentumAcross,
+      const T    bed,
+      const T    otherSurface,
+      const bool takesEqualComponents,
+      const T    g,
+      const T    hThreshold,
+      const T    spacing,
+      const T    cfl,
+      T          transfer[3],
+      T&         gain
+    ) {
+      // A side that holds at most this part of the dry threshold counts as nearly empty.
+      constexpr auto NearlyEmpty = static_cast<T>(1.0 / 1024.0);
+      // A side gives at most this part of its water through one face per step. It then never gives
+      // more than it holds.
+      constexpr auto LargestShare = static_cast<T>(1.0 / DIMENSIONS);
+
+      transfer[0] = transfer[1] = transfer[2] = T{};
+      gain                                    = T{};
+      if (not(height > T{})) {
+        // A side has two faces along each axis. Each of them takes half of the momentum along it.
+        gain = -static_cast<T>(0.5) * momentumTowards / cfl;
+        return;
+      }
+
+      const bool isNearlyEmpty = height <= NearlyEmpty * hThreshold;
+      T          share         = T{};
+      if (isNearlyEmpty) {
+        const T across = std::abs(momentumAcross);
+        if (momentumTowards > across
+            or (momentumTowards == across and momentumTowards > T{} and takesEqualComponents)) {
+          share = T{1};
+        }
+      } else if (momentumTowards > T{}) {
+        share = std::fmin(momentumTowards / height * cfl, LargestShare);
+      }
+
+      const T surface = bed + height;
+      if (share > T{}) {
+        if (otherSurface > surface) {
+          gain = -momentumTowards / cfl;
+        } else {
+          transfer[0] = share * height / cfl;
+          transfer[1] = share * momentumTowards / cfl;
+          transfer[2] = share * momentumAcross / cfl;
+        }
+      }
+
+      const bool isAtRest    = momentumTowards == T{} and momentumAcross == T{};
+      const bool accelerates = isNearlyEmpty ? isAtRest : share < LargestShare;
+      if (accelerates and otherSurface < bed + static_cast<T>(0.5) * height) {
+        gain += g * height * std::fmin(surface - otherSurface, spacing);
+      }
+    }
+
+    /**
+     * Adds the motion of thin water to the fluctuations FL and FR of one face. A side takes part if
+     * it holds at most the dry threshold. bLeft and bRight are the beds below the two sides,
+     * spacing is the distance between the sides and cfl the time step size divided by it.
+     *
+     * @see computeResidualWaterMotion()
+     */
+    template <class Shortcuts, class T>
+    INLINE_METHOD GPU_CALLABLE_METHOD void addResidualWaterMotion(
+      const T* const NOALIAS QL,
+      const T* const NOALIAS QR,
+      const T                bLeft,
+      const T                bRight,
+      const int              normal,
+      const T                g,
+      const T                hThreshold,
+      const T                spacing,
+      const T                cfl,
+      T* const NOALIAS       FL,
+      T* const NOALIAS       FR
+    ) {
+      const T hLeft        = QL[Shortcuts::h];
+      const T hRight       = QR[Shortcuts::h];
+      const T surfaceLeft  = bLeft + std::fmax(hLeft, T{});
+      const T surfaceRight = bRight + std::fmax(hRight, T{});
+      T       transfer[3];
+      T       gain;
+      if (hLeft <= hThreshold) {
+        computeResidualWaterMotion(
+          hLeft,
+          QL[Shortcuts::hu + normal],
+          QL[Shortcuts::hu + 1 - normal],
+          bLeft,
+          surfaceRight,
+          normal == 0,
+          g,
+          hThreshold,
+          spacing,
+          cfl,
+          transfer,
+          gain
+        );
+        FL[Shortcuts::h] += transfer[0];
+        FR[Shortcuts::h] += transfer[0];
+        FL[Shortcuts::hu + normal] += transfer[1] - gain;
+        FR[Shortcuts::hu + normal] += transfer[1];
+        FL[Shortcuts::hu + 1 - normal] += transfer[2];
+        FR[Shortcuts::hu + 1 - normal] += transfer[2];
+      }
+      if (hRight <= hThreshold) {
+        computeResidualWaterMotion(
+          hRight,
+          -QR[Shortcuts::hu + normal],
+          QR[Shortcuts::hu + 1 - normal],
+          bRight,
+          surfaceLeft,
+          normal == 0,
+          g,
+          hThreshold,
+          spacing,
+          cfl,
+          transfer,
+          gain
+        );
+        FL[Shortcuts::h] -= transfer[0];
+        FR[Shortcuts::h] -= transfer[0];
+        FL[Shortcuts::hu + normal] += transfer[1];
+        FR[Shortcuts::hu + normal] += transfer[1] - gain;
+        FL[Shortcuts::hu + 1 - normal] -= transfer[2];
+        FR[Shortcuts::hu + 1 - normal] -= transfer[2];
+      }
+    }
   } // namespace
 
   /**
    * Solves a wet-dry shallow-water interface over variable bathymetry with
    * George's augmented-state Riemann method and writes the left- and right-going
-   * fluctuations.
+   * fluctuations. A side that holds at most minimumWaterHeight counts as dry ground
+   * at rest. computeResidualWaterMotion() moves the water that such a side still holds.
    *
    * @return The largest absolute wave speed.
    * @see https://doi.org/10.1016/j.jcp.2007.10.027
@@ -714,6 +867,8 @@ namespace applications::exahype2::exaskred::riemann {
     T       bRight         = QR[BathymetryIndex];
     const T originalHLeft  = hLeft;
     const T originalHRight = hRight;
+    const T originalBLeft  = bLeft;
+    const T originalBRight = bRight;
     T       uLeft          = 0;
     T       uRight         = 0;
     T       vLeft          = 0;
@@ -773,7 +928,25 @@ namespace applications::exahype2::exaskred::riemann {
       hThreshold
     );
 
+    const auto cfl           = dt > 0.0 and h(normal) > 0.0 ? static_cast<T>(dt / h(normal)) : T{};
+    const bool cflIsPositive = std::isfinite(cfl) and cfl > T{};
+
     if (wetDryState == WetDryState::DryDry) {
+      if (cflIsPositive) {
+        addResidualWaterMotion<Shortcuts>(
+          QL,
+          QR,
+          originalBLeft,
+          originalBRight,
+          normal,
+          g,
+          hThreshold,
+          static_cast<T>(h(normal)),
+          cfl,
+          FL,
+          FR
+        );
+      }
       return 0;
     }
 
@@ -833,8 +1006,7 @@ namespace applications::exahype2::exaskred::riemann {
       }
     }
 
-    const auto cfl = dt > 0.0 and h(normal) > 0.0 ? static_cast<T>(dt / h(normal)) : T{};
-    if (std::isfinite(cfl) and cfl > T{}) {
+    if (cflIsPositive) {
       constexpr auto PerFaceFraction = static_cast<T>(1.0 / (2.0 * DIMENSIONS));
 
       const auto leftDrain  = std::fmax(FL[Shortcuts::h], T{});
@@ -890,6 +1062,22 @@ namespace applications::exahype2::exaskred::riemann {
     );
     FR[Shortcuts::hu + normal]     = rightIncomingMomentumNormal;
     FR[Shortcuts::hu + 1 - normal] = rightIncomingMomentumTransverse;
+
+    if (cflIsPositive) {
+      addResidualWaterMotion<Shortcuts>(
+        QL,
+        QR,
+        originalBLeft,
+        originalBRight,
+        normal,
+        g,
+        hThreshold,
+        static_cast<T>(h(normal)),
+        cfl,
+        FL,
+        FR
+      );
+    }
 
     return std::max(std::abs(waveSpeeds[0]), std::max(std::abs(waveSpeeds[1]), std::abs(waveSpeeds[2])));
   }
