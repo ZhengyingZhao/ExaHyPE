@@ -251,7 +251,8 @@ exahype2::dg::limiting::SubcellLimiter<Derived, StoragePrecision, ComputePrecisi
 /**
  * Moves the statuses and the subgrids through the regrid. A regrid reads the old cells from its
  * freed slots only. Every freed cell on the Galerkin scheme first writes the projection of its
- * nodes into its subgrid. The next time step fills the previous solution and the faces.
+ * nodes into its subgrid. SubgridTransfer fills the subgrids of the new cells and reads the nodes
+ * of a refined cell from solution. The next time step fills the previous solution and the faces.
  */
 template <typename Derived, typename StoragePrecision, typename ComputePrecision>
 INLINE_METHOD void
@@ -271,7 +272,12 @@ exahype2::dg::limiting::SubcellLimiter<Derived, StoragePrecision, ComputePrecisi
   _subcellMigration.migrate(
     _subcells,
     regrid,
-    exahype2::fv::PatchTransfer<Derived, StoragePrecision, ComputePrecision>{std::as_const(_subcells).getView()}
+    exahype2::dg::limiting::SubgridTransfer<Derived, StoragePrecision, ComputePrecision>{
+      exahype2::fv::PatchTransfer<Derived, StoragePrecision, ComputePrecision>{std::as_const(_subcells).getView()},
+      solution.getView(),
+      SubcellProjection<StoragePrecision>::NodesToSubcells1D,
+      Derived::template DGMatrices<double>::ProlongationMatrix1D
+    }
   );
   _statusMigration
     .migrate(_statuses, regrid, exahype2::dg::limiting::StatusTransfer{std::as_const(_statuses).getView()});

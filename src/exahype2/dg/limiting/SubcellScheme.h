@@ -39,6 +39,9 @@ namespace exahype2::dg::limiting {
 
   template <typename Derived, typename StoragePrecision, typename ComputePrecision>
   struct ProjectNodesOntoSubgrids;
+
+  template <typename Derived, typename StoragePrecision, typename ComputePrecision>
+  struct SubgridTransfer;
 } // namespace exahype2::dg::limiting
 
 TARGET_DECLARE
@@ -98,6 +101,26 @@ public:
     StoragePrecision* NOALIAS       subcells,
     const StoragePrecision* NOALIAS nodesToSubcells,
     StoragePrecision* NOALIAS       scratch
+  );
+
+  template <typename StoragePrecision>
+  [[nodiscard]] static INLINE_METHOD GPU_CALLABLE_METHOD bool holdsProjectionOfNodes(
+    const StoragePrecision* NOALIAS nodes,
+    const StoragePrecision* NOALIAS subcells,
+    const StoragePrecision* NOALIAS nodesToSubcells,
+    int                             value
+  );
+
+  template <typename StoragePrecision>
+  static INLINE_METHOD GPU_CALLABLE_METHOD void interpolateSubcell(
+    const StoragePrecision* NOALIAS parentNodes,
+    const StoragePrecision* NOALIAS parentSubcells,
+    StoragePrecision* NOALIAS       childSubcells,
+    const StoragePrecision* NOALIAS nodesToSubcells,
+    const double* NOALIAS           prolongationMatrix1D,
+    const double* NOALIAS           followsNodes,
+    int                             childPosition,
+    int                             fineSubcell
   );
 
   template <typename StoragePrecision>
@@ -466,6 +489,56 @@ struct exahype2::dg::limiting::ProjectNodesOntoSubgrids final {
   StoragePrecision*              scratch{nullptr};
 
   INLINE_METHOD GPU_CALLABLE_METHOD void operator()(int entry, tarch::accelerator::TeamHandle team) const;
+};
+
+/**
+ * Fills the subgrids of the new grid from the old grid during a regrid. A cell that stays keeps its
+ * subgrid. A parent that replaces its children takes the mean of their subcells. The children of a
+ * refined cell take their subgrids from the parent: A value that still matches the polynomial of
+ * the parent, such as a bathymetry, follows that polynomial, and every other value copies the
+ * subcell of the parent that covers the new one. The regrid first asks once per value of the
+ * parent which of the two applies and then fills one subcell per call.
+ *
+ * @see SubcellScheme::holdsProjectionOfNodes()
+ */
+template <typename Derived, typename StoragePrecision, typename ComputePrecision>
+struct exahype2::dg::limiting::SubgridTransfer final {
+  using Kernel   = exahype2::dg::limiting::SubcellScheme<Derived, ComputePrecision>;
+  using CellPool = tarch::accelerator::ChunkedMemoryPool<StoragePrecision>;
+
+  static constexpr int WorkItemsPerChunk        = Kernel::SubcellsPerCell;
+  static constexpr int PreparedValuesPerChunk   = Kernel::NumberOfData;
+  static constexpr int PreparationItemsPerChunk = Kernel::NumberOfData;
+
+  exahype2::fv::PatchTransfer<Derived, StoragePrecision, ComputePrecision> subgrids{};
+  typename CellPool::ConstView                                             nodes{};
+  const StoragePrecision*                                                  nodesToSubcells{nullptr};
+  const double*                                                            prolongationMatrix{nullptr};
+
+  INLINE_METHOD GPU_CALLABLE_METHOD void prepareInterpolation(int parentSlot, double* prepared, int itemOfChunk) const;
+
+  INLINE_METHOD GPU_CALLABLE_METHOD void prepareRestriction(
+    const int* childSlots,
+    double*    prepared,
+    int        itemOfChunk
+  ) const;
+
+  INLINE_METHOD GPU_CALLABLE_METHOD void copy(int slot, StoragePrecision* target, int itemOfChunk) const;
+
+  INLINE_METHOD GPU_CALLABLE_METHOD void interpolateFromParent(
+    int               parentSlot,
+    StoragePrecision* target,
+    int               childPosition,
+    int               itemOfChunk,
+    const double*     prepared
+  ) const;
+
+  INLINE_METHOD GPU_CALLABLE_METHOD void restrictFromChildren(
+    const int*        childSlots,
+    StoragePrecision* target,
+    int               itemOfChunk,
+    const double*     prepared
+  ) const;
 };
 TARGET_DECLARE_END
 

@@ -7,6 +7,8 @@
 #include "peano4/Loop.h"
 #include "tarch/Assertions.h"
 #include "tarch/accelerator/Scratch.h"
+#include "tarch/la/FixedPointSum.h"
+#include "tarch/la/ScalarOperations.h"
 
 #include <cmath>
 #include <limits>
@@ -87,6 +89,166 @@ exahype2::dg::limiting::SubcellScheme<Derived, ComputePrecision>::projectNodesOn
   for (int stage = 0; stage < exahype2::dg::getStagesOfTensorProduct<DIMENSIONS>(); stage++) {
     projectNodesOntoSubcells(nodes, subcells, nodesToSubcells, weights, scratch, stage, thread, threads);
     tarch::accelerator::teamBarrier(team);
+  }
+}
+
+/**
+ * Returns whether the subcells of a cell still store what the polynomial of the cell describes
+ * for one value: the projection of its nodes, apart from rounding. A value that the subcell
+ * scheme does not change, such as a bathymetry, passes. A value that is the same in every subcell
+ * returns false, because a plain copy keeps it.
+ */
+template <typename Derived, typename ComputePrecision>
+template <typename StoragePrecision>
+INLINE_METHOD GPU_CALLABLE_METHOD bool
+exahype2::dg::limiting::SubcellScheme<Derived, ComputePrecision>::holdsProjectionOfNodes(
+  const StoragePrecision* NOALIAS const nodes,
+  const StoragePrecision* NOALIAS const subcells,
+  const StoragePrecision* NOALIAS const nodesToSubcells,
+  const int                             value
+) {
+  ASSERTION(nodes != nullptr);
+  ASSERTION(subcells != nullptr);
+  ASSERTION(nodesToSubcells != nullptr);
+  ASSERTION(value >= 0 and value < NumberOfData, value);
+  constexpr double RoundingErrorOfProjections =
+    4096.0 * static_cast<double>(std::numeric_limits<StoragePrecision>::epsilon());
+
+  double largestValue = 0.0;
+  bool   varies       = false;
+  for (int subcell = 0; subcell < SubcellsPerCell; subcell++) {
+    largestValue = std::fmax(largestValue, std::abs(static_cast<double>(subcells[subcell * NumberOfData + value])));
+    varies       = varies or subcells[subcell * NumberOfData + value] != subcells[value];
+  }
+  if (not varies) {
+    return false;
+  }
+  for (int subcell = 0; subcell < SubcellsPerCell; subcell++) {
+    const auto position   = peano4::dDelinearised(subcell, SubcellsPerAxis);
+    double     projection = 0.0;
+    for (int node = 0; node < NodesPerCell; node++) {
+      const auto nodePosition = peano4::dDelinearised(node, NodesPerAxis);
+      double     weight       = 1.0;
+      for (int axis = 0; axis < DIMENSIONS; axis++) {
+        weight *= static_cast<double>(nodesToSubcells[nodePosition(axis) * SubcellsPerAxis + position(axis)]);
+      }
+      projection += weight * static_cast<double>(nodes[node * NumberOfData + value]);
+    }
+    const auto stored = static_cast<double>(subcells[subcell * NumberOfData + value]);
+    if (not(std::abs(stored - projection) <= RoundingErrorOfProjections * largestValue)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Fills the subcell fineSubcell of the child at childPosition from its parent. followsNodes holds
+ * one entry per value. A value with a nonzero entry follows the polynomial of the parent: the new
+ * subcell gets the mean of that polynomial, and the new subcells inside one subcell of the parent
+ * keep its mean. Every other value copies the subcell of the parent that covers the new one.
+ * prolongationMatrix1D stores one block [coarse][fine] per child interval. The mirror image of a
+ * parent gives the mirror images of its children bit for bit when the tables are mirror symmetric.
+ */
+template <typename Derived, typename ComputePrecision>
+template <typename StoragePrecision>
+INLINE_METHOD GPU_CALLABLE_METHOD void
+exahype2::dg::limiting::SubcellScheme<Derived, ComputePrecision>::interpolateSubcell(
+  const StoragePrecision* NOALIAS const parentNodes,
+  const StoragePrecision* NOALIAS const parentSubcells,
+  StoragePrecision* NOALIAS const       childSubcells,
+  const StoragePrecision* NOALIAS const nodesToSubcells,
+  const double* NOALIAS const           prolongationMatrix1D,
+  const double* NOALIAS const           followsNodes,
+  const int                             childPosition,
+  const int                             fineSubcell
+) {
+  constexpr int SubdivisionFactor  = peano4::SubdivisionFactor;
+  constexpr int EntriesPerInterval = NodesPerAxis * NodesPerAxis;
+  ASSERTION(parentNodes != nullptr);
+  ASSERTION(parentSubcells != nullptr);
+  ASSERTION(childSubcells != nullptr);
+  ASSERTION(nodesToSubcells != nullptr);
+  ASSERTION(prolongationMatrix1D != nullptr);
+  ASSERTION(followsNodes != nullptr);
+  ASSERTION(childPosition >= 0 and childPosition < peano4::ChildrenPerCell, childPosition);
+  ASSERTION(fineSubcell >= 0 and fineSubcell < SubcellsPerCell, fineSubcell);
+
+  const auto                         child        = peano4::dDelinearised(childPosition, SubdivisionFactor);
+  const auto                         finePosition = peano4::dDelinearised(fineSubcell, SubcellsPerAxis);
+  tarch::la::Vector<DIMENSIONS, int> coarsePosition;
+  // How much each node of the parent counts in the new subcell and in the covering subcell, per axis.
+  double fineWeights[DIMENSIONS][NodesPerAxis];
+  double coarseWeights[DIMENSIONS][NodesPerAxis];
+  for (int axis = 0; axis < DIMENSIONS; axis++) {
+    coarsePosition(axis) = (finePosition(axis) + SubcellsPerAxis * child(axis)) / SubdivisionFactor;
+    const double* const prolongation =
+      prolongationMatrix1D + static_cast<std::ptrdiff_t>(child(axis)) * EntriesPerInterval;
+    for (int node = 0; node < NodesPerAxis; node++) {
+      const auto getTerm = [&](const int fineNode) {
+        return prolongation[node * NodesPerAxis + fineNode]
+          * static_cast<double>(nodesToSubcells[fineNode * SubcellsPerAxis + finePosition(axis)]);
+      };
+      double largestTerm = 0.0;
+      for (int fineNode = 0; fineNode < NodesPerAxis; fineNode++) {
+        largestTerm = std::fmax(largestTerm, std::abs(getTerm(fineNode)));
+      }
+      tarch::la::FixedPointSum<NodesPerAxis> weight;
+      weight.clear(largestTerm);
+      for (int fineNode = 0; fineNode < NodesPerAxis; fineNode++) {
+        weight.add(getTerm(fineNode));
+      }
+      fineWeights[axis][node]   = weight.round();
+      coarseWeights[axis][node] = static_cast<double>(nodesToSubcells[node * SubcellsPerAxis + coarsePosition(axis)]);
+    }
+  }
+
+  const int fineIndex   = fineSubcell * NumberOfData;
+  const int coarseIndex = peano4::dLinearised(coarsePosition, SubcellsPerAxis) * NumberOfData;
+  for (int value = 0; value < NumberOfData; value++) {
+    if (followsNodes[value] == 0.0) {
+      childSubcells[fineIndex + value] = parentSubcells[coarseIndex + value];
+      continue;
+    }
+    auto smallest = static_cast<double>(parentNodes[value]);
+    auto largest  = smallest;
+    for (int node = 1; node < NodesPerCell; node++) {
+      smallest = std::fmin(smallest, static_cast<double>(parentNodes[node * NumberOfData + value]));
+      largest  = std::fmax(largest, static_cast<double>(parentNodes[node * NumberOfData + value]));
+    }
+    // Each set of weights adds up to one, so the same number can be taken off every node. The
+    // middle of their range keeps the terms small.
+    const double reference = 0.5 * (smallest + largest);
+    const auto   getTerm   = [&](const int node) {
+      const auto nodePosition = peano4::dDelinearised(node, NodesPerAxis);
+#if DIMENSIONS == 2
+      const double fineWeight   = fineWeights[0][nodePosition(0)] * fineWeights[1][nodePosition(1)];
+      const double coarseWeight = coarseWeights[0][nodePosition(0)] * coarseWeights[1][nodePosition(1)];
+#else
+      const double fineWeight = tarch::la::productInOrderOfMagnitude(
+        fineWeights[0][nodePosition(0)],
+        fineWeights[1][nodePosition(1)],
+        fineWeights[2][nodePosition(2)]
+      );
+      const double coarseWeight = tarch::la::productInOrderOfMagnitude(
+        coarseWeights[0][nodePosition(0)],
+        coarseWeights[1][nodePosition(1)],
+        coarseWeights[2][nodePosition(2)]
+      );
+#endif
+      return (fineWeight - coarseWeight) * (static_cast<double>(parentNodes[node * NumberOfData + value]) - reference);
+    };
+    double largestTerm = 0.0;
+    for (int node = 0; node < NodesPerCell; node++) {
+      largestTerm = std::fmax(largestTerm, std::abs(getTerm(node)));
+    }
+    tarch::la::FixedPointSum<NodesPerCell> difference;
+    difference.clear(largestTerm);
+    for (int node = 0; node < NodesPerCell; node++) {
+      difference.add(getTerm(node));
+    }
+    childSubcells[fineIndex + value] =
+      static_cast<StoragePrecision>(static_cast<double>(parentSubcells[coarseIndex + value]) + difference.round());
   }
 }
 
@@ -900,5 +1062,75 @@ exahype2::dg::limiting::ProjectNodesOntoSubgrids<Derived, StoragePrecision, Comp
       );
     }
   }
+}
+
+template <typename Derived, typename StoragePrecision, typename ComputePrecision>
+INLINE_METHOD GPU_CALLABLE_METHOD void
+exahype2::dg::limiting::SubgridTransfer<Derived, StoragePrecision, ComputePrecision>::prepareInterpolation(
+  const int     parentSlot,
+  double* const prepared,
+  const int     itemOfChunk
+) const {
+  prepared[itemOfChunk] = Kernel::holdsProjectionOfNodes(
+                            nodes.getChunk(parentSlot),
+                            subgrids.source.getChunk(parentSlot),
+                            nodesToSubcells,
+                            itemOfChunk
+                          )
+    ? 1.0
+    : 0.0;
+}
+
+/**
+ * Prepares nothing. A parent takes the mean of its children as they are.
+ */
+template <typename Derived, typename StoragePrecision, typename ComputePrecision>
+INLINE_METHOD GPU_CALLABLE_METHOD void
+exahype2::dg::limiting::SubgridTransfer<Derived, StoragePrecision, ComputePrecision>::prepareRestriction(
+  [[maybe_unused]] const int* const childSlots,
+  [[maybe_unused]] double* const    prepared,
+  [[maybe_unused]] const int        itemOfChunk
+) const {}
+
+template <typename Derived, typename StoragePrecision, typename ComputePrecision>
+INLINE_METHOD GPU_CALLABLE_METHOD void
+exahype2::dg::limiting::SubgridTransfer<Derived, StoragePrecision, ComputePrecision>::copy(
+  const int               slot,
+  StoragePrecision* const target,
+  const int               itemOfChunk
+) const {
+  subgrids.copy(slot, target, itemOfChunk);
+}
+
+template <typename Derived, typename StoragePrecision, typename ComputePrecision>
+INLINE_METHOD GPU_CALLABLE_METHOD void
+exahype2::dg::limiting::SubgridTransfer<Derived, StoragePrecision, ComputePrecision>::interpolateFromParent(
+  const int               parentSlot,
+  StoragePrecision* const target,
+  const int               childPosition,
+  const int               itemOfChunk,
+  const double* const     prepared
+) const {
+  Kernel::interpolateSubcell(
+    nodes.getChunk(parentSlot),
+    subgrids.source.getChunk(parentSlot),
+    target,
+    nodesToSubcells,
+    prolongationMatrix,
+    prepared,
+    childPosition,
+    itemOfChunk
+  );
+}
+
+template <typename Derived, typename StoragePrecision, typename ComputePrecision>
+INLINE_METHOD GPU_CALLABLE_METHOD void
+exahype2::dg::limiting::SubgridTransfer<Derived, StoragePrecision, ComputePrecision>::restrictFromChildren(
+  const int* const        childSlots,
+  StoragePrecision* const target,
+  const int               itemOfChunk,
+  const double* const     prepared
+) const {
+  subgrids.restrictFromChildren(childSlots, target, itemOfChunk, prepared);
 }
 TARGET_DECLARE_END

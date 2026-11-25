@@ -904,3 +904,359 @@ UNIT_TEST(
     }
   }
 }
+
+namespace {
+  using CellPool = tarch::accelerator::ChunkedMemoryPool<double>;
+  using SubgridTransfer =
+    exahype2::dg::limiting::SubgridTransfer<exahype2::dg::limiting::unittests::StubSolver, double, double>;
+
+  /**
+   * Returns the matrix that interpolates the nodes of a cell onto the nodes of its children, in the layout of the
+   * generated tables.
+   */
+  exahype2::dg::AMRMatrices1D<Layout::NodesPerAxis> getProlongationMatrix(const Projections& tables) {
+    return exahype2::dg::transposePerChild<Layout::NodesPerAxis>(
+      exahype2::dg::getInterpolationMatrix1D<Layout::NodesPerAxis>(tables.quadraturePoints.data())
+    );
+  }
+
+  /**
+   * A polynomial of degree one over the unit cell.
+   */
+  double getLinearPolynomial(const tarch::la::Vector<DIMENSIONS, double>& x) {
+    double result = 2.0;
+    for (int axis = 0; axis < DIMENSIONS; axis++) {
+      result += (3.0 - 4.0 * axis) * x(axis);
+    }
+    return result;
+  }
+
+  /**
+   * Returns nodes whose unknown is getLinearPolynomial() and whose auxiliary is 0.25.
+   */
+  std::vector<double> getLinearNodes(const Projections& tables) {
+    std::vector<double> nodes(Layout::ValuesPerCell);
+    for (int node = 0; node < Layout::NodesPerCell; node++) {
+      const auto                            position = peano4::dDelinearised(node, Layout::NodesPerAxis);
+      tarch::la::Vector<DIMENSIONS, double> x;
+      for (int axis = 0; axis < DIMENSIONS; axis++) {
+        x(axis) = tables.quadraturePoints[static_cast<std::size_t>(position(axis))];
+      }
+      nodes[static_cast<std::size_t>(node) * Layout::NumberOfData]     = getLinearPolynomial(x);
+      nodes[static_cast<std::size_t>(node) * Layout::NumberOfData + 1] = 0.25;
+    }
+    return nodes;
+  }
+
+  /**
+   * Returns a subgrid whose unknown is the projection of nodes and whose auxiliary alternates between one and two
+   * from subcell to subcell, so that no polynomial of the cell describes the auxiliary.
+   */
+  std::vector<double> getProjectionWithAlternatingAuxiliary(
+    const Projections&         tables,
+    const std::vector<double>& nodes
+  ) {
+    std::vector<double> subcells(Layout::SubcellValuesPerCell);
+    Scheme::projectNodesOntoSubcells(nodes.data(), subcells.data(), tables.nodesToSubcells.data());
+    for (int subcell = 0; subcell < Layout::SubcellsPerCell; subcell++) {
+      subcells[static_cast<std::size_t>(subcell) * Layout::NumberOfData + 1] = 1.0 + subcell % 2;
+    }
+    return subcells;
+  }
+
+  /**
+   * Returns the subgrids of the children of a cell with the given nodes and subcells. followsNodes receives one entry
+   * per value: one if the children take the value from the polynomial of the cell, zero if they copy it.
+   */
+  std::vector<std::vector<double>> interpolateChildren(
+    const Projections&         tables,
+    const std::vector<double>& nodes,
+    const std::vector<double>& subcells,
+    double                     followsNodes[Layout::NumberOfData]
+  ) {
+    const auto prolongation = getProlongationMatrix(tables);
+    for (int value = 0; value < Layout::NumberOfData; value++) {
+      followsNodes[value] =
+        Scheme::holdsProjectionOfNodes(nodes.data(), subcells.data(), tables.nodesToSubcells.data(), value) ? 1.0 : 0.0;
+    }
+    std::vector<std::vector<double>> children(
+      peano4::ChildrenPerCell,
+      std::vector<double>(Layout::SubcellValuesPerCell)
+    );
+    for (int child = 0; child < peano4::ChildrenPerCell; child++) {
+      for (int subcell = 0; subcell < Layout::SubcellsPerCell; subcell++) {
+        Scheme::interpolateSubcell(
+          nodes.data(),
+          subcells.data(),
+          children[static_cast<std::size_t>(child)].data(),
+          tables.nodesToSubcells.data(),
+          prolongation.data(),
+          followsNodes,
+          child,
+          subcell
+        );
+      }
+    }
+    return children;
+  }
+} // namespace
+
+UNIT_TEST("The children of a cell take a value that holds the projection of its nodes from its polynomial") {
+  GIVEN(
+    "A cell whose unknown is a polynomial of degree one at the nodes and its projection on the subgrid, and whose auxiliary alternates from subcell to subcell"
+  ) {
+    const Projections         tables;
+    const std::vector<double> nodes    = getLinearNodes(tables);
+    const std::vector<double> subcells = getProjectionWithAlternatingAuxiliary(tables, nodes);
+
+    WHEN("Every child interpolates its subgrid") {
+      double     followsNodes[Layout::NumberOfData];
+      const auto children = interpolateChildren(tables, nodes, subcells, followsNodes);
+
+      THEN("The unknown holds the projection of the nodes and the auxiliary does not") {
+        VALIDATE_EQUALS(followsNodes[0], 1.0);
+        VALIDATE_EQUALS(followsNodes[1], 0.0);
+      }
+
+      THEN("Every subcell of a child stores the polynomial at its centre and the auxiliary of the covering subcell") {
+        for (int child = 0; child < peano4::ChildrenPerCell; child++) {
+          const auto childPosition = peano4::dDelinearised(child, peano4::SubdivisionFactor);
+          for (int subcell = 0; subcell < Layout::SubcellsPerCell; subcell++) {
+            const auto finePosition = peano4::dDelinearised(subcell, Layout::SubcellsPerAxis);
+            tarch::la::Vector<DIMENSIONS, double> centre;
+            tarch::la::Vector<DIMENSIONS, int>    coarsePosition;
+            for (int axis = 0; axis < DIMENSIONS; axis++) {
+              centre(axis) = (childPosition(axis) + (finePosition(axis) + 0.5) / Layout::SubcellsPerAxis)
+                / peano4::SubdivisionFactor;
+              coarsePosition(axis) =
+                (finePosition(axis) + Layout::SubcellsPerAxis * childPosition(axis)) / peano4::SubdivisionFactor;
+            }
+            const auto fineIndex = static_cast<std::size_t>(subcell) * Layout::NumberOfData;
+            const auto coarseIndex =
+              static_cast<std::size_t>(peano4::dLinearised(coarsePosition, Layout::SubcellsPerAxis))
+              * Layout::NumberOfData;
+            const std::vector<double>& fine = children[static_cast<std::size_t>(child)];
+            VALIDATE_NUMERICAL_EQUALS(fine[fineIndex], getLinearPolynomial(centre), child, subcell);
+            VALIDATE_EQUALS(fine[fineIndex + 1], subcells[coarseIndex + 1], child, subcell);
+          }
+        }
+      }
+
+      THEN("The subcells of the children that cover one subcell of the cell keep its mean") {
+        std::vector<double> sums(Layout::SubcellValuesPerCell, 0.0);
+        for (int child = 0; child < peano4::ChildrenPerCell; child++) {
+          const auto childPosition = peano4::dDelinearised(child, peano4::SubdivisionFactor);
+          for (int subcell = 0; subcell < Layout::SubcellsPerCell; subcell++) {
+            const auto                         finePosition = peano4::dDelinearised(subcell, Layout::SubcellsPerAxis);
+            tarch::la::Vector<DIMENSIONS, int> coarsePosition;
+            for (int axis = 0; axis < DIMENSIONS; axis++) {
+              coarsePosition(axis) =
+                (finePosition(axis) + Layout::SubcellsPerAxis * childPosition(axis)) / peano4::SubdivisionFactor;
+            }
+            const auto coarseIndex =
+              static_cast<std::size_t>(peano4::dLinearised(coarsePosition, Layout::SubcellsPerAxis))
+              * Layout::NumberOfData;
+            for (int value = 0; value < Layout::NumberOfData; value++) {
+              sums[coarseIndex + static_cast<std::size_t>(value)] +=
+                children[static_cast<std::size_t>(child)]
+                        [static_cast<std::size_t>(subcell) * Layout::NumberOfData + static_cast<std::size_t>(value)];
+            }
+          }
+        }
+        for (std::size_t entry = 0; entry < sums.size(); entry++) {
+          VALIDATE_NUMERICAL_EQUALS(sums[entry] / peano4::ChildrenPerCell, subcells[entry], entry);
+        }
+      }
+    }
+  }
+}
+
+UNIT_TEST("A subgrid that the subcell scheme has changed copies the covering subcell into the children") {
+  GIVEN(
+    "A cell whose unknown is a polynomial of degree one at the nodes and whose subgrid differs from its projection in one subcell"
+  ) {
+    const Projections         tables;
+    const std::vector<double> nodes    = getLinearNodes(tables);
+    std::vector<double>       subcells = getProjectionWithAlternatingAuxiliary(tables, nodes);
+    subcells[0] += 1.0e-9;
+
+    WHEN("Every child interpolates its subgrid") {
+      double     followsNodes[Layout::NumberOfData];
+      const auto children = interpolateChildren(tables, nodes, subcells, followsNodes);
+
+      THEN("No value holds the projection of the nodes and every subcell of a child stores the covering subcell") {
+        VALIDATE_EQUALS(followsNodes[0], 0.0);
+        VALIDATE_EQUALS(followsNodes[1], 0.0);
+        for (int child = 0; child < peano4::ChildrenPerCell; child++) {
+          const auto childPosition = peano4::dDelinearised(child, peano4::SubdivisionFactor);
+          for (int subcell = 0; subcell < Layout::SubcellsPerCell; subcell++) {
+            const auto                         finePosition = peano4::dDelinearised(subcell, Layout::SubcellsPerAxis);
+            tarch::la::Vector<DIMENSIONS, int> coarsePosition;
+            for (int axis = 0; axis < DIMENSIONS; axis++) {
+              coarsePosition(axis) =
+                (finePosition(axis) + Layout::SubcellsPerAxis * childPosition(axis)) / peano4::SubdivisionFactor;
+            }
+            const auto fineIndex = static_cast<std::size_t>(subcell) * Layout::NumberOfData;
+            const auto coarseIndex =
+              static_cast<std::size_t>(peano4::dLinearised(coarsePosition, Layout::SubcellsPerAxis))
+              * Layout::NumberOfData;
+            for (std::size_t value = 0; value < Layout::NumberOfData; value++) {
+              VALIDATE_EQUALS(
+                children[static_cast<std::size_t>(child)][fineIndex + value],
+                subcells[coarseIndex + value],
+                child,
+                subcell,
+                value
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+UNIT_TEST("A value that is equal in every subcell of a cell is equal in every subcell of its children") {
+  GIVEN("A cell whose nodes and subcells store the unknown three and the auxiliary -1.5") {
+    const Projections         tables;
+    const std::vector<double> nodes    = getConstantNodes(3.0, -1.5);
+    const std::vector<double> subcells = getConstantSubgrid(3.0, -1.5);
+
+    WHEN("Every child interpolates its subgrid") {
+      double     followsNodes[Layout::NumberOfData];
+      const auto children = interpolateChildren(tables, nodes, subcells, followsNodes);
+
+      THEN("Every subcell of every child stores the state") {
+        for (int child = 0; child < peano4::ChildrenPerCell; child++) {
+          for (int subcell = 0; subcell < Layout::SubcellsPerCell; subcell++) {
+            const auto index = static_cast<std::size_t>(subcell) * Layout::NumberOfData;
+            VALIDATE_EQUALS(children[static_cast<std::size_t>(child)][index], 3.0, child, subcell);
+            VALIDATE_EQUALS(children[static_cast<std::size_t>(child)][index + 1], -1.5, child, subcell);
+          }
+        }
+      }
+    }
+  }
+}
+
+UNIT_TEST("The children of the mirror image of a cell are the mirror images of the children of the cell") {
+  GIVEN(
+    "A cell whose unknown holds the projection of a polynomial of degree one, and its mirror image along the first axis"
+  ) {
+    const Projections         tables;
+    const std::vector<double> nodes    = getLinearNodes(tables);
+    const std::vector<double> subcells = getProjectionWithAlternatingAuxiliary(tables, nodes);
+    std::vector<double>       mirroredNodes(nodes.size());
+    std::vector<double>       mirroredSubcells(subcells.size());
+    const auto                mirror = [](const int index, const int entriesPerAxis) {
+      auto position = peano4::dDelinearised(index, entriesPerAxis);
+      position(0)   = entriesPerAxis - 1 - position(0);
+      return peano4::dLinearised(position, entriesPerAxis);
+    };
+    for (int node = 0; node < Layout::NodesPerCell; node++) {
+      for (int value = 0; value < Layout::NumberOfData; value++) {
+        mirroredNodes[static_cast<std::size_t>(mirror(node, Layout::NodesPerAxis) * Layout::NumberOfData + value)] =
+          nodes[static_cast<std::size_t>(node * Layout::NumberOfData + value)];
+      }
+    }
+    for (int subcell = 0; subcell < Layout::SubcellsPerCell; subcell++) {
+      for (int value = 0; value < Layout::NumberOfData; value++) {
+        mirroredSubcells[static_cast<std::size_t>(
+          mirror(subcell, Layout::SubcellsPerAxis) * Layout::NumberOfData + value
+        )] = subcells[static_cast<std::size_t>(subcell * Layout::NumberOfData + value)];
+      }
+    }
+
+    WHEN("Every child of both cells interpolates its subgrid") {
+      double     followsNodes[Layout::NumberOfData];
+      double     mirroredFollowsNodes[Layout::NumberOfData];
+      const auto children         = interpolateChildren(tables, nodes, subcells, followsNodes);
+      const auto mirroredChildren = interpolateChildren(tables, mirroredNodes, mirroredSubcells, mirroredFollowsNodes);
+
+      THEN("Every subcell of a child equals the mirrored subcell of the mirrored child bitwise") {
+        VALIDATE_EQUALS(followsNodes[0], 1.0);
+        VALIDATE_EQUALS(mirroredFollowsNodes[0], 1.0);
+        for (int child = 0; child < peano4::ChildrenPerCell; child++) {
+          const int mirroredChild = mirror(child, peano4::SubdivisionFactor);
+          for (int subcell = 0; subcell < Layout::SubcellsPerCell; subcell++) {
+            const int mirroredSubcell = mirror(subcell, Layout::SubcellsPerAxis);
+            for (int value = 0; value < Layout::NumberOfData; value++) {
+              VALIDATE_EQUALS(
+                children[static_cast<std::size_t>(child)]
+                        [static_cast<std::size_t>(subcell * Layout::NumberOfData + value)],
+                mirroredChildren[static_cast<std::size_t>(mirroredChild)]
+                                [static_cast<std::size_t>(mirroredSubcell * Layout::NumberOfData + value)],
+                child,
+                subcell,
+                value
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+UNIT_TEST("The subgrid transfer of a regrid fills a child from the nodes and the subgrid of its parent") {
+  GIVEN("Pools with the nodes and the subgrid of one cell whose unknown holds the projection of a polynomial") {
+    const Projections         tables;
+    const auto                prolongation = getProlongationMatrix(tables);
+    const std::vector<double> nodes        = getLinearNodes(tables);
+    const std::vector<double> subcells     = getProjectionWithAlternatingAuxiliary(tables, nodes);
+    CellPool                  nodePool(Layout::ValuesPerCell, tarch::MemoryLocation::Heap);
+    CellPool                  subcellPool(Layout::SubcellValuesPerCell, tarch::MemoryLocation::Heap);
+    nodePool.reserve(1);
+    subcellPool.reserve(1);
+    std::copy(nodes.begin(), nodes.end(), nodePool.getChunk(0));
+    std::copy(subcells.begin(), subcells.end(), subcellPool.getChunk(0));
+    const SubgridTransfer transfer{
+      {std::as_const(subcellPool).getView()},
+      std::as_const(nodePool).getView(),
+      tables.nodesToSubcells.data(),
+      prolongation.data()
+    };
+
+    WHEN("The transfer prepares the cell and interpolates every child") {
+      double prepared[SubgridTransfer::PreparedValuesPerChunk];
+      for (int item = 0; item < SubgridTransfer::PreparationItemsPerChunk; item++) {
+        transfer.prepareInterpolation(0, prepared, item);
+      }
+      std::vector<std::vector<double>> children(
+        peano4::ChildrenPerCell,
+        std::vector<double>(Layout::SubcellValuesPerCell)
+      );
+      for (int child = 0; child < peano4::ChildrenPerCell; child++) {
+        for (int item = 0; item < SubgridTransfer::WorkItemsPerChunk; item++) {
+          transfer.interpolateFromParent(0, children[static_cast<std::size_t>(child)].data(), child, item, prepared);
+        }
+      }
+
+      THEN("The children equal the children of interpolateSubcell() for the values that hold the projection") {
+        double     followsNodes[Layout::NumberOfData];
+        const auto expected = interpolateChildren(tables, nodes, subcells, followsNodes);
+        for (int value = 0; value < Layout::NumberOfData; value++) {
+          VALIDATE_EQUALS(prepared[value], followsNodes[value], value);
+        }
+        for (std::size_t child = 0; child < children.size(); child++) {
+          for (std::size_t entry = 0; entry < children[child].size(); entry++) {
+            VALIDATE_EQUALS(children[child][entry], expected[child][entry], child, entry);
+          }
+        }
+      }
+    }
+
+    WHEN("The transfer copies the cell") {
+      std::vector<double> copy(Layout::SubcellValuesPerCell);
+      for (int item = 0; item < SubgridTransfer::WorkItemsPerChunk; item++) {
+        transfer.copy(0, copy.data(), item);
+      }
+
+      THEN("The copy stores the subgrid of the cell") {
+        for (std::size_t entry = 0; entry < copy.size(); entry++) {
+          VALIDATE_EQUALS(copy[entry], subcells[entry], entry);
+        }
+      }
+    }
+  }
+}
