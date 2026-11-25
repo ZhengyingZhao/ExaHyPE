@@ -87,10 +87,37 @@ namespace {
       return 1.0;
     }
   };
+
+  /**
+   * A stub solver that empties a subcell within one time step: the flux through a face of the first axis carries the
+   * whole unknown of the left state.
+   */
+  struct DrainingStubSolver final : exahype2::dg::limiting::unittests::StubSolver {
+    static INLINE_METHOD GPU_CALLABLE_METHOD double solveSubcellRiemannProblem(
+      const double* const                                           QL,
+      [[maybe_unused]] const double* const                          QR,
+      [[maybe_unused]] const tarch::la::Vector<DIMENSIONS, double>& x,
+      const tarch::la::Vector<DIMENSIONS, double>&                  h,
+      [[maybe_unused]] const double                                 t,
+      const double                                                  dt,
+      const int                                                     normal,
+      [[maybe_unused]] const bool                                   isBoundaryFace,
+      [[maybe_unused]] const int                                    faceIndex,
+      double* const                                                 FL,
+      double* const                                                 FR,
+      [[maybe_unused]] const RuntimeParameters&                     parameters
+    ) {
+      ASSERTION(QL != nullptr and FL != nullptr and FR != nullptr);
+      FL[0] = normal == 0 ? QL[0] * h(0) / dt : 0.0;
+      FR[0] = FL[0];
+      return 1.0;
+    }
+  };
   TARGET_DECLARE_END
 
   using SamplingScheme = exahype2::dg::limiting::SubcellScheme<SamplingStubSolver, double>;
   using UpwindScheme   = exahype2::dg::limiting::SubcellScheme<UpwindStubSolver, double>;
+  using DrainingScheme = exahype2::dg::limiting::SubcellScheme<DrainingStubSolver, double>;
 
   std::vector<double> getConstantSubgrid(const double unknown, const double auxiliary) {
     std::vector<double> subgrid(Layout::SubcellValuesPerCell);
@@ -527,6 +554,45 @@ UNIT_TEST("The subgrid update of a solver with a subcell Riemann solver takes th
 
       THEN("The lowest layer along the first axis gains the flux difference one times the time step over the width") {
         VALIDATE_NUMERICAL_BUFFERS_EQUALS(subcells, expected);
+      }
+    }
+  }
+}
+
+UNIT_TEST("A subcell whose fluxes carry its whole content away stores zero") {
+  GIVEN(
+    "A cell of the width 0.7, a subgrid whose unknown rises from subcell to subcell and halos without the unknown"
+  ) {
+    const Projections                           tables;
+    const tarch::la::Vector<DIMENSIONS, double> centre(0.5);
+    const tarch::la::Vector<DIMENSIONS, double> width(0.7);
+    std::vector<double>                         initialSubcells(Layout::SubcellValuesPerCell);
+    for (int subcell = 0; subcell < Layout::SubcellsPerCell; subcell++) {
+      initialSubcells[static_cast<std::size_t>(subcell) * Layout::NumberOfData]     = 1.0 + 0.137 * subcell;
+      initialSubcells[static_cast<std::size_t>(subcell) * Layout::NumberOfData + 1] = 0.5;
+    }
+    const std::vector<double> halo = getConstantHalo(0.0, 0.5);
+
+    WHEN(
+      "The subgrid of the stub solver whose fluxes carry every unknown into the next subcell along the first axis recomputes"
+    ) {
+      std::vector<double> subcells = initialSubcells;
+      std::vector<double> nodes(Layout::ValuesPerCell, 0.0);
+      static_cast<void>(recomputeCellOnDevice<DrainingScheme>(tables, centre, width, nodes, subcells, halo));
+
+      THEN(
+        "The lowest layer along the first axis stores zero and every other subcell the unknown of the subcell below it"
+      ) {
+        for (int subcell = 0; subcell < Layout::SubcellsPerCell; subcell++) {
+          const auto   entry   = static_cast<std::size_t>(subcell) * Layout::NumberOfData;
+          const double unknown = subcells[entry];
+          if (peano4::dDelinearised(subcell, Layout::SubcellsPerAxis)(0) == 0) {
+            VALIDATE(unknown == 0.0, subcell, unknown);
+          } else {
+            VALIDATE_NUMERICAL_EQUALS(unknown, initialSubcells[entry - Layout::NumberOfData]);
+          }
+          VALIDATE_EQUALS(subcells[entry + 1], 0.5, subcell);
+        }
       }
     }
   }

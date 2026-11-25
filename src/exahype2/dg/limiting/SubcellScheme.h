@@ -210,6 +210,12 @@ private:
     const typename Derived::RuntimeParameters&   parameters
   );
 
+  template <typename StoragePrecision>
+  [[nodiscard]] static INLINE_METHOD GPU_CALLABLE_METHOD StoragePrecision getStoredValue(
+    StoragePrecision previousValue,
+    StoragePrecision evolvedValue
+  );
+
   template <typename StoragePrecision, typename Functor>
   static INLINE_METHOD constexpr void forEachSubcell(
     const tarch::la::Vector<DIMENSIONS, double>& cellCentre,

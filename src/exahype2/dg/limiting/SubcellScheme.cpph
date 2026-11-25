@@ -8,6 +8,9 @@
 #include "tarch/Assertions.h"
 #include "tarch/accelerator/Scratch.h"
 
+#include <cmath>
+#include <limits>
+
 /**
  * Returns the threads per team of a launch that asks for one thread per subcell of a cell.
  */
@@ -238,7 +241,7 @@ exahype2::dg::limiting::SubcellScheme<Derived, ComputePrecision>::recompute(
     }
   }
   for (int value = 0; value < SubcellValuesPerCell; value++) {
-    subcells[value] = evolvedSubcells[value];
+    subcells[value] = getStoredValue(subcells[value], evolvedSubcells[value]);
   }
   projectSubcellsOntoNodes(subcells, nodes, subcellsToNodes);
   if constexpr (ReportEigenvalues) {
@@ -379,7 +382,7 @@ exahype2::dg::limiting::SubcellScheme<Derived, ComputePrecision>::recomputeWithT
   tarch::accelerator::teamBarrier(team);
   for (int subcell = thread; subcell < SubcellsPerCell; subcell += threads) {
     for (int value = subcell * NumberOfData; value < (subcell + 1) * NumberOfData; value++) {
-      subcells[value] = evolvedSubcells[value];
+      subcells[value] = getStoredValue(subcells[value], evolvedSubcells[value]);
     }
   }
   tarch::accelerator::teamBarrier(team);
@@ -401,6 +404,23 @@ exahype2::dg::limiting::SubcellScheme<Derived, ComputePrecision>::recomputeWithT
     }
   }
   return statistics;
+}
+
+/**
+ * Returns the value that a subcell stores after a step from previousValue to evolvedValue. When
+ * the fluxes carry everything out of a subcell, their sum leaves a rounding error behind instead
+ * of zero. The subcell stores such a remainder as zero. An emptied subcell is then exactly empty.
+ */
+template <typename Derived, typename ComputePrecision>
+template <typename StoragePrecision>
+INLINE_METHOD GPU_CALLABLE_METHOD StoragePrecision
+exahype2::dg::limiting::SubcellScheme<Derived, ComputePrecision>::getStoredValue(
+  const StoragePrecision previousValue,
+  const StoragePrecision evolvedValue
+) {
+  constexpr auto RoundingErrorOfUpdate =
+    static_cast<StoragePrecision>(16) * std::numeric_limits<StoragePrecision>::epsilon();
+  return std::abs(evolvedValue) <= RoundingErrorOfUpdate * std::abs(previousValue) ? StoragePrecision{} : evolvedValue;
 }
 
 /**
