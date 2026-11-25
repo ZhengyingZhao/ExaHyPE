@@ -90,6 +90,12 @@ class AMRHostSettingsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "execution='cpu'"):
             exahype2.amr.AMR(state_scales=(1.0, 1.0), coarsening_interval=2, execution="gpu")
 
+    def test_parent_maximum_principle_is_validated(self):
+        for invalid in (0, 1, "False", None):
+            with self.assertRaisesRegex(TypeError, "parent_maximum_principle must be a boolean"):
+                exahype2.amr.AMR(state_scales=(1.0, 1.0), parent_maximum_principle=invalid)
+        self.assertTrue(exahype2.amr.AMR(state_scales=(1.0, 1.0)).parent_maximum_principle)
+
     def test_legacy_mode_without_wave_speed_reports_its_quiet_time_unit(self):
         policy = exahype2.amr.AMR(state_scales=(1.0, 1.0), resolution_indicator="legacy", quiet_time=3.0, reference_time=2.0)
         with self.assertWarnsRegex(UserWarning, "quiet_time \\* reference_time = 6.0"):
@@ -153,6 +159,38 @@ class AMRHostGenerationTest(unittest.TestCase):
         solver = solver_for("limited")
         exahype2.amr.AMR(state_scales=(1.0, 1.0)).install(solver)
         self.assertNotIn("bindInitialState", generate(solver)["AMRHostBase.cpp"])
+
+    def test_parent_maximum_principle_selects_the_parent_check_of_a_limited_solver(self):
+        def files(**settings):
+            solver = solver_for("limited")
+            exahype2.amr.AMR(state_scales=(1.0, 1.0), **settings).install(solver)
+            return generate(solver)
+
+        checked = (
+            "    // The proposed parent's observables must stay within the children's bounds, up to the limiter tolerance.\n"
+            "    return ::exahype2::amr::parentRespectsMaximumPrinciple<Solver>(\n"
+            "      parent, children, 0.0, 0.0, parameters\n"
+            "    );\n")
+        accepted = (
+            "    // parent_maximum_principle is off: the limiter's maximum principle is not applied to the proposed parent.\n"
+            "    return true;\n")
+        default = files()
+        self.assertEqual(default["AMRHostBase.h"].count(checked), 1)
+        self.assertEqual(files(parent_maximum_principle=True), default)
+        # The setting replaces the body of one generated function and changes nothing else.
+        expected = dict(default)
+        expected["AMRHostBase.h"] = default["AMRHostBase.h"].replace(checked, accepted)
+        self.assertEqual(files(parent_maximum_principle=False), expected)
+
+    def test_parent_maximum_principle_does_not_change_solvers_without_a_limiter(self):
+        for family in ("fv", "rk", "ader"):
+            with self.subTest(family=family):
+                generated = []
+                for enabled in (True, False):
+                    solver = solver_for(family)
+                    exahype2.amr.AMR(state_scales=(1.0, 1.0), parent_maximum_principle=enabled).install(solver)
+                    generated.append(generate(solver))
+                self.assertEqual(generated[0], generated[1])
 
     def test_coarsening_interval_counts_assessed_steps(self):
         solver = solver_for("ader")

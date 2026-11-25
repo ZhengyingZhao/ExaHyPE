@@ -283,6 +283,10 @@ class _AMRSettings:
         crossing time.
     sample_initial_data: for DG solvers, compare the initial polynomial of a cell with the initial
         condition at the nodes of its children, and refine the cell where they differ too much.
+    parent_maximum_principle: for ADER-DG with a subcell limiter that checks a discrete maximum
+        principle (number_of_dmp_observables > 0). With True, siblings coarsen only if their parent
+        respects it: every quantity of dmp_observables stays within its range over the siblings,
+        which is widened as in the limiter. With False, the criterion does not check this.
     execution: "cpu" assesses on the host, "gpu" on the accelerator of the build.
 
     With execution="cpu", FV and DG solvers without a limiter score the cells of the initial mesh with
@@ -301,6 +305,7 @@ class _AMRSettings:
     assessment_interval: int = 1
     coarsening_interval: int = 1
     resolution_components: tuple[int, ...] | None = None
+    parent_maximum_principle: bool = True
     execution: str = "cpu"
 
     def __post_init__(self):
@@ -310,6 +315,8 @@ class _AMRSettings:
             raise ValueError("resolution_indicator must be 'prediction' or 'legacy'.")
         if not isinstance(self.sample_initial_data, bool):
             raise TypeError("sample_initial_data must be a boolean.")
+        if not isinstance(self.parent_maximum_principle, bool):
+            raise TypeError("parent_maximum_principle must be a boolean.")
         if isinstance(self.assessment_interval, bool) or not isinstance(self.assessment_interval, int):
             raise TypeError("assessment_interval must be an integer.")
         if not 1 <= self.assessment_interval <= 2**31 - 1:
@@ -723,6 +730,20 @@ class Limiter(_AMRSettings):
     def _transfer_weights(solver):
         return _transfer_weights(solver)
 
+    def _parent_check(self, solver):
+        """Return the body of the generated C++ function that decides whether the limiter accepts a
+        proposed parent."""
+        if not self.parent_maximum_principle:
+            return """\
+    // parent_maximum_principle is off: the limiter's maximum principle is not applied to the proposed parent.
+    return true;"""
+        return """\
+    // The proposed parent's observables must stay within the children's bounds, up to the limiter tolerance.
+    return ::exahype2::amr::parentRespectsMaximumPrinciple<Solver>(
+      parent, children, %r, %r, parameters
+    );""" % (float(solver._subcell_limiter_dmp_relaxation_parameter),
+             float(solver._subcell_limiter_dmp_differences_scaling))
+
     def _declarations(self, solver):
         """Give the C++ criterion the settings and physical checks for this limited solver."""
         device = self.execution == "gpu"
@@ -818,10 +839,7 @@ class Limiter(_AMRSettings):
     const %(storage)s* parent, const %(storage)s* const* children,
     const RuntimeParameters& parameters
   ) {
-    // The proposed parent's observables must stay within the children's bounds, up to the limiter tolerance.
-    return ::exahype2::amr::parentRespectsMaximumPrinciple<Solver>(
-      parent, children, %(dmp_relaxation)r, %(dmp_scaling)r, parameters
-    );
+%(parent_check)s
   }
 """ % {
             "method": method,
@@ -844,8 +862,7 @@ class Limiter(_AMRSettings):
             "lower": ", ".join(repr(value) for value in lower),
             "upper": ", ".join(repr(value) for value in upper),
             "amplification": amplification,
-            "dmp_relaxation": float(solver._subcell_limiter_dmp_relaxation_parameter),
-            "dmp_scaling": float(solver._subcell_limiter_dmp_differences_scaling),
+            "parent_check": self._parent_check(solver),
             "storage": solver.precision.storage,
             "compute": solver.precision.compute,
         }

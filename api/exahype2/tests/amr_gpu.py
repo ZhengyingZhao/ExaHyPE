@@ -188,6 +188,16 @@ class AMRGPUGenerationTest(unittest.TestCase):
                 else:
                     self.assertIn("NoStatusView{}", declarations)
 
+    def test_device_callback_follows_parent_maximum_principle(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                _, files = self.render("limited", execution="gpu", parent_maximum_principle=enabled)
+                declarations = files["AMRGPUBase.h"]
+                self.assertIn("GPU_CALLABLE_METHOD static bool _limiterCriterionTransferAdmissible(", declarations)
+                self.assertIn("{ return _limiterCriterionTransferAdmissible<Solver>(parent, children, parameters); }",
+                              declarations)
+                self.assertEqual("parentRespectsMaximumPrinciple" in declarations, enabled)
+
     def test_device_initial_sampling_uses_device_tables_and_callbacks(self):
         for family in ("ader", "rk", "limited"):
             with self.subTest(family=family):
